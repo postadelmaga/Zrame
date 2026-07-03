@@ -5,11 +5,13 @@ const WindowMode = enum {
     a,
     b,
     c,
+    d,
 };
 
 const mode_a: WindowMode = .a;
 const mode_b: WindowMode = .b;
 const mode_c: WindowMode = .c;
+const mode_d: WindowMode = .d;
 
 fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
     const mode: WindowMode = @as(*const WindowMode, @ptrCast(@alignCast(user.?))).*;
@@ -54,6 +56,17 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) vo
             // Info tiles: Window C - Aurora Glass (Inset + Fading Blur)
             canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
             canvas.fillRoundedRect(cx + 88, cy + 70, 360, 22, 11, zrame.Color.rgba(243, 139, 168, 0.45));
+        },
+        .d => {
+            // Stylized letter "D"
+            canvas.fillRoundedRect(lx, ly, 10, 60, 4, color); // left bar
+            canvas.fillRoundedRect(lx, ly, 25, 10, 4, color); // top bar
+            canvas.fillRoundedRect(lx, ly + 50, 25, 10, 4, color); // bottom bar
+            canvas.fillRoundedRect(lx + 18, ly + 5, 10, 50, 4, color); // right curve bar
+
+            // Info tiles: Window D - Material Design 3 (Solid surface tint + 28px corners)
+            canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
+            canvas.fillRoundedRect(cx + 88, cy + 70, 260, 22, 11, zrame.Color.rgba(166, 227, 161, 0.45));
         },
     }
 }
@@ -100,11 +113,25 @@ pub fn main() !void {
     });
     defer win3.deinit();
 
+    const win4 = try zrame.Window.init(gpa, .{
+        .title = "zrame — Window D (Material Design)",
+        .app_id = "dev.zrame.hello.d",
+        .width = 640,
+        .height = 400,
+        .on_draw = drawContent,
+        .user = @ptrCast(@constCast(&mode_d)),
+        .style = zrame.Style.material(),
+    });
+    defer win4.deinit();
+
     const t1 = try std.Thread.spawn(.{}, runWindow, .{win1});
     defer t1.join();
 
     const t2 = try std.Thread.spawn(.{}, runWindow, .{win2});
     defer t2.join();
 
-    try win3.run();
+    const t3 = try std.Thread.spawn(.{}, runWindow, .{win3});
+    defer t3.join();
+
+    try win4.run();
 }

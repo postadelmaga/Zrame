@@ -116,6 +116,18 @@ pub const Style = struct {
             .border_alpha = 0.20,
         };
     }
+
+    /// Preset: Material Design 3 (highly rounded, high opacity surface, flat borders)
+    pub fn material() Style {
+        return .{
+            .corner_radius = 28,
+            .glass = Color.rgba(28, 27, 31, 0.85),
+            .border_alpha = 0.0,
+            .shadow_alpha = 0.45,
+            .shadow_blur = 30,
+            .shadow_offset_y = 8,
+        };
+    }
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.
