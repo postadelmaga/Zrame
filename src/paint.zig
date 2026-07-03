@@ -75,6 +75,10 @@ pub const Style = struct {
     border_alpha: f32 = 0.22,
     /// Progressive fade-out width of the glass color near the edges (0 to disable).
     glass_fade_width: f32 = 0,
+    /// Corner radius of the content frames.
+    content_radius: f32 = 14,
+    /// Progressive fade-out width of the content near its edges (0 to disable).
+    content_fade_width: f32 = 0,
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.
@@ -163,6 +167,11 @@ pub const Canvas = struct {
         const pw = @as(f32, @floatFromInt(self.width)) - 2.0 * m;
         const ph = @as(f32, @floatFromInt(self.height)) - 2.0 * m;
 
+        const dx_f: f32 = @floatFromInt(dst_x);
+        const dy_f: f32 = @floatFromInt(dst_y);
+        const sw_f: f32 = @floatFromInt(src_w);
+        const sh_f: f32 = @floatFromInt(src_h);
+
         var sy: u32 = 0;
         while (sy < src_h) : (sy += 1) {
             const y = dst_y + sy;
@@ -178,8 +187,16 @@ pub const Canvas = struct {
                 const mask = coverage(roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius));
                 if (mask <= 0.0) continue;
 
+                const d_content = roundedRectSdf(fx, fy, dx_f, dy_f, sw_f, sh_f, style.content_radius);
+                var content_cov = coverage(d_content);
+                if (content_cov <= 0.0) continue;
+
+                if (style.content_fade_width > 0.0) {
+                    content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
+                }
+
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];
-                const sa = @as(f32, @floatFromInt(sp[3])) / 255.0 * mask;
+                const sa = @as(f32, @floatFromInt(sp[3])) / 255.0 * mask * content_cov;
                 if (sa <= 0.0) continue;
                 const sr = @as(f32, @floatFromInt(sp[0])) / 255.0;
                 const sg = @as(f32, @floatFromInt(sp[1])) / 255.0;

@@ -76,6 +76,8 @@ pub fn main() !void {
         .style = .{
             .glass = zrame.Color.rgba(15, 15, 20, 0.35),
             .glass_fade_width = 30.0,
+            .content_radius = 18.0,
+            .content_fade_width = 25.0,
         },
     });
     defer win.deinit();
