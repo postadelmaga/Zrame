@@ -81,6 +81,41 @@ pub const Style = struct {
     content_fade_width: f32 = 0,
     /// Inset of the compositor blur region relative to the panel (0 for full panel blur).
     blur_inset: f32 = 0,
+
+    /// Preset: Apple macOS Vision Pro Glassmorphism
+    pub fn macos() Style {
+        return .{
+            .corner_radius = 28,
+            .glass = Color.rgba(255, 255, 255, 0.08),
+            .border_alpha = 0.35,
+            .shadow_alpha = 0.30,
+            .shadow_blur = 30,
+            .shadow_offset_y = 12,
+        };
+    }
+
+    /// Preset: Windows 11 Fluent Design / Acrylic
+    pub fn fluent() Style {
+        return .{
+            .corner_radius = 12,
+            .glass = Color.rgba(32, 32, 32, 0.65),
+            .border_alpha = 0.15,
+            .shadow_alpha = 0.40,
+            .shadow_blur = 20,
+            .shadow_offset_y = 8,
+        };
+    }
+
+    /// Preset: Aurora Glass (inset blur with wide color fade)
+    pub fn aurora() Style {
+        return .{
+            .corner_radius = 28,
+            .glass = Color.rgba(137, 180, 250, 0.40),
+            .glass_fade_width = 70.0,
+            .blur_inset = 40.0,
+            .border_alpha = 0.20,
+        };
+    }
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.

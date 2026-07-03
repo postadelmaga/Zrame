@@ -28,9 +28,9 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) vo
             canvas.fillRoundedRect(lx, ly, 35, 10, 4, color); // top bar
             canvas.fillRoundedRect(lx, ly + 25, 35, 10, 4, color); // middle bar
 
-            // Info tile: Mode A - Baseline (Uniform Glass + Full Blur)
+            // Info tile: Window A - Fluent Design / Acrylic
             canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 160, 22, 11, zrame.Color.rgba(255, 255, 255, 0.15));
+            canvas.fillRoundedRect(cx + 88, cy + 70, 220, 22, 11, zrame.Color.rgba(255, 255, 255, 0.15));
         },
         .b => {
             // Stylized letter "B"
@@ -41,9 +41,9 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) vo
             canvas.fillRoundedRect(lx + 20, ly, 10, 35, 4, color); // top loop right
             canvas.fillRoundedRect(lx + 20, ly + 25, 10, 35, 4, color); // bottom loop right
 
-            // Info tiles: Mode B - Glass Fade (Fading Glass + Full Blur)
+            // Info tiles: Window B - Vision Pro Glassmorphism
             canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 240, 22, 11, zrame.Color.rgba(137, 180, 250, 0.45));
+            canvas.fillRoundedRect(cx + 88, cy + 70, 300, 22, 11, zrame.Color.rgba(137, 180, 250, 0.45));
         },
         .c => {
             // Stylized letter "C"
@@ -51,9 +51,9 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) vo
             canvas.fillRoundedRect(lx, ly, 35, 10, 4, color); // top bar
             canvas.fillRoundedRect(lx, ly + 50, 35, 10, 4, color); // bottom bar
 
-            // Info tiles: Mode C - Glass Fade + Inset Blur (Fading Glass + 25px Inset Blur)
+            // Info tiles: Window C - Aurora Glass (Inset + Fading Blur)
             canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 320, 22, 11, zrame.Color.rgba(243, 139, 168, 0.45));
+            canvas.fillRoundedRect(cx + 88, cy + 70, 360, 22, 11, zrame.Color.rgba(243, 139, 168, 0.45));
         },
     }
 }
@@ -68,47 +68,35 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     const win1 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window A (Baseline)",
+        .title = "zrame — Window A (Fluent Design)",
         .app_id = "dev.zrame.hello.a",
         .width = 640,
         .height = 400,
         .on_draw = drawContent,
         .user = @ptrCast(@constCast(&mode_a)),
-        .style = .{
-            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
-            .glass_fade_width = 0.0,
-            .blur_inset = 0.0,
-        },
+        .style = zrame.Style.fluent(),
     });
     defer win1.deinit();
 
     const win2 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window B (Glass Fade)",
+        .title = "zrame — Window B (Vision Pro Glass)",
         .app_id = "dev.zrame.hello.b",
         .width = 640,
         .height = 400,
         .on_draw = drawContent,
         .user = @ptrCast(@constCast(&mode_b)),
-        .style = .{
-            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
-            .glass_fade_width = 30.0,
-            .blur_inset = 0.0,
-        },
+        .style = zrame.Style.macos(),
     });
     defer win2.deinit();
 
     const win3 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window C (Fade + Inset Blur)",
+        .title = "zrame — Window C (Aurora Glass)",
         .app_id = "dev.zrame.hello.c",
         .width = 640,
         .height = 400,
         .on_draw = drawContent,
         .user = @ptrCast(@constCast(&mode_c)),
-        .style = .{
-            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
-            .glass_fade_width = 30.0,
-            .blur_inset = 25.0,
-        },
+        .style = zrame.Style.aurora(),
     });
     defer win3.deinit();
 
