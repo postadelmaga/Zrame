@@ -79,6 +79,8 @@ pub const Style = struct {
     content_radius: f32 = 14,
     /// Progressive fade-out width of the content near its edges (0 to disable).
     content_fade_width: f32 = 0,
+    /// Inset of the compositor blur region relative to the panel (0 for full panel blur).
+    blur_inset: f32 = 0,
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.

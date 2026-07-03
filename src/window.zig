@@ -360,7 +360,16 @@ pub const Window = struct {
         if (self.blur) |blur| {
             const region = self.compositor.?.createRegion();
             defer region.destroy();
-            addRoundedRegion(region, 0, self.panel_w, self.panel_h, self.opts.style.corner_radius);
+            const bi = self.opts.style.blur_inset;
+            if (bi > 0.0 and bi < @as(f32, @floatFromInt(self.panel_w)) / 2.0 and bi < @as(f32, @floatFromInt(self.panel_h)) / 2.0) {
+                const bi_u: u32 = @intFromFloat(bi);
+                const pw_shrunk = self.panel_w - 2 * bi_u;
+                const ph_shrunk = self.panel_h - 2 * bi_u;
+                const radius = @max(0.0, self.opts.style.corner_radius - bi);
+                addRoundedRegion(region, bi_u, pw_shrunk, ph_shrunk, radius);
+            } else {
+                addRoundedRegion(region, 0, self.panel_w, self.panel_h, self.opts.style.corner_radius);
+            }
             blur.setBlurRegion(region);
         }
     }

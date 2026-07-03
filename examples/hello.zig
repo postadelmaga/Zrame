@@ -16,26 +16,45 @@ fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, _: ?*anyopaque) void 
     canvas.fillRoundedRect(cx + 168, cy + 78, 44, 26, 13, zrame.Color.rgba(243, 139, 168, 0.45));
 }
 
+fn runWindow(win: *zrame.Window) void {
+    win.run() catch {};
+}
+
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const win = try zrame.Window.init(gpa, .{
-        .title = "zrame — hello",
-        .app_id = "dev.zrame.hello",
+    const win1 = try zrame.Window.init(gpa, .{
+        .title = "zrame — hello (Mode A - Full Blur)",
+        .app_id = "dev.zrame.hello.a",
         .width = 640,
         .height = 400,
         .on_draw = drawContent,
         .style = .{
             .glass = zrame.Color.rgba(15, 15, 20, 0.35),
             .glass_fade_width = 30.0,
+            .blur_inset = 0.0,
         },
     });
-    defer win.deinit();
+    defer win1.deinit();
 
-    if (!win.hasBlur())
-        std.debug.print("compositor offers no ext-background-effect-v1: window stays translucent, without blur\n", .{});
+    const win2 = try zrame.Window.init(gpa, .{
+        .title = "zrame — hello (Mode B - Inset Blur)",
+        .app_id = "dev.zrame.hello.b",
+        .width = 640,
+        .height = 400,
+        .on_draw = drawContent,
+        .style = .{
+            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
+            .glass_fade_width = 30.0,
+            .blur_inset = 25.0,
+        },
+    });
+    defer win2.deinit();
 
-    try win.run();
+    const t = try std.Thread.spawn(.{}, runWindow, .{win1});
+    defer t.join();
+
+    try win2.run();
 }
