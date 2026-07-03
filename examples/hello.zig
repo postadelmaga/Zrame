@@ -26,8 +26,22 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     const win1 = try zrame.Window.init(gpa, .{
-        .title = "zrame — hello (Mode A - Full Blur)",
+        .title = "zrame — Window A (Baseline)",
         .app_id = "dev.zrame.hello.a",
+        .width = 640,
+        .height = 400,
+        .on_draw = drawContent,
+        .style = .{
+            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
+            .glass_fade_width = 0.0,
+            .blur_inset = 0.0,
+        },
+    });
+    defer win1.deinit();
+
+    const win2 = try zrame.Window.init(gpa, .{
+        .title = "zrame — Window B (Glass Fade)",
+        .app_id = "dev.zrame.hello.b",
         .width = 640,
         .height = 400,
         .on_draw = drawContent,
@@ -37,11 +51,11 @@ pub fn main() !void {
             .blur_inset = 0.0,
         },
     });
-    defer win1.deinit();
+    defer win2.deinit();
 
-    const win2 = try zrame.Window.init(gpa, .{
-        .title = "zrame — hello (Mode B - Inset Blur)",
-        .app_id = "dev.zrame.hello.b",
+    const win3 = try zrame.Window.init(gpa, .{
+        .title = "zrame — Window C (Fade + Inset Blur)",
+        .app_id = "dev.zrame.hello.c",
         .width = 640,
         .height = 400,
         .on_draw = drawContent,
@@ -51,10 +65,13 @@ pub fn main() !void {
             .blur_inset = 25.0,
         },
     });
-    defer win2.deinit();
+    defer win3.deinit();
 
-    const t = try std.Thread.spawn(.{}, runWindow, .{win1});
-    defer t.join();
+    const t1 = try std.Thread.spawn(.{}, runWindow, .{win1});
+    defer t1.join();
 
-    try win2.run();
+    const t2 = try std.Thread.spawn(.{}, runWindow, .{win2});
+    defer t2.join();
+
+    try win3.run();
 }
