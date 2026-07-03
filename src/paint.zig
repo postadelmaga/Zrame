@@ -128,6 +128,21 @@ pub const Style = struct {
             .shadow_offset_y = 8,
         };
     }
+
+    /// Preset: Psychedelic Neon (vibrant magenta tint, reflective border, heavy content fade)
+    pub fn psy() Style {
+        return .{
+            .corner_radius = 32,
+            .glass = Color.rgba(240, 0, 255, 0.30),
+            .glass_fade_width = 45.0,
+            .border_alpha = 0.60,
+            .content_radius = 24,
+            .content_fade_width = 35.0,
+            .shadow_alpha = 0.40,
+            .shadow_blur = 25,
+            .shadow_offset_y = 10,
+        };
+    }
 };
 
 /// A premultiplied ARGB8888 pixel canvas, the exact bytes a wl_shm buffer wants.
