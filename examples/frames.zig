@@ -73,6 +73,10 @@ pub fn main() !void {
         .app_id = "dev.zrame.frames",
         .width = content_w + 40,
         .height = content_h + 40,
+        .style = .{
+            .glass = zrame.Color.rgba(15, 15, 20, 0.35),
+            .glass_fade_width = 30.0,
+        },
     });
     defer win.deinit();
 
