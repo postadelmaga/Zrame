@@ -81,6 +81,8 @@ pub const Style = struct {
     content_fade_width: f32 = 0,
     /// Inset of the compositor blur region relative to the panel (0 for full panel blur).
     blur_inset: f32 = 0,
+    /// Whether only the border region should show the animated blitted content.
+    animate_border_only: bool = false,
 
     /// Preset: Apple macOS Vision Pro Glassmorphism
     pub fn macos() Style {
@@ -141,6 +143,7 @@ pub const Style = struct {
             .shadow_alpha = 0.40,
             .shadow_blur = 25,
             .shadow_offset_y = 10,
+            .animate_border_only = true,
         };
     }
 };
@@ -248,7 +251,8 @@ pub const Canvas = struct {
                 const x = dst_x + sx;
                 if (x >= self.width) break;
                 const fx = @as(f32, @floatFromInt(x)) + 0.5;
-                const mask = coverage(roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius));
+                const d_panel = roundedRectSdf(fx, fy, m, m, pw, ph, style.corner_radius);
+                const mask = coverage(d_panel);
                 if (mask <= 0.0) continue;
 
                 const d_content = roundedRectSdf(fx, fy, dx_f, dy_f, sw_f, sh_f, style.content_radius);
@@ -257,6 +261,11 @@ pub const Canvas = struct {
 
                 if (style.content_fade_width > 0.0) {
                     content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
+                }
+
+                if (style.animate_border_only) {
+                    const border_fade = 1.0 - smoothstep(0.0, style.glass_fade_width, -d_panel);
+                    content_cov *= border_fade;
                 }
 
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];

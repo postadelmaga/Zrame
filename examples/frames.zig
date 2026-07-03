@@ -10,8 +10,8 @@ const std = @import("std");
 const zicro = @import("zicro");
 const zrame = @import("zrame");
 
-const content_w: u32 = 600;
-const content_h: u32 = 360;
+const content_w: u32 = 640;
+const content_h: u32 = 400;
 
 /// A source module: paints plasma frames and sends them latest-wins.
 const Painter = struct {
@@ -71,8 +71,8 @@ pub fn main() !void {
     const win = try zrame.Window.init(gpa, .{
         .title = "zrame — zicro frames",
         .app_id = "dev.zrame.frames",
-        .width = content_w + 40,
-        .height = content_h + 40,
+        .width = content_w,
+        .height = content_h,
         .style = zrame.Style.psy(),
     });
     defer win.deinit();
