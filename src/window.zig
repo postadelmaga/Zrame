@@ -249,6 +249,20 @@ pub const Window = struct {
         self.closed = true;
     }
 
+    /// Dynamically update the window's decoration style.
+    pub fn setStyle(self: *Window, style: Style) !void {
+        self.opts.style = style;
+        const m = self.opts.style.margin;
+        const bw = self.panel_w + 2 * m;
+        const bh = self.panel_h + 2 * m;
+        if (self.decor.len > 0) self.gpa.free(self.decor);
+        self.decor = try self.gpa.alloc(u32, @as(usize, bw) * bh);
+        var canvas = paint.Canvas.init(self.decor, bw, bh);
+        canvas.drawChrome(self.opts.style);
+        self.applySurfaceMetrics();
+        self.needs_redraw = true;
+    }
+
     // --- drawing --------------------------------------------------------------------
 
     fn contentRect(self: *Window) Rect {
