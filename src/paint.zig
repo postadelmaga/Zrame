@@ -7,7 +7,6 @@
 //! a decorated frame is just math over pixels.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 
 /// A straight (non-premultiplied) color; premultiplication happens at draw time.
 pub const Color = struct {
@@ -49,12 +48,23 @@ fn coverage(d: f32) f32 {
     return std.math.clamp(0.5 - d, 0.0, 1.0);
 }
 
+/// Pack already-premultiplied channels (each in [0,1]) into an ARGB8888 pixel.
 fn packPremul(r: f32, g: f32, b: f32, a: f32) u32 {
     const ai: u32 = @intFromFloat(std.math.clamp(a, 0.0, 1.0) * 255.0 + 0.5);
-    const ri: u32 = @intFromFloat(std.math.clamp(r * a, 0.0, 1.0) * 255.0 + 0.5);
-    const gi: u32 = @intFromFloat(std.math.clamp(g * a, 0.0, 1.0) * 255.0 + 0.5);
-    const bi: u32 = @intFromFloat(std.math.clamp(b * a, 0.0, 1.0) * 255.0 + 0.5);
+    const ri: u32 = @intFromFloat(std.math.clamp(r, 0.0, 1.0) * 255.0 + 0.5);
+    const gi: u32 = @intFromFloat(std.math.clamp(g, 0.0, 1.0) * 255.0 + 0.5);
+    const bi: u32 = @intFromFloat(std.math.clamp(b, 0.0, 1.0) * 255.0 + 0.5);
     return (ai << 24) | (ri << 16) | (gi << 8) | bi;
+}
+
+/// Unpack an ARGB8888 pixel into premultiplied `{ r, g, b, a }` floats.
+fn unpackPremul(px: u32) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt((px >> 16) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt((px >> 8) & 0xff)) / 255.0,
+        @as(f32, @floatFromInt(px & 0xff)) / 255.0,
+        @as(f32, @floatFromInt(px >> 24)) / 255.0,
+    };
 }
 
 /// How the window chrome looks. All lengths are in buffer pixels.
@@ -209,11 +219,7 @@ pub const Canvas = struct {
                 pb = ring + pb * (1.0 - ring);
                 pa = ring + pa * (1.0 - ring);
 
-                const ai: u32 = @intFromFloat(std.math.clamp(pa, 0.0, 1.0) * 255.0 + 0.5);
-                const ri: u32 = @intFromFloat(std.math.clamp(pr, 0.0, 1.0) * 255.0 + 0.5);
-                const gi: u32 = @intFromFloat(std.math.clamp(pg, 0.0, 1.0) * 255.0 + 0.5);
-                const bi: u32 = @intFromFloat(std.math.clamp(pb, 0.0, 1.0) * 255.0 + 0.5);
-                row[x] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
+                row[x] = packPremul(pr, pg, pb, pa);
             }
         }
     }
@@ -275,23 +281,14 @@ pub const Canvas = struct {
                 const sg = @as(f32, @floatFromInt(sp[1])) / 255.0;
                 const sb = @as(f32, @floatFromInt(sp[2])) / 255.0;
 
-                const dst = row[x];
-                const da = @as(f32, @floatFromInt((dst >> 24) & 0xff)) / 255.0;
-                const dr = @as(f32, @floatFromInt((dst >> 16) & 0xff)) / 255.0;
-                const dg = @as(f32, @floatFromInt((dst >> 8) & 0xff)) / 255.0;
-                const db = @as(f32, @floatFromInt(dst & 0xff)) / 255.0;
-
+                const dr, const dg, const db, const da = unpackPremul(row[x]);
                 const inv = 1.0 - sa;
-                const oa = sa + da * inv;
-                const or_ = sr * sa + dr * inv;
-                const og = sg * sa + dg * inv;
-                const ob = sb * sa + db * inv;
-
-                const ai: u32 = @intFromFloat(std.math.clamp(oa, 0.0, 1.0) * 255.0 + 0.5);
-                const ri: u32 = @intFromFloat(std.math.clamp(or_, 0.0, 1.0) * 255.0 + 0.5);
-                const gi: u32 = @intFromFloat(std.math.clamp(og, 0.0, 1.0) * 255.0 + 0.5);
-                const bi: u32 = @intFromFloat(std.math.clamp(ob, 0.0, 1.0) * 255.0 + 0.5);
-                row[x] = (ai << 24) | (ri << 16) | (gi << 8) | bi;
+                row[x] = packPremul(
+                    sr * sa + dr * inv,
+                    sg * sa + dg * inv,
+                    sb * sa + db * inv,
+                    sa + da * inv,
+                );
             }
         }
     }
@@ -314,17 +311,12 @@ pub const Canvas = struct {
                 if (cov <= 0.0) continue;
                 const sa = color.a * cov;
 
-                const dst = row[px];
-                const da = @as(f32, @floatFromInt((dst >> 24) & 0xff)) / 255.0;
-                const dr = @as(f32, @floatFromInt((dst >> 16) & 0xff)) / 255.0;
-                const dg = @as(f32, @floatFromInt((dst >> 8) & 0xff)) / 255.0;
-                const db = @as(f32, @floatFromInt(dst & 0xff)) / 255.0;
+                const dr, const dg, const db, const da = unpackPremul(row[px]);
                 const inv = 1.0 - sa;
-
                 row[px] = packPremul(
-                    (color.r * sa + dr * inv) / @max(sa + da * inv, 1e-6),
-                    (color.g * sa + dg * inv) / @max(sa + da * inv, 1e-6),
-                    (color.b * sa + db * inv) / @max(sa + da * inv, 1e-6),
+                    color.r * sa + dr * inv,
+                    color.g * sa + dg * inv,
+                    color.b * sa + db * inv,
                     sa + da * inv,
                 );
             }

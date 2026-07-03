@@ -1,74 +1,72 @@
+//! `zig build run-hello`
+//!
+//! Four static glass windows, one per style preset. Everything that differs between
+//! them is data: a `Demo` entry with the preset, an accent tint for the info tile,
+//! and the letter glyph as a list of rounded-rect segments.
+
 const std = @import("std");
 const zrame = @import("zrame");
 
-const WindowMode = enum {
-    a,
-    b,
-    c,
-    d,
+/// One rounded-rect segment of a letter glyph: `{ x, y, w, h }` from the glyph origin.
+const Seg = [4]f32;
+
+const Demo = struct {
+    title: [:0]const u8,
+    app_id: [:0]const u8,
+    style: zrame.Style,
+    /// Accent color of the second info tile.
+    tint: zrame.Color,
+    glyph: []const Seg,
 };
 
-const mode_a: WindowMode = .a;
-const mode_b: WindowMode = .b;
-const mode_c: WindowMode = .c;
-const mode_d: WindowMode = .d;
+const glyph_a = [_]Seg{ .{ 0, 0, 10, 60 }, .{ 25, 0, 10, 60 }, .{ 0, 0, 35, 10 }, .{ 0, 25, 35, 10 } };
+const glyph_b = [_]Seg{ .{ 0, 0, 10, 60 }, .{ 0, 0, 30, 10 }, .{ 0, 25, 30, 10 }, .{ 0, 50, 30, 10 }, .{ 20, 0, 10, 35 }, .{ 20, 25, 10, 35 } };
+const glyph_c = [_]Seg{ .{ 0, 0, 10, 60 }, .{ 0, 0, 35, 10 }, .{ 0, 50, 35, 10 } };
+const glyph_d = [_]Seg{ .{ 0, 0, 10, 60 }, .{ 0, 0, 25, 10 }, .{ 0, 50, 25, 10 }, .{ 18, 5, 10, 50 } };
+
+const demos = [_]Demo{
+    .{
+        .title = "zrame — Window A (Fluent Design)",
+        .app_id = "dev.zrame.hello.a",
+        .style = zrame.Style.fluent(),
+        .tint = zrame.Color.rgba(255, 255, 255, 0.15),
+        .glyph = &glyph_a,
+    },
+    .{
+        .title = "zrame — Window B (Vision Pro Glass)",
+        .app_id = "dev.zrame.hello.b",
+        .style = zrame.Style.macos(),
+        .tint = zrame.Color.rgba(137, 180, 250, 0.45),
+        .glyph = &glyph_b,
+    },
+    .{
+        .title = "zrame — Window C (Aurora Glass)",
+        .app_id = "dev.zrame.hello.c",
+        .style = zrame.Style.aurora(),
+        .tint = zrame.Color.rgba(243, 139, 168, 0.45),
+        .glyph = &glyph_c,
+    },
+    .{
+        .title = "zrame — Window D (Material Design)",
+        .app_id = "dev.zrame.hello.d",
+        .style = zrame.Style.material(),
+        .tint = zrame.Color.rgba(166, 227, 161, 0.45),
+        .glyph = &glyph_d,
+    },
+};
 
 fn drawContent(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
-    const mode: WindowMode = @as(*const WindowMode, @ptrCast(@alignCast(user.?))).*;
+    const demo: *const Demo = @ptrCast(@alignCast(user.?));
     const cx: f32 = @floatFromInt(content.x);
     const cy: f32 = @floatFromInt(content.y);
 
-    const lx = cx + 32;
-    const ly = cy + 32;
-    const color = zrame.Color.rgba(255, 255, 255, 0.65);
-
-    switch (mode) {
-        .a => {
-            // Stylized letter "A"
-            canvas.fillRoundedRect(lx, ly, 10, 60, 4, color); // left leg
-            canvas.fillRoundedRect(lx + 25, ly, 10, 60, 4, color); // right leg
-            canvas.fillRoundedRect(lx, ly, 35, 10, 4, color); // top bar
-            canvas.fillRoundedRect(lx, ly + 25, 35, 10, 4, color); // middle bar
-
-            // Info tile: Window A - Fluent Design / Acrylic
-            canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 220, 22, 11, zrame.Color.rgba(255, 255, 255, 0.15));
-        },
-        .b => {
-            // Stylized letter "B"
-            canvas.fillRoundedRect(lx, ly, 10, 60, 4, color); // left bar
-            canvas.fillRoundedRect(lx, ly, 30, 10, 4, color); // top bar
-            canvas.fillRoundedRect(lx, ly + 25, 30, 10, 4, color); // middle bar
-            canvas.fillRoundedRect(lx, ly + 50, 30, 10, 4, color); // bottom bar
-            canvas.fillRoundedRect(lx + 20, ly, 10, 35, 4, color); // top loop right
-            canvas.fillRoundedRect(lx + 20, ly + 25, 10, 35, 4, color); // bottom loop right
-
-            // Info tiles: Window B - Vision Pro Glassmorphism
-            canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 300, 22, 11, zrame.Color.rgba(137, 180, 250, 0.45));
-        },
-        .c => {
-            // Stylized letter "C"
-            canvas.fillRoundedRect(lx, ly, 10, 60, 4, color); // left bar
-            canvas.fillRoundedRect(lx, ly, 35, 10, 4, color); // top bar
-            canvas.fillRoundedRect(lx, ly + 50, 35, 10, 4, color); // bottom bar
-
-            // Info tiles: Window C - Aurora Glass (Inset + Fading Blur)
-            canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 360, 22, 11, zrame.Color.rgba(243, 139, 168, 0.45));
-        },
-        .d => {
-            // Stylized letter "D"
-            canvas.fillRoundedRect(lx, ly, 10, 60, 4, color); // left bar
-            canvas.fillRoundedRect(lx, ly, 25, 10, 4, color); // top bar
-            canvas.fillRoundedRect(lx, ly + 50, 25, 10, 4, color); // bottom bar
-            canvas.fillRoundedRect(lx + 18, ly + 5, 10, 50, 4, color); // right curve bar
-
-            // Info tiles: Window D - Material Design 3 (Solid surface tint + 28px corners)
-            canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
-            canvas.fillRoundedRect(cx + 88, cy + 70, 260, 22, 11, zrame.Color.rgba(166, 227, 161, 0.45));
-        },
+    const white = zrame.Color.rgba(255, 255, 255, 0.65);
+    for (demo.glyph) |seg| {
+        canvas.fillRoundedRect(cx + 32 + seg[0], cy + 32 + seg[1], seg[2], seg[3], 4, white);
     }
+
+    canvas.fillRoundedRect(cx + 88, cy + 32, 280, 26, 13, zrame.Color.rgba(255, 255, 255, 0.20));
+    canvas.fillRoundedRect(cx + 88, cy + 70, 300, 22, 11, demo.tint);
 }
 
 fn runWindow(win: *zrame.Window) void {
@@ -80,58 +78,30 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const win1 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window A (Fluent Design)",
-        .app_id = "dev.zrame.hello.a",
-        .width = 640,
-        .height = 400,
-        .on_draw = drawContent,
-        .user = @ptrCast(@constCast(&mode_a)),
-        .style = zrame.Style.fluent(),
-    });
-    defer win1.deinit();
+    var wins: [demos.len]*zrame.Window = undefined;
+    var opened: usize = 0;
+    defer for (wins[0..opened]) |win| win.deinit();
+    for (&demos, &wins) |*demo, *win| {
+        win.* = try zrame.Window.init(gpa, .{
+            .title = demo.title,
+            .app_id = demo.app_id,
+            .width = 640,
+            .height = 400,
+            .on_draw = drawContent,
+            .user = @ptrCast(@constCast(demo)),
+            .style = demo.style,
+        });
+        opened += 1;
+    }
 
-    const win2 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window B (Vision Pro Glass)",
-        .app_id = "dev.zrame.hello.b",
-        .width = 640,
-        .height = 400,
-        .on_draw = drawContent,
-        .user = @ptrCast(@constCast(&mode_b)),
-        .style = zrame.Style.macos(),
-    });
-    defer win2.deinit();
-
-    const win3 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window C (Aurora Glass)",
-        .app_id = "dev.zrame.hello.c",
-        .width = 640,
-        .height = 400,
-        .on_draw = drawContent,
-        .user = @ptrCast(@constCast(&mode_c)),
-        .style = zrame.Style.aurora(),
-    });
-    defer win3.deinit();
-
-    const win4 = try zrame.Window.init(gpa, .{
-        .title = "zrame — Window D (Material Design)",
-        .app_id = "dev.zrame.hello.d",
-        .width = 640,
-        .height = 400,
-        .on_draw = drawContent,
-        .user = @ptrCast(@constCast(&mode_d)),
-        .style = zrame.Style.material(),
-    });
-    defer win4.deinit();
-
-    const t1 = try std.Thread.spawn(.{}, runWindow, .{win1});
-    defer t1.join();
-
-    const t2 = try std.Thread.spawn(.{}, runWindow, .{win2});
-    defer t2.join();
-
-    const t3 = try std.Thread.spawn(.{}, runWindow, .{win3});
-    defer t3.join();
-
-    try win4.run();
+    // Each window owns its thread (each has its own Wayland connection); the last
+    // one runs on main. Closing a window ends its loop.
+    var threads: [demos.len - 1]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    for (&threads, wins[0 .. demos.len - 1]) |*t, win| {
+        t.* = try std.Thread.spawn(.{}, runWindow, .{win});
+        spawned += 1;
+    }
+    try wins[demos.len - 1].run();
 }

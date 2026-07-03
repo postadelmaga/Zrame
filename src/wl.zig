@@ -46,14 +46,7 @@ pub extern fn wl_display_read_events(display: *Display) c_int;
 pub extern fn wl_display_cancel_read(display: *Display) void;
 pub extern fn wl_display_get_error(display: *Display) c_int;
 
-pub extern fn wl_proxy_marshal_flags(
-    proxy: *Proxy,
-    opcode: u32,
-    interface: ?*const Interface,
-    version: u32,
-    flags: u32,
-    ...
-) ?*Proxy;
+pub extern fn wl_proxy_marshal_flags(proxy: *Proxy, opcode: u32, interface: ?*const Interface, version: u32, flags: u32, ...) ?*Proxy;
 pub extern fn wl_proxy_add_listener(
     proxy: *Proxy,
     implementation: [*]const ?*const fn () callconv(.c) void,
@@ -86,8 +79,8 @@ pub extern const wp_cursor_shape_device_v1_interface: Interface;
 /// 24.8 fixed point, the wire format of pointer coordinates.
 pub const Fixed = i32;
 
-pub fn fixedToF64(f: Fixed) f64 {
-    return @as(f64, @floatFromInt(f)) / 256.0;
+pub fn fixedToF32(f: Fixed) f32 {
+    return @as(f32, @floatFromInt(f)) / 256.0;
 }
 
 fn proxy(ptr: anytype) *Proxy {

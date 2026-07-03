@@ -51,6 +51,7 @@ const Staged = struct {
     pixels: std.ArrayList(u8) = .empty,
     width: u32 = 0,
     height: u32 = 0,
+    /// Set by `presentRgba`, cleared when `redraw` swaps the frame to the front slot.
     fresh: bool = false,
 };
 
@@ -116,17 +117,21 @@ pub const Window = struct {
     /// Chrome painted once per resize, memcpy'd under every frame.
     decor: []u32 = &.{},
 
-    // Cross-thread frame mailbox.
+    // Cross-thread frame mailbox: producers write `staged` under the lock, `redraw`
+    // swaps it into `front` (window-thread-only) so the blit runs unlocked.
     mutex: SpinLock = .{},
     staged: Staged = .{},
+    front: Staged = .{},
     wake_fd: posix.fd_t,
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const display = wl.wl_display_connect(null) orelse return error.NoWaylandDisplay;
         errdefer wl.wl_display_disconnect(display);
 
-        const wake_fd: posix.fd_t = @intCast(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
-        if (wake_fd < 0) return error.EventFdFailed;
+        const efd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        if (linux.errno(efd) != .SUCCESS) return error.EventFdFailed;
+        const wake_fd: posix.fd_t = @intCast(efd);
+        errdefer _ = linux.close(wake_fd);
 
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
@@ -135,10 +140,12 @@ pub const Window = struct {
             .opts = opts,
             .display = display,
             .registry = wl.displayGetRegistry(display),
-            .panel_w = @max(opts.width, 4 * opts.style.margin),
-            .panel_h = @max(opts.height, 4 * opts.style.margin),
+            .panel_w = opts.width,
+            .panel_h = opts.height,
             .wake_fd = wake_fd,
         };
+        self.panel_w = @max(self.panel_w, self.minPanel());
+        self.panel_h = @max(self.panel_h, self.minPanel());
 
         self.registry.setListener(&registry_listener, self);
         if (wl.wl_display_roundtrip(display) < 0) return error.WaylandIo;
@@ -156,7 +163,7 @@ pub const Window = struct {
         toplevel.setListener(&toplevel_listener, self);
         toplevel.setTitle(opts.title.ptr);
         toplevel.setAppId(opts.app_id.ptr);
-        const min: i32 = @intCast(4 * opts.style.margin);
+        const min: i32 = @intCast(self.minPanel());
         toplevel.setMinSize(min, min);
         self.toplevel = toplevel;
 
@@ -173,6 +180,7 @@ pub const Window = struct {
         self.dropBuffers();
         if (self.decor.len > 0) self.gpa.free(self.decor);
         self.staged.pixels.deinit(self.gpa);
+        self.front.pixels.deinit(self.gpa);
         if (self.blur) |b| wl.wl_proxy_destroy(@ptrCast(b));
         if (self.cursor_device) |c| wl.wl_proxy_destroy(@ptrCast(c));
         if (self.keyboard) |k| wl.wl_proxy_destroy(@ptrCast(k));
@@ -200,7 +208,14 @@ pub const Window = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.staged.pixels.clearRetainingCapacity();
-            self.staged.pixels.appendSlice(self.gpa, rgba[0..need]) catch return;
+            self.staged.pixels.appendSlice(self.gpa, rgba[0..need]) catch {
+                // Keep the invariant `pixels.len == width * height * 4`: a stale
+                // width over emptied pixels would send redraw out of bounds.
+                self.staged.width = 0;
+                self.staged.height = 0;
+                self.staged.fresh = false;
+                return;
+            };
             self.staged.width = width;
             self.staged.height = height;
             self.staged.fresh = true;
@@ -249,21 +264,22 @@ pub const Window = struct {
         self.closed = true;
     }
 
-    /// Dynamically update the window's decoration style.
+    /// Dynamically update the window's decoration style. Window thread only (it talks
+    /// to Wayland objects): call it from an input callback or before [`run`].
     pub fn setStyle(self: *Window, style: Style) !void {
         self.opts.style = style;
-        const m = self.opts.style.margin;
-        const bw = self.panel_w + 2 * m;
-        const bh = self.panel_h + 2 * m;
-        if (self.decor.len > 0) self.gpa.free(self.decor);
-        self.decor = try self.gpa.alloc(u32, @as(usize, bw) * bh);
-        var canvas = paint.Canvas.init(self.decor, bw, bh);
-        canvas.drawChrome(self.opts.style);
+        const m = style.margin;
+        try self.repaintDecor(self.panel_w + 2 * m, self.panel_h + 2 * m);
         self.applySurfaceMetrics();
         self.needs_redraw = true;
     }
 
     // --- drawing --------------------------------------------------------------------
+
+    /// Smallest panel the chrome stays legible at; also what we advertise as min size.
+    fn minPanel(self: *const Window) u32 {
+        return 4 * self.opts.style.margin;
+    }
 
     fn contentRect(self: *Window) Rect {
         const m = self.opts.style.margin;
@@ -282,17 +298,24 @@ pub const Window = struct {
 
         if (self.opts.on_draw) |draw| draw(&canvas, self.contentRect(), self.opts.user);
 
+        // Take the newest frame with a buffer swap: the lock is held for a few word
+        // writes, never for the per-pixel blit, so producers don't spin behind it.
+        // The swapped-out front buffer becomes the producer's next staging capacity.
         self.mutex.lock();
-        if (self.staged.width > 0) {
-            const content = self.contentRect();
-            const fw = @min(self.staged.width, content.w);
-            const fh = @min(self.staged.height, content.h);
-            const dx = content.x + (content.w - fw) / 2;
-            const dy = content.y + (content.h - fh) / 2;
-            canvas.blitRgba(dx, dy, self.staged.pixels.items, self.staged.width, self.staged.height, self.opts.style);
+        if (self.staged.fresh) {
+            std.mem.swap(Staged, &self.staged, &self.front);
             self.staged.fresh = false;
         }
         self.mutex.unlock();
+
+        if (self.front.width > 0) {
+            const content = self.contentRect();
+            const fw = @min(self.front.width, content.w);
+            const fh = @min(self.front.height, content.h);
+            const dx = content.x + (content.w - fw) / 2;
+            const dy = content.y + (content.h - fh) / 2;
+            canvas.blitRgba(dx, dy, self.front.pixels.items, self.front.width, self.front.height, self.opts.style);
+        }
 
         const surface = self.surface.?;
         surface.attach(slot.buffer, 0, 0);
@@ -349,13 +372,21 @@ pub const Window = struct {
         self.buf_w = bw;
         self.buf_h = bh;
 
-        // Repaint the chrome cache for the new size.
-        if (self.decor.len > 0) self.gpa.free(self.decor);
-        self.decor = try self.gpa.alloc(u32, @as(usize, bw) * bh);
+        try self.repaintDecor(bw, bh);
+        self.applySurfaceMetrics();
+    }
+
+    /// (Re)raster the chrome cache at `bw`×`bh`, reusing the allocation when the size
+    /// is unchanged (e.g. a pure style swap).
+    fn repaintDecor(self: *Window, bw: u32, bh: u32) !void {
+        const len = @as(usize, bw) * bh;
+        if (self.decor.len != len) {
+            if (self.decor.len > 0) self.gpa.free(self.decor);
+            self.decor = &.{};
+            self.decor = try self.gpa.alloc(u32, len);
+        }
         var canvas = paint.Canvas.init(self.decor, bw, bh);
         canvas.drawChrome(self.opts.style);
-
-        self.applySurfaceMetrics();
     }
 
     /// Window geometry, input region and blur region all describe the *panel*, not the
@@ -446,8 +477,8 @@ pub const Window = struct {
     fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32, _: ?*anyopaque) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         // The suggested size is window geometry — the panel. 0 means "you pick".
-        if (width > 0) self.panel_w = @max(@as(u32, @intCast(width)), 2 * self.opts.style.margin);
-        if (height > 0) self.panel_h = @max(@as(u32, @intCast(height)), 2 * self.opts.style.margin);
+        if (width > 0) self.panel_w = @max(@as(u32, @intCast(width)), self.minPanel());
+        if (height > 0) self.panel_h = @max(@as(u32, @intCast(height)), self.minPanel());
     }
 
     fn onToplevelClose(data: ?*anyopaque, _: *wl.XdgToplevel) callconv(.c) void {
@@ -533,8 +564,8 @@ pub const Window = struct {
     fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
     fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        const fx = @as(f32, @floatFromInt(x)) / 256.0;
-        const fy = @as(f32, @floatFromInt(y)) / 256.0;
+        const fx = wl.fixedToF32(x);
+        const fy = wl.fixedToF32(y);
         self.pointer_x = fx;
         self.pointer_y = fy;
         if (self.opts.on_mouse) |cb| {
