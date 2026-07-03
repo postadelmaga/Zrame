@@ -109,10 +109,10 @@ pub const Style = struct {
     /// Preset: Aurora Glass (inset blur with wide color fade)
     pub fn aurora() Style {
         return .{
-            .corner_radius = 28,
+            .corner_radius = 24,
             .glass = Color.rgba(137, 180, 250, 0.40),
-            .glass_fade_width = 70.0,
-            .blur_inset = 40.0,
+            .glass_fade_width = 30.0,
+            .blur_inset = 16.0,
             .border_alpha = 0.20,
         };
     }
