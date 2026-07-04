@@ -23,6 +23,8 @@ const plugin = @import("plugin.zig");
 const controls = @import("controls.zig");
 const menu = @import("menu.zig");
 const tray_mod = @import("tray.zig");
+const dbusmenu = @import("dbusmenu.zig");
+const appmenu_mod = @import("appmenu.zig");
 
 pub const Style = paint.Style;
 pub const Panel = plugin.Panel;
@@ -60,6 +62,10 @@ pub const Options = struct {
     /// the window's poll loop. A failure to register (no tray host present) is non-fatal —
     /// the window runs without a tray.
     tray: ?TrayConfig = null,
+    /// Optional KDE global menu (`com.canonical.dbusmenu`). The top-level menus; each
+    /// item's `on_click` receives `user`. `run` exports the menu on the session bus and
+    /// publishes it to KWin via the appmenu Wayland protocol. Non-fatal if unavailable.
+    menu: ?[]const dbusmenu.Item = null,
     user: ?*anyopaque = null,
 };
 
@@ -185,6 +191,11 @@ pub const Window = struct {
     // Optional StatusNotifierItem tray connection; created in `run` when `opts.tray` is set,
     // its bus fd is polled alongside Wayland. Null when no tray or registration failed.
     tray: ?*tray_mod.Tray = null,
+    // Optional KDE global menu: the com.canonical.dbusmenu server plus the Wayland
+    // appmenu object that tells KWin where to find it. Bus fd polled alongside Wayland.
+    menu: ?*dbusmenu.Server = null,
+    appmenu_manager: ?*appmenu_mod.Manager = null,
+    appmenu_obj: ?*appmenu_mod.Appmenu = null,
     // Open handles of `dlopen`'d plugin `.so`s. Closed after `panels.deinit` in `deinit`,
     // because the panels' `deinit` code lives inside these libraries.
     plugin_libs: std.ArrayList(std.DynLib) = .empty,
@@ -293,6 +304,8 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        if (self.appmenu_obj) |o| o.release();
+        if (self.menu) |mnu| mnu.deinit();
         if (self.tray) |t| t.deinit();
         // Panels first (runs plugin `deinit`s), then unload the libraries that hold them.
         self.panels.deinit();
@@ -466,19 +479,27 @@ pub const Window = struct {
             }
         }
 
+        // Bring up the KDE global menu once: export the dbusmenu on the session bus, then
+        // tell KWin its address over the appmenu Wayland protocol. Any failure is non-fatal.
+        if (self.menu == null) {
+            if (self.opts.menu) |items| self.setupMenu(items);
+        }
+
         while (!self.closed) {
             while (wl.wl_display_prepare_read(self.display) != 0) {
                 if (wl.wl_display_dispatch_pending(self.display) < 0) return error.WaylandIo;
             }
             _ = wl.wl_display_flush(self.display);
             if (self.tray) |t| t.flush();
+            if (self.menu) |mnu| mnu.flush();
 
             var fds = [_]posix.pollfd{
                 .{ .fd = wl.wl_display_get_fd(self.display), .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.wake_fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.timer_fd, .events = posix.POLL.IN, .revents = 0 },
-                // Negative fd = ignored by poll, so this slot is inert without a tray.
+                // Negative fd = ignored by poll, so these slots are inert when absent.
                 .{ .fd = if (self.tray) |t| t.fd() else -1, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = if (self.menu) |mnu| mnu.fd() else -1, .events = posix.POLL.IN, .revents = 0 },
             };
             _ = posix.poll(&fds, -1) catch |err| {
                 wl.wl_display_cancel_read(self.display);
@@ -526,6 +547,9 @@ pub const Window = struct {
             if (self.tray) |t| {
                 if (fds[3].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) t.process();
             }
+            if (self.menu) |mnu| {
+                if (fds[4].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) mnu.process();
+            }
 
             if (self.configured and self.needs_redraw) try self.redraw();
         }
@@ -538,6 +562,32 @@ pub const Window = struct {
         if (self.opts.tray) |tc| {
             if (tc.on_activate) |cb| cb(self, self.opts.user);
         }
+    }
+
+    const menu_object_path = "/MenuBar";
+
+    /// Export the global menu on the bus and publish its address to KWin.
+    fn setupMenu(self: *Window, items: []const dbusmenu.Item) void {
+        const server = dbusmenu.Server.init(self.gpa, .{
+            .items = items,
+            .object_path = menu_object_path,
+            .ctx = self.opts.user,
+        }) catch |err| {
+            std.log.warn("zrame: global menu unavailable ({s})", .{@errorName(err)});
+            return;
+        };
+        self.menu = server;
+
+        const mgr = self.appmenu_manager orelse {
+            std.log.warn("zrame: compositor has no org_kde_kwin_appmenu — menu is on the bus but not shown", .{});
+            return;
+        };
+        const surface = self.surface orelse return;
+        const name = server.uniqueName() orelse return;
+        const obj = mgr.create(surface);
+        self.appmenu_obj = obj;
+        obj.setAddress(name, menu_object_path);
+        _ = wl.wl_display_flush(self.display);
     }
 
     /// Animation heartbeat: drain the timerfd, measure real elapsed `dt`, tick every
@@ -938,6 +988,8 @@ pub const Window = struct {
             self.blur_manager = @ptrCast(registry.bind(name, &wl.ext_background_effect_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
             self.cursor_shapes = @ptrCast(registry.bind(name, &wl.wp_cursor_shape_manager_v1_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, appmenu_mod.manager_global)) {
+            self.appmenu_manager = @ptrCast(registry.bind(name, appmenu_mod.manager_interface, 1).?);
         }
     }
 

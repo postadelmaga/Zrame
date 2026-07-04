@@ -11,6 +11,8 @@ const protocol_xmls = [_][]const u8{
     "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml",
     // GPU frames land in the video subsurface as dmabufs (zero-copy path).
     "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
+    // KDE global menu: link the toplevel to a com.canonical.dbusmenu address.
+    "/usr/share/qt6/wayland/protocols/appmenu/appmenu.xml",
 };
 
 pub fn build(b: *std.Build) void {
@@ -50,7 +52,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
 
     // Examples: `zig build run-hello`, `zig build run-frames`.
-    inline for (.{ "hello", "frames", "scroll", "tray" }) |name| {
+    inline for (.{ "hello", "frames", "scroll", "tray", "menu" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
