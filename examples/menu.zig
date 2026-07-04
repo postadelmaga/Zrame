@@ -8,14 +8,25 @@
 const std = @import("std");
 const zrame = @import("zrame");
 
-const Ctx = struct { win: ?*zrame.Window = null };
+// A few panel sizes to spring between; Space cycles them, the File menu jumps to ends.
+const sizes = [_][2]u32{ .{ 420, 300 }, .{ 620, 420 }, .{ 900, 600 } };
+
+const Ctx = struct { win: ?*zrame.Window = null, idx: usize = 1 };
 var ctx: Ctx = .{};
 
-fn onNew(_: ?*anyopaque) void {
-    std.debug.print("menu: File -> New\n", .{});
+fn animateTo(c: ?*anyopaque, i: usize) void {
+    const cx: *Ctx = @ptrCast(@alignCast(c.?));
+    cx.idx = i;
+    if (cx.win) |w| w.animateResize(sizes[i][0], sizes[i][1]);
 }
-fn onOpen(_: ?*anyopaque) void {
-    std.debug.print("menu: File -> Open\n", .{});
+
+fn onNew(c: ?*anyopaque) void {
+    std.debug.print("menu: File -> New (grow)\n", .{});
+    animateTo(c, sizes.len - 1); // spring to the largest size
+}
+fn onOpen(c: ?*anyopaque) void {
+    std.debug.print("menu: File -> Open (shrink)\n", .{});
+    animateTo(c, 0); // spring to the smallest size
 }
 fn onQuit(c: ?*anyopaque) void {
     std.debug.print("menu: File -> Quit\n", .{});
@@ -30,6 +41,17 @@ fn onCopy(_: ?*anyopaque) void {
 }
 fn onAbout(_: ?*anyopaque) void {
     std.debug.print("menu: Help -> About\n", .{});
+}
+
+/// Space cycles through `sizes`, springing the window to each.
+fn onKey(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
+    if (state != 1) return; // press only
+    if (key == zrame.wl.KEY_SPACE) {
+        const cx: *Ctx = @ptrCast(@alignCast(user.?));
+        cx.idx = (cx.idx + 1) % sizes.len;
+        win.animateResize(sizes[cx.idx][0], sizes[cx.idx][1]);
+        std.debug.print("space -> resize to {d}x{d}\n", .{ sizes[cx.idx][0], sizes[cx.idx][1] });
+    }
 }
 
 const menu = [_]zrame.dbusmenu.Item{
@@ -57,17 +79,18 @@ pub fn main() !void {
     const win = try zrame.Window.init(gpa, .{
         .title = "zrame — Global Menu",
         .app_id = "dev.zrame.menu",
-        .width = 560,
-        .height = 360,
+        .width = sizes[1][0],
+        .height = sizes[1][1],
         .titlebar = true,
         .titlebar_style = .macos,
         .style = zrame.Style.macos(),
         .menu = &menu,
+        .on_key = onKey,
         .user = @ptrCast(&ctx),
     });
     defer win.deinit();
     ctx.win = win;
 
-    std.debug.print("global menu published; look in your panel's Global Menu (or the titlebar menu button).\n", .{});
+    std.debug.print("global menu published. Space cycles size; File -> New/Open spring to big/small.\n", .{});
     try win.run();
 }
