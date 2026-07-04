@@ -18,8 +18,14 @@ const linux = std.os.linux;
 const wl = @import("wl.zig");
 const paint = @import("paint.zig");
 const text = @import("text.zig");
+const plugin = @import("plugin.zig");
+const controls = @import("controls.zig");
+const menu = @import("menu.zig");
 
 pub const Style = paint.Style;
+pub const Panel = plugin.Panel;
+pub const Host = plugin.Host;
+pub const TitlebarStyle = controls.Layout;
 
 pub const Options = struct {
     title: [:0]const u8 = "zrame",
@@ -28,6 +34,16 @@ pub const Options = struct {
     width: u32 = 720,
     height: u32 = 460,
     style: Style = .{},
+    /// Draw a client-side title bar with window controls (see [`TitlebarStyle`]). Off by
+    /// default so bare content windows keep the whole panel; the content rect shrinks by
+    /// `titlebar_height` when on.
+    titlebar: bool = false,
+    /// Title-bar height in panel pixels.
+    titlebar_height: u32 = 38,
+    /// Traffic-lights (macOS) or right-aligned buttons (Material). Default macOS.
+    titlebar_style: TitlebarStyle = .macos,
+    /// Client-drawn right-click window menu (Minimize/Maximize/Full Screen/Close).
+    context_menu: bool = true,
     /// Optional painter invoked after the chrome, before any staged frame:
     /// draws app content directly on the canvas (window thread).
     on_draw: ?*const fn (canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void = null,
@@ -45,8 +61,8 @@ pub const MouseEvent = union(enum) {
     button: struct { button: u32, state: u32 },
 };
 
-/// The panel-content rectangle in canvas coordinates.
-pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+/// The panel-content rectangle in canvas coordinates (shared with the plugin seam).
+pub const Rect = plugin.Rect;
 
 const Staged = struct {
     pixels: std.ArrayList(u8) = .empty,
@@ -133,6 +149,26 @@ pub const Window = struct {
     font: ?text.Font = null,
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
+    /// Latest pointer input serial (enter/button), needed by interactive move/resize and
+    /// cursor-shape requests, which the compositor authenticates against a recent serial.
+    pointer_serial: u32 = 0,
+    /// Cursor shape currently requested, so repeated motion doesn't re-issue set_shape.
+    cursor_shape: u32 = wl.CursorShapeDevice.SHAPE_DEFAULT,
+    // Stato massimizzato, come per il fullscreen: rilevato dagli stati del configure,
+    // pilota l'icona massimizza/ripristina dei controlli.
+    maximized: bool = false,
+
+    // Panels (title-bar controls, context menu, scrollbars, dlopen plugins) draw over the
+    // content, receive input before the app callbacks, and animate off a shared clock.
+    panels: plugin.Registry,
+    // timerfd che batte l'orologio d'animazione: armato (~60 Hz) mentre un pannello si
+    // anima, disarmato quando tutto si è assestato così `poll` torna a bloccarsi a riposo.
+    timer_fd: posix.fd_t = -1,
+    timer_armed: bool = false,
+    last_tick_ns: i64 = 0,
+    // Open handles of `dlopen`'d plugin `.so`s. Closed after `panels.deinit` in `deinit`,
+    // because the panels' `deinit` code lives inside these libraries.
+    plugin_libs: std.ArrayList(std.DynLib) = .empty,
 
     // wl_shm double buffer, one pool + mapping shared by both slots.
     shm_fd: posix.fd_t = -1,
@@ -176,6 +212,11 @@ pub const Window = struct {
         const wake_fd: posix.fd_t = @intCast(efd);
         errdefer _ = linux.close(wake_fd);
 
+        const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+        if (linux.errno(tfd) != .SUCCESS) return error.TimerFdFailed;
+        const timer_fd: posix.fd_t = @intCast(tfd);
+        errdefer _ = linux.close(timer_fd);
+
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -186,6 +227,8 @@ pub const Window = struct {
             .panel_w = opts.width,
             .panel_h = opts.height,
             .wake_fd = wake_fd,
+            .timer_fd = timer_fd,
+            .panels = plugin.Registry.init(gpa),
         };
         self.panel_w = @max(self.panel_w, self.minPanel());
         self.panel_h = @max(self.panel_h, self.minPanel());
@@ -212,6 +255,17 @@ pub const Window = struct {
 
         if (self.blur_manager) |mgr| self.blur = mgr.getBackgroundEffect(surface);
 
+        // Register the built-in title-bar controls as the first (bottom-most) panel, then
+        // the context menu on top of it so the menu draws over the bar and grabs input first.
+        if (opts.titlebar) {
+            const c = try controls.Controls.create(gpa, opts.titlebar_style, opts.titlebar_height, opts.title);
+            try self.panels.add(Panel.of(controls.Controls, c), true);
+        }
+        if (opts.context_menu) {
+            const mnu = try menu.Menu.create(gpa);
+            try self.panels.add(Panel.of(menu.Menu, mnu), true);
+        }
+
         // First commit carries no buffer; the compositor answers with configure and
         // only then may we attach pixels.
         surface.commit();
@@ -220,6 +274,10 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        // Panels first (runs plugin `deinit`s), then unload the libraries that hold them.
+        self.panels.deinit();
+        for (self.plugin_libs.items) |*lib| lib.close();
+        self.plugin_libs.deinit(self.gpa);
         self.dropBuffers();
         if (self.font) |*f| f.deinit();
         if (self.decor.len > 0) self.gpa.free(self.decor);
@@ -239,6 +297,7 @@ pub const Window = struct {
         if (self.surface) |s| s.destroy();
         wl.wl_display_disconnect(self.display);
         _ = linux.close(self.wake_fd);
+        if (self.timer_fd >= 0) _ = linux.close(self.timer_fd);
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -378,6 +437,7 @@ pub const Window = struct {
             var fds = [_]posix.pollfd{
                 .{ .fd = wl.wl_display_get_fd(self.display), .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.wake_fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.timer_fd, .events = posix.POLL.IN, .revents = 0 },
             };
             _ = posix.poll(&fds, -1) catch |err| {
                 wl.wl_display_cancel_read(self.display);
@@ -420,8 +480,176 @@ pub const Window = struct {
                 }
             }
 
+            if (fds[2].revents & posix.POLL.IN != 0) self.onTimerTick();
+
             if (self.configured and self.needs_redraw) try self.redraw();
         }
+    }
+
+    /// Animation heartbeat: drain the timerfd, measure real elapsed `dt`, tick every
+    /// panel, and repaint. When nothing wants more frames, disarm so `poll` blocks idle.
+    fn onTimerTick(self: *Window) void {
+        var expirations: u64 = 0;
+        _ = posix.read(self.timer_fd, std.mem.asBytes(&expirations)) catch {};
+        const now = monotonicNs();
+        const dt: f32 = if (self.last_tick_ns != 0)
+            @min(@as(f32, @floatFromInt(now - self.last_tick_ns)) / 1_000_000_000.0, 0.1)
+        else
+            0.016;
+        self.last_tick_ns = now;
+        const active = self.panels.tick(dt, self.host());
+        self.needs_redraw = true;
+        if (!active) self.disarmTimer();
+    }
+
+    fn monotonicNs() i64 {
+        var ts: linux.timespec = undefined;
+        _ = linux.clock_gettime(.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+    }
+
+    /// Register a panel to draw over the content and receive input before the app
+    /// callbacks. `owned` = the registry runs its `deinit` at teardown. Window thread only.
+    pub fn addPanel(self: *Window, panel: Panel, owned: bool) !void {
+        try self.panels.add(panel, owned);
+        self.needs_redraw = true;
+    }
+
+    /// Remove a previously added panel by its instance pointer (runs `deinit` if owned).
+    pub fn removePanel(self: *Window, ptr: *anyopaque) void {
+        self.panels.remove(ptr);
+        self.needs_redraw = true;
+    }
+
+    /// Load a single plugin `.so` and let it register its panels (see `plugin.loadPlugin`).
+    /// Window thread only. The library stays loaded until `deinit`.
+    pub fn loadPlugin(self: *Window, path: []const u8) !void {
+        const lib = try plugin.loadPlugin(&self.panels, path);
+        try self.plugin_libs.append(self.gpa, lib);
+        self.needs_redraw = true;
+    }
+
+    /// Load every `*.so` in `dir_path`. Missing directory is a no-op; a plugin that fails
+    /// to load is logged and skipped, not fatal. Window thread only.
+    pub fn loadPluginDir(self: *Window, dir_path: []const u8) !void {
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |ent| {
+            if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, ".so")) continue;
+            const full = try std.fs.path.join(self.gpa, &.{ dir_path, ent.name });
+            defer self.gpa.free(full);
+            self.loadPlugin(full) catch |e| std.log.warn("zrame: plugin {s} failed to load: {}", .{ ent.name, e });
+        }
+    }
+
+    /// The narrow interface panels use to reach back into the window (see `plugin.zig`).
+    pub fn host(self: *Window) Host {
+        return .{ .ptr = self, .vtable = &host_vtable };
+    }
+
+    const host_vtable = Host.VTable{ .do = hostDo, .info = hostInfo, .font = hostFont };
+
+    fn hostDo(ptr: *anyopaque, action: plugin.Action) void {
+        const self: *Window = @ptrCast(@alignCast(ptr));
+        switch (action) {
+            .minimize => if (self.toplevel) |t| t.setMinimized(),
+            .toggle_maximize => if (self.toplevel) |t| {
+                if (self.maximized) t.unsetMaximized() else t.setMaximized();
+            },
+            .toggle_fullscreen => self.toggleFullscreen(),
+            .close => self.closed = true,
+            .begin_move => if (self.toplevel) |t| {
+                if (self.seat) |s| t.move(s, self.pointer_serial);
+            },
+            .begin_resize => |edge| if (self.toplevel) |t| {
+                if (self.seat) |s| t.resize(s, self.pointer_serial, edge);
+            },
+            .set_cursor => |shape| self.setCursorShape(shape),
+            .request_redraw => self.needs_redraw = true,
+        }
+    }
+
+    /// Request a `wp_cursor_shape_device` shape, skipping the round-trip when unchanged.
+    fn setCursorShape(self: *Window, shape: u32) void {
+        if (shape == self.cursor_shape) return;
+        self.cursor_shape = shape;
+        if (self.cursor_device) |d| d.setShape(self.pointer_serial, shape);
+    }
+
+    /// The `xdg_toplevel` resize-edge bitmask for a pointer at canvas `(sx,sy)`: an 8px
+    /// band around the panel border, corners combining two edges. NONE in the interior.
+    fn resizeEdgeAt(self: *const Window, sx: f32, sy: f32) u32 {
+        const m: f32 = @floatFromInt(self.opts.style.margin);
+        const px = sx - m;
+        const py = sy - m;
+        const w: f32 = @floatFromInt(self.panel_w);
+        const h: f32 = @floatFromInt(self.panel_h);
+        if (px < 0 or py < 0 or px >= w or py >= h) return wl.RESIZE_EDGE_NONE;
+        const band: f32 = 8.0;
+        var edge: u32 = 0;
+        if (py < band) edge |= wl.RESIZE_EDGE_TOP;
+        if (py >= h - band) edge |= wl.RESIZE_EDGE_BOTTOM;
+        if (px < band) edge |= wl.RESIZE_EDGE_LEFT;
+        if (px >= w - band) edge |= wl.RESIZE_EDGE_RIGHT;
+        return edge;
+    }
+
+    fn edgeCursor(edge: u32) u32 {
+        return switch (edge) {
+            wl.RESIZE_EDGE_TOP, wl.RESIZE_EDGE_BOTTOM => wl.CursorShapeDevice.SHAPE_NS_RESIZE,
+            wl.RESIZE_EDGE_LEFT, wl.RESIZE_EDGE_RIGHT => wl.CursorShapeDevice.SHAPE_EW_RESIZE,
+            wl.RESIZE_EDGE_TOP_LEFT, wl.RESIZE_EDGE_BOTTOM_RIGHT => wl.CursorShapeDevice.SHAPE_NWSE_RESIZE,
+            wl.RESIZE_EDGE_TOP_RIGHT, wl.RESIZE_EDGE_BOTTOM_LEFT => wl.CursorShapeDevice.SHAPE_NESW_RESIZE,
+            else => wl.CursorShapeDevice.SHAPE_DEFAULT,
+        };
+    }
+
+    fn hostInfo(ptr: *anyopaque) plugin.Info {
+        const self: *Window = @ptrCast(@alignCast(ptr));
+        return .{
+            .content = self.contentRect(),
+            .panel_w = self.panel_w,
+            .panel_h = self.panel_h,
+            .margin = self.opts.style.margin,
+            .maximized = self.maximized,
+            .fullscreen = self.fullscreen,
+        };
+    }
+
+    fn hostFont(ptr: *anyopaque) ?*text.Font {
+        const self: *Window = @ptrCast(@alignCast(ptr));
+        return self.textFont() catch null;
+    }
+
+    /// Route an input event through the panels; returns true if a panel consumed it.
+    /// Any input may have started an animation, so we (cheaply) re-arm the timer, which
+    /// self-disarms on the first tick that reports nothing left to animate.
+    fn routeInput(self: *Window, event: plugin.Event) bool {
+        const consumed = self.panels.route(event, self.host());
+        if (consumed) self.needs_redraw = true;
+        self.armTimer();
+        return consumed;
+    }
+
+    fn armTimer(self: *Window) void {
+        if (self.timer_armed) return;
+        // ~60 Hz repeating tick.
+        const spec = linux.itimerspec{
+            .it_interval = .{ .sec = 0, .nsec = 16_666_667 },
+            .it_value = .{ .sec = 0, .nsec = 16_666_667 },
+        };
+        _ = linux.timerfd_settime(self.timer_fd, .{}, &spec, null);
+        self.timer_armed = true;
+        self.last_tick_ns = monotonicNs();
+    }
+
+    fn disarmTimer(self: *Window) void {
+        if (!self.timer_armed) return;
+        const spec = std.mem.zeroes(linux.itimerspec);
+        _ = linux.timerfd_settime(self.timer_fd, .{}, &spec, null);
+        self.timer_armed = false;
+        self.last_tick_ns = 0;
     }
 
     /// Ask the loop to exit (safe from listeners on the window thread).
@@ -476,9 +704,17 @@ pub const Window = struct {
         return 4 * self.opts.style.margin;
     }
 
+    /// Height the title bar steals from the top of the content (0 when disabled or in
+    /// fullscreen, where the chrome is hidden).
+    fn titlebarHeight(self: *const Window) u32 {
+        if (!self.opts.titlebar or self.fullscreen) return 0;
+        return @min(self.opts.titlebar_height, self.panel_h);
+    }
+
     fn contentRect(self: *Window) Rect {
         const m = self.opts.style.margin;
-        return .{ .x = m, .y = m, .w = self.panel_w, .h = self.panel_h };
+        const tb = self.titlebarHeight();
+        return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
     }
 
     fn redraw(self: *Window) !void {
@@ -511,6 +747,10 @@ pub const Window = struct {
             const dy = content.y + (content.h - fh) / 2;
             canvas.blitRgba(dx, dy, self.front.pixels.items, self.front.width, self.front.height, self.opts.style);
         }
+
+        // Panels (title bar, scrollbars, context menu, plugins) composite last, on top of
+        // both app content and any video frame.
+        self.panels.draw(&canvas, self.host());
 
         const surface = self.surface.?;
         surface.attach(slot.buffer, 0, 0);
@@ -678,24 +918,25 @@ pub const Window = struct {
     // wl_array: buffer dinamico Wayland. `states` di xdg_toplevel.configure è un
     // array di u32 (enum di stato); `size` è in byte.
     const WlArray = extern struct { size: usize, alloc: usize, data: ?[*]u32 };
-    // xdg_toplevel.state
-    const STATE_FULLSCREEN: u32 = 2;
 
     fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32, states: ?*anyopaque) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
 
-        // Rileva lo stato fullscreen dall'array di stati del compositore.
+        // Rileva fullscreen e massimizzato dall'array di stati del compositore.
         var is_fs = false;
+        var is_max = false;
         if (states) |sp| {
             const arr: *const WlArray = @ptrCast(@alignCast(sp));
             if (arr.data) |d| {
                 const n = arr.size / @sizeOf(u32);
                 var i: usize = 0;
                 while (i < n) : (i += 1) {
-                    if (d[i] == STATE_FULLSCREEN) is_fs = true;
+                    if (d[i] == wl.STATE_FULLSCREEN) is_fs = true;
+                    if (d[i] == wl.STATE_MAXIMIZED) is_max = true;
                 }
             }
         }
+        self.maximized = is_max;
 
         // Ingresso/uscita da fullscreen: azzera o ripristina gutter/ombra/angoli.
         // La dimensione la porta il `width`/`height` di questa stessa configure;
@@ -778,7 +1019,9 @@ pub const Window = struct {
 
     fn onKey(data: ?*anyopaque, _: *wl.Keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        if (key == wl.KEY_ESC and state == wl.KEYBOARD_KEY_STATE_PRESSED) self.closed = true;
+        const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
+        if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
+        if (key == wl.KEY_ESC and pressed) self.closed = true;
         if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
     }
 
@@ -801,6 +1044,8 @@ pub const Window = struct {
 
     fn onPointerEnter(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: ?*wl.Surface, _: wl.Fixed, _: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+        self.pointer_serial = serial;
+        self.cursor_shape = wl.CursorShapeDevice.SHAPE_DEFAULT;
         if (self.cursor_device) |device| device.setShape(serial, wl.CursorShapeDevice.SHAPE_DEFAULT);
     }
 
@@ -811,6 +1056,13 @@ pub const Window = struct {
         const fy = wl.fixedToF32(y);
         self.pointer_x = fx;
         self.pointer_y = fy;
+        if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
+        // Not over a panel: reflect the resize band in the cursor, else default.
+        if (!self.fullscreen and !self.maximized) {
+            self.setCursorShape(edgeCursor(self.resizeEdgeAt(fx, fy)));
+        } else {
+            self.setCursorShape(wl.CursorShapeDevice.SHAPE_DEFAULT);
+        }
         if (self.opts.on_mouse) |cb| {
             cb(self, .{ .motion = .{ .x = fx, .y = fy } }, self.opts.user);
         }
@@ -818,24 +1070,34 @@ pub const Window = struct {
 
     fn onPointerButton(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+        self.pointer_serial = serial;
+        const pressed = state == wl.POINTER_BUTTON_STATE_PRESSED;
+        if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = button, .pressed = pressed } })) return;
         if (self.opts.on_mouse) |cb| {
             cb(self, .{ .button = .{ .button = button, .state = state } }, self.opts.user);
         }
         if (button == wl.BTN_LEFT and state == wl.POINTER_BUTTON_STATE_PRESSED) {
-            const m = @as(f32, @floatFromInt(self.opts.style.margin));
-            const px = self.pointer_x - m;
-            const py = self.pointer_y - m;
-            const w = @as(f32, @floatFromInt(self.panel_w));
-            const h = @as(f32, @floatFromInt(self.panel_h));
-            const near_edge = (px < 30.0 or py < 30.0 or px > w - 30.0 or py > h - 30.0);
-            if (near_edge) {
-                if (self.seat) |seat| self.toplevel.?.move(seat, serial);
+            const edge = self.resizeEdgeAt(self.pointer_x, self.pointer_y);
+            if (edge != wl.RESIZE_EDGE_NONE and !self.fullscreen and !self.maximized) {
+                if (self.seat) |seat| self.toplevel.?.resize(seat, serial, edge);
+            } else if (!self.opts.titlebar) {
+                // No title bar to grab: keep the panel draggable from near its edge, as
+                // before. With a title bar, dragging is the bar's job (see controls.zig).
+                const m = @as(f32, @floatFromInt(self.opts.style.margin));
+                const px = self.pointer_x - m;
+                const py = self.pointer_y - m;
+                const w = @as(f32, @floatFromInt(self.panel_w));
+                const h = @as(f32, @floatFromInt(self.panel_h));
+                if (px < 30.0 or py < 30.0 or px > w - 30.0 or py > h - 30.0) {
+                    if (self.seat) |seat| self.toplevel.?.move(seat, serial);
+                }
             }
         }
     }
 
     fn onPointerAxis(data: ?*anyopaque, _: *wl.Pointer, _: u32, axis: u32, value: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+        if (self.routeInput(.{ .axis = .{ .x = self.pointer_x, .y = self.pointer_y, .axis = axis, .value = wl.fixedToF32(value), .line = true } })) return;
         if (self.opts.on_scroll) |cb| cb(self, axis, value, self.opts.user);
     }
     fn onPointerFrame(_: ?*anyopaque, _: *wl.Pointer) callconv(.c) void {}

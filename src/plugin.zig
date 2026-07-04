@@ -1,0 +1,340 @@
+//! # zrame.plugin — the extension seam
+//!
+//! Everything interactive in zrame — the title-bar controls, the context menu, the
+//! scrollbars — is a *panel*: a thing the window draws over its content, routes input
+//! to, and ticks once per animation frame. The window owns a [`Registry`] of panels
+//! and knows nothing about what any of them do; a panel reaches back to the window only
+//! through the narrow [`Host`] interface (minimize/close/resize/geometry/font).
+//!
+//! This is deliberately the same shape a loadable plugin needs. In-process Zig panels
+//! (`controls.zig`, `menu.zig`, `scroll.zig`) implement [`Panel`] directly; a future
+//! `dlopen`'d `.so` (see `loadDir`) exposes a C-ABI vtable that a shim adapts to the
+//! very same [`Panel`]. Building the built-ins on this contract first is how we know the
+//! contract is right before it's frozen across the C boundary.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const paint = @import("paint.zig");
+const text = @import("text.zig");
+
+/// An axis-aligned rectangle in canvas (buffer) pixels — the coordinate space of both
+/// the [`paint.Canvas`] and the pointer events (surface-local == buffer-local here).
+pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+
+/// An input event delivered to panels. Coordinates are canvas pixels (include the shadow
+/// gutter margin), matching what a panel sees when it draws. Richer than zicro's
+/// `input.InputEvent`: buttons/axes carry a position, scroll carries a real axis and a
+/// line/pixel hint, so scrollbars can smooth wheel notches but not trackpad pixels.
+pub const Event = union(enum) {
+    motion: struct { x: f32, y: f32 },
+    button: struct { x: f32, y: f32, button: u32, pressed: bool },
+    /// `axis` is `wl_pointer` axis (0 = vertical, 1 = horizontal); `value` is the scroll
+    /// amount (fixed→f32); `line` is true for discrete mouse-wheel steps (smooth them),
+    /// false for trackpad pixel deltas (apply verbatim).
+    axis: struct { x: f32, y: f32, axis: u32, value: f32, line: bool },
+    key: struct { key: u32, pressed: bool },
+};
+
+/// A window operation a panel asks the host to perform. The host owns the Wayland
+/// objects and the input serial, so a panel never touches them directly.
+pub const Action = union(enum) {
+    minimize,
+    toggle_maximize,
+    toggle_fullscreen,
+    close,
+    /// Start an interactive move (compositor grabs the last pointer serial).
+    begin_move,
+    /// Start an interactive resize toward an `xdg_toplevel` edge bitmask.
+    begin_resize: u32,
+    /// Set the pointer cursor to a `wp_cursor_shape_device_v1` shape id.
+    set_cursor: u32,
+    /// Force a repaint next loop turn even if nothing else is dirty.
+    request_redraw,
+};
+
+/// A snapshot of window geometry and state, handed to panels each draw/input so they can
+/// lay themselves out without holding a reference to the window.
+pub const Info = struct {
+    /// Content rectangle (panel interior, canvas coords): `{margin, margin, panel_w, panel_h}`.
+    content: Rect,
+    panel_w: u32,
+    panel_h: u32,
+    margin: u32,
+    maximized: bool,
+    fullscreen: bool,
+};
+
+/// The window, as a panel sees it: three calls, no Wayland types. `window.zig` builds one
+/// of these over itself; the dlopen loader will build one whose calls cross into C.
+pub const Host = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        do: *const fn (ptr: *anyopaque, action: Action) void,
+        info: *const fn (ptr: *anyopaque) Info,
+        font: *const fn (ptr: *anyopaque) ?*text.Font,
+    };
+
+    pub inline fn do(self: Host, action: Action) void {
+        self.vtable.do(self.ptr, action);
+    }
+    pub inline fn info(self: Host) Info {
+        return self.vtable.info(self.ptr);
+    }
+    pub inline fn font(self: Host) ?*text.Font {
+        return self.vtable.font(self.ptr);
+    }
+};
+
+/// A drawable, interactive, animatable overlay. Implement `draw` and `onInput` on a
+/// struct `T`; optionally `tick` (return true while still animating) and `deinit` (only
+/// called for panels the registry owns). Wrap it with [`Panel.of`].
+pub const Panel = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Paint over the window content. Called every redraw, low z-order first.
+        draw: *const fn (ptr: *anyopaque, canvas: *paint.Canvas, host: Host) void,
+        /// Handle an event; return true to consume it (stops propagation to lower
+        /// panels and to the app callbacks).
+        on_input: *const fn (ptr: *anyopaque, event: Event, host: Host) bool,
+        /// Advance animation by `dt` seconds; return true while more frames are needed.
+        tick: *const fn (ptr: *anyopaque, dt: f32, host: Host) bool,
+        /// Release resources. `null` for borrowed (caller-owned) panels.
+        deinit: ?*const fn (ptr: *anyopaque, gpa: Allocator) void,
+    };
+
+    /// Build a `Panel` from `*T`, deriving the vtable from `T`'s methods. `T.draw` and
+    /// `T.onInput` are required; `T.tick` and `T.deinit` are optional.
+    pub fn of(comptime T: type, instance: *T) Panel {
+        const gen = struct {
+            fn drawFn(ptr: *anyopaque, canvas: *paint.Canvas, host: Host) void {
+                T.draw(@ptrCast(@alignCast(ptr)), canvas, host);
+            }
+            fn inputFn(ptr: *anyopaque, event: Event, host: Host) bool {
+                return T.onInput(@ptrCast(@alignCast(ptr)), event, host);
+            }
+            fn tickFn(ptr: *anyopaque, dt: f32, host: Host) bool {
+                if (@hasDecl(T, "tick")) return T.tick(@ptrCast(@alignCast(ptr)), dt, host);
+                return false;
+            }
+            fn deinitFn(ptr: *anyopaque, gpa: Allocator) void {
+                T.deinit(@ptrCast(@alignCast(ptr)), gpa);
+            }
+            const vtable = VTable{
+                .draw = drawFn,
+                .on_input = inputFn,
+                .tick = tickFn,
+                .deinit = if (@hasDecl(T, "deinit")) deinitFn else null,
+            };
+        };
+        return .{ .ptr = instance, .vtable = &gen.vtable };
+    }
+
+    pub inline fn draw(self: Panel, canvas: *paint.Canvas, host: Host) void {
+        self.vtable.draw(self.ptr, canvas, host);
+    }
+    pub inline fn onInput(self: Panel, event: Event, host: Host) bool {
+        return self.vtable.on_input(self.ptr, event, host);
+    }
+    pub inline fn tick(self: Panel, dt: f32, host: Host) bool {
+        return self.vtable.tick(self.ptr, dt, host);
+    }
+};
+
+/// The window's ordered set of panels. Draw order is insertion order (first added is
+/// bottom-most); input is offered top-most first and stops at the first consumer.
+pub const Registry = struct {
+    gpa: Allocator,
+    panels: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { panel: Panel, owned: bool };
+
+    pub fn init(gpa: Allocator) Registry {
+        return .{ .gpa = gpa };
+    }
+
+    /// Register a panel. `owned` = the registry calls its `deinit` (and, once dlopen
+    /// lands, frees/`dlclose`s it) at teardown; borrowed panels are left to the caller.
+    pub fn add(self: *Registry, panel: Panel, owned: bool) !void {
+        try self.panels.append(self.gpa, .{ .panel = panel, .owned = owned });
+    }
+
+    /// Remove the first entry whose panel points at `ptr`. Runs its `deinit` if owned.
+    pub fn remove(self: *Registry, ptr: *anyopaque) void {
+        for (self.panels.items, 0..) |e, i| {
+            if (e.panel.ptr == ptr) {
+                if (e.owned) if (e.panel.vtable.deinit) |d| d(e.panel.ptr, self.gpa);
+                _ = self.panels.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Paint every panel, bottom-most first.
+    pub fn draw(self: *Registry, canvas: *paint.Canvas, host: Host) void {
+        for (self.panels.items) |e| e.panel.draw(canvas, host);
+    }
+
+    /// Offer `event` top-most first; stop and return true at the first consumer.
+    pub fn route(self: *Registry, event: Event, host: Host) bool {
+        var i = self.panels.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.panels.items[i].panel.onInput(event, host)) return true;
+        }
+        return false;
+    }
+
+    /// Tick every panel; return true if any still wants frames.
+    pub fn tick(self: *Registry, dt: f32, host: Host) bool {
+        var active = false;
+        for (self.panels.items) |e| {
+            if (e.panel.tick(dt, host)) active = true;
+        }
+        return active;
+    }
+
+    pub fn deinit(self: *Registry) void {
+        for (self.panels.items) |e| {
+            if (e.owned) if (e.panel.vtable.deinit) |d| d(e.panel.ptr, self.gpa);
+        }
+        self.panels.deinit(self.gpa);
+    }
+};
+
+// --- dlopen loader ---------------------------------------------------------------------
+
+/// The C-ABI entry point a loadable plugin `.so` must export under [`register_symbol`].
+/// It receives the window's panel [`Registry`] and registers whatever it provides —
+/// typically `reg.add(Panel.of(MyPanel, instance), true)` for a UI panel, or a Zicro
+/// `core.Module` for a headless one. Allocate through `reg.gpa`. Returns 0 on success.
+///
+/// The plugin is a Zig object built against this same `zrame` module, so it shares the
+/// `Panel`/`Registry`/`Host` layouts and can call `Canvas` drawing directly — nothing but
+/// these plain structs and function pointers crosses the boundary. (The allocator isn't a
+/// parameter because `std.mem.Allocator` has no guaranteed C-ABI layout; it rides along
+/// inside the `Registry` instead.)
+pub const RegisterFn = *const fn (reg: *Registry) callconv(.c) c_int;
+
+pub const register_symbol = "zrame_plugin_register";
+
+/// `dlopen` `path`, resolve [`register_symbol`], and let it register its panels into
+/// `reg`. Returns the open library handle — keep it alive for as long as the panels are
+/// registered, and `close()` it only *after* the registry has run their `deinit`s (their
+/// code lives in the library). See `Window.loadPlugin`.
+pub fn loadPlugin(reg: *Registry, path: []const u8) !std.DynLib {
+    var lib = try std.DynLib.open(path);
+    errdefer lib.close();
+    const reg_fn = lib.lookup(RegisterFn, register_symbol) orelse return error.MissingPluginEntry;
+    if (reg_fn(reg) != 0) return error.PluginRegisterFailed;
+    return lib;
+}
+
+// --- tests -----------------------------------------------------------------------------
+
+const TestPanel = struct {
+    draws: u32 = 0,
+    inputs: u32 = 0,
+    ticks: u32 = 0,
+    consume: bool = false,
+    frames_left: u32 = 0,
+    deinited: *bool,
+
+    fn draw(self: *TestPanel, canvas: *paint.Canvas, host: Host) void {
+        _ = canvas;
+        _ = host;
+        self.draws += 1;
+    }
+    fn onInput(self: *TestPanel, event: Event, host: Host) bool {
+        _ = event;
+        _ = host;
+        self.inputs += 1;
+        return self.consume;
+    }
+    fn tick(self: *TestPanel, dt: f32, host: Host) bool {
+        _ = dt;
+        _ = host;
+        self.ticks += 1;
+        if (self.frames_left > 0) self.frames_left -= 1;
+        return self.frames_left > 0;
+    }
+    fn deinit(self: *TestPanel, gpa: Allocator) void {
+        _ = gpa;
+        self.deinited.* = true;
+    }
+};
+
+fn nullHost() Host {
+    const gen = struct {
+        fn do(_: *anyopaque, _: Action) void {}
+        fn info(_: *anyopaque) Info {
+            return .{ .content = .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .panel_w = 0, .panel_h = 0, .margin = 0, .maximized = false, .fullscreen = false };
+        }
+        fn font(_: *anyopaque) ?*text.Font {
+            return null;
+        }
+        const vtable = Host.VTable{ .do = do, .info = info, .font = font };
+        var dummy: u8 = 0;
+    };
+    return .{ .ptr = &gen.dummy, .vtable = &gen.vtable };
+}
+
+test "registry routes top-most first and stops at a consumer" {
+    const gpa = std.testing.allocator;
+    var d1 = false;
+    var d2 = false;
+    var bottom = TestPanel{ .deinited = &d1, .consume = false };
+    var top = TestPanel{ .deinited = &d2, .consume = true };
+
+    var reg = Registry.init(gpa);
+    defer reg.deinit();
+    try reg.add(Panel.of(TestPanel, &bottom), false);
+    try reg.add(Panel.of(TestPanel, &top), false);
+
+    const host = nullHost();
+    const consumed = reg.route(.{ .motion = .{ .x = 1, .y = 2 } }, host);
+    try std.testing.expect(consumed);
+    // Top consumed it; bottom never saw it.
+    try std.testing.expectEqual(@as(u32, 1), top.inputs);
+    try std.testing.expectEqual(@as(u32, 0), bottom.inputs);
+}
+
+test "registry draws bottom-most first and ticks report activity" {
+    const gpa = std.testing.allocator;
+    var d = false;
+    var p = TestPanel{ .deinited = &d, .frames_left = 3 };
+
+    var reg = Registry.init(gpa);
+    defer reg.deinit();
+    try reg.add(Panel.of(TestPanel, &p), false);
+
+    const host = nullHost();
+    var px: [1]u32 = .{0};
+    var canvas = paint.Canvas.init(&px, 1, 1);
+    reg.draw(&canvas, host);
+    try std.testing.expectEqual(@as(u32, 1), p.draws);
+
+    try std.testing.expect(reg.tick(0.016, host)); // 3 -> 2, still active
+    try std.testing.expect(reg.tick(0.016, host)); // 2 -> 1, still active
+    try std.testing.expect(!reg.tick(0.016, host)); // 1 -> 0, done
+}
+
+test "owned panels are deinited, borrowed ones are not" {
+    const gpa = std.testing.allocator;
+    var owned_deinited = false;
+    var borrowed_deinited = false;
+    var owned = TestPanel{ .deinited = &owned_deinited };
+    var borrowed = TestPanel{ .deinited = &borrowed_deinited };
+
+    var reg = Registry.init(gpa);
+    try reg.add(Panel.of(TestPanel, &owned), true);
+    try reg.add(Panel.of(TestPanel, &borrowed), false);
+    reg.deinit();
+
+    try std.testing.expect(owned_deinited);
+    try std.testing.expect(!borrowed_deinited);
+}

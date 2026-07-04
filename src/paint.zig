@@ -46,6 +46,21 @@ pub fn roundedRectSdf(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, radius: 
     return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - radius;
 }
 
+/// Signed distance from `(px,py)` to the line segment `a`→`b`: the capsule/stadium
+/// distance (zero on the segment's spine, growing outward). Feeds thin strokes — the
+/// close ✕ and the minimize – are just two/one of these.
+pub fn segmentSdf(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) f32 {
+    const pax = px - ax;
+    const pay = py - ay;
+    const bax = bx - ax;
+    const bay = by - ay;
+    const len2 = bax * bax + bay * bay;
+    const h = if (len2 > 0.0) std.math.clamp((pax * bax + pay * bay) / len2, 0.0, 1.0) else 0.0;
+    const dx = pax - bax * h;
+    const dy = pay - bay * h;
+    return @sqrt(dx * dx + dy * dy);
+}
+
 fn smoothstep(edge0: f32, edge1: f32, x: f32) f32 {
     const t = std.math.clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
@@ -54,6 +69,26 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) f32 {
 /// Pixel coverage of an SDF: full at d <= -0.5, zero at d >= 0.5.
 fn coverage(d: f32) f32 {
     return std.math.clamp(0.5 - d, 0.0, 1.0);
+}
+
+/// sRGB (0..1) → luce lineare (0..1). Serve per fondere l'antialiasing dei glifi
+/// in spazio lineare (resa tipografica): fondere la copertura direttamente in
+/// sRGB assottiglia e sporca i bordi del testo, specie su fondo scuro.
+fn srgbToLinear(u: f32) f32 {
+    return if (u <= 0.04045) u / 12.92 else std.math.pow(f32, (u + 0.055) / 1.055, 2.4);
+}
+
+/// Luce lineare (0..1) → sRGB (0..1).
+fn linearToSrgb(u: f32) f32 {
+    const x = std.math.clamp(u, 0.0, 1.0);
+    return if (x <= 0.0031308) x * 12.92 else 1.055 * std.math.pow(f32, x, 1.0 / 2.4) - 0.055;
+}
+
+/// "Font smoothing" in stile macOS: solleva la copertura media per ingrassare
+/// leggermente i tratti (macOS rende il testo più pieno e morbido del grayscale
+/// grezzo). Esponente < 1 → più pieno.
+fn smoothCoverage(a: f32) f32 {
+    return std.math.pow(f32, std.math.clamp(a, 0.0, 1.0), 0.72);
 }
 
 /// Pack already-premultiplied channels (each in [0,1]) into an ARGB8888 pixel.
@@ -182,10 +217,44 @@ pub const Canvas = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    /// Optional scissor rect (pixel bounds, `x1`/`y1` exclusive). When set, every draw
+    /// primitive is confined to it — how apps keep scrolled content from bleeding over
+    /// the chrome. `null` = draw to the whole canvas.
+    clip: ?Clip = null,
+
+    pub const Clip = struct { x0: u32, y0: u32, x1: u32, y1: u32 };
 
     pub fn init(pixels: []u32, width: u32, height: u32) Canvas {
         std.debug.assert(pixels.len == @as(usize, width) * @as(usize, height));
         return .{ .pixels = pixels, .width = width, .height = height };
+    }
+
+    /// Restrict subsequent drawing to `(x,y,w,h)` (canvas coords), intersected with the
+    /// canvas. Returns the previous clip so callers can restore it
+    /// (`const saved = canvas.setClip(...); defer canvas.clip = saved;`).
+    pub fn setClip(self: *Canvas, x: u32, y: u32, w: u32, h: u32) ?Clip {
+        const saved = self.clip;
+        self.clip = .{
+            .x0 = @min(x, self.width),
+            .y0 = @min(y, self.height),
+            .x1 = @min(x +| w, self.width),
+            .y1 = @min(y +| h, self.height),
+        };
+        return saved;
+    }
+
+    /// Iteration bounds `[x0,x1)×[y0,y1)` intersected with the active clip (if any).
+    fn clipBounds(self: *const Canvas, x0: u32, y0: u32, x1: u32, y1: u32) [4]u32 {
+        if (self.clip) |c| {
+            return .{ @max(x0, c.x0), @max(y0, c.y0), @min(x1, c.x1), @min(y1, c.y1) };
+        }
+        return .{ x0, y0, x1, y1 };
+    }
+
+    /// Is pixel `(x,y)` inside the active clip? (For per-pixel primitives like glyphs.)
+    fn inClip(self: *const Canvas, x: u32, y: u32) bool {
+        if (self.clip) |c| return x >= c.x0 and x < c.x1 and y >= c.y0 and y < c.y1;
+        return true;
     }
 
     /// Paint the full window chrome: transparent gutter, drop shadow, glass panel,
@@ -314,10 +383,11 @@ pub const Canvas = struct {
     /// Fill a rounded rect with a straight-alpha color (source-over). For decorative
     /// content drawn by apps that don't push zicro frames.
     pub fn fillRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) void {
-        const x0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
-        const y0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
-        const x1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
-        const y1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - 1)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(y - 1)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + 1)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + 1)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
         var py: u32 = y0;
         while (py < y1) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
@@ -329,6 +399,73 @@ pub const Canvas = struct {
                 if (cov <= 0.0) continue;
                 const sa = color.a * cov;
 
+                const dr, const dg, const db, const da = unpackPremul(row[px]);
+                const inv = 1.0 - sa;
+                row[px] = packPremul(
+                    color.r * sa + dr * inv,
+                    color.g * sa + dg * inv,
+                    color.b * sa + db * inv,
+                    sa + da * inv,
+                );
+            }
+        }
+    }
+
+    /// Stroke the line segment `a`→`b` as a rounded (capsule) stroke of the given
+    /// `width`, anti-aliased and source-over composited. The building block for the
+    /// procedural window-control glyphs (✕, –).
+    pub fn strokeSegment(self: *Canvas, ax: f32, ay: f32, bx: f32, by: f32, width: f32, color: Color) void {
+        const r = width / 2.0;
+        const minx = @min(ax, bx) - r - 1.0;
+        const miny = @min(ay, by) - r - 1.0;
+        const maxx = @max(ax, bx) + r + 1.0;
+        const maxy = @max(ay, by) + r + 1.0;
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(minx)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(miny)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(maxx)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(maxy)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const cov = coverage(segmentSdf(fx, fy, ax, ay, bx, by) - r);
+                if (cov <= 0.0) continue;
+                const sa = color.a * cov;
+                const dr, const dg, const db, const da = unpackPremul(row[px]);
+                const inv = 1.0 - sa;
+                row[px] = packPremul(
+                    color.r * sa + dr * inv,
+                    color.g * sa + dg * inv,
+                    color.b * sa + db * inv,
+                    sa + da * inv,
+                );
+            }
+        }
+    }
+
+    /// Stroke the outline of a rounded rect: coverage of `|sdf| - stroke/2`, so the fill
+    /// stays hollow. The maximize ▢ and the restore double-square are drawn with this.
+    pub fn strokeRoundedRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, stroke: f32, color: Color) void {
+        const hs = stroke / 2.0;
+        const bx0: u32 = @intFromFloat(@max(0.0, @floor(x - hs - 1)));
+        const by0: u32 = @intFromFloat(@max(0.0, @floor(y - hs - 1)));
+        const bx1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(0.0, @ceil(x + w + hs + 1)))));
+        const by1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(0.0, @ceil(y + h + hs + 1)))));
+        const x0, const y0, const x1, const y1 = self.clipBounds(bx0, by0, bx1, by1);
+        var py: u32 = y0;
+        while (py < y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row = self.pixels[@as(usize, py) * self.width ..][0..self.width];
+            var px: u32 = x0;
+            while (px < x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const cov = coverage(@abs(roundedRectSdf(fx, fy, x, y, w, h, radius)) - hs);
+                if (cov <= 0.0) continue;
+                const sa = color.a * cov;
                 const dr, const dg, const db, const da = unpackPremul(row[px]);
                 const inv = 1.0 - sa;
                 row[px] = packPremul(
@@ -374,17 +511,23 @@ pub const Canvas = struct {
             while (gx < g.w) : (gx += 1) {
                 const px = gx0 + gx;
                 if (px < 0 or px >= W) continue;
+                if (!self.inClip(@intCast(px), @intCast(py))) continue;
                 const cov = g.bitmap[@intCast(gy * g.w + gx)];
                 if (cov == 0) continue;
-                const sa = color.a * (@as(f32, @floatFromInt(cov)) / 255.0);
+                // Stem darkening in stile macOS + copertura → alpha.
+                const a0 = smoothCoverage(@as(f32, @floatFromInt(cov)) / 255.0);
+                const sa = color.a * a0;
                 if (sa <= 0.0) continue;
                 const idx = @as(usize, @intCast(py)) * self.width + @as(usize, @intCast(px));
                 const dr, const dg, const db, const da = unpackPremul(self.pixels[idx]);
                 const inv = 1.0 - sa;
+                // "Over" gamma-corretto: fondi RGB in luce lineare (i canali premoltiplicati
+                // sono ~straight sul pannello opaco del chrome), poi torna a sRGB. L'alpha
+                // resta lineare (copertura geometrica).
                 self.pixels[idx] = packPremul(
-                    color.r * sa + dr * inv,
-                    color.g * sa + dg * inv,
-                    color.b * sa + db * inv,
+                    linearToSrgb(srgbToLinear(color.r) * sa + srgbToLinear(dr) * inv),
+                    linearToSrgb(srgbToLinear(color.g) * sa + srgbToLinear(dg) * inv),
+                    linearToSrgb(srgbToLinear(color.b) * sa + srgbToLinear(db) * inv),
                     sa + da * inv,
                 );
             }

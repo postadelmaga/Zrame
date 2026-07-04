@@ -287,7 +287,30 @@ pub const BufferParams = opaque {
 pub const SEAT_CAPABILITY_POINTER: u32 = 1;
 pub const SEAT_CAPABILITY_KEYBOARD: u32 = 2;
 pub const BTN_LEFT: u32 = 0x110;
+pub const BTN_RIGHT: u32 = 0x111;
+pub const BTN_MIDDLE: u32 = 0x112;
 pub const POINTER_BUTTON_STATE_PRESSED: u32 = 1;
+
+/// wl_pointer axis: 0 = vertical, 1 = horizontal.
+pub const AXIS_VERTICAL_SCROLL: u32 = 0;
+pub const AXIS_HORIZONTAL_SCROLL: u32 = 1;
+
+/// xdg_toplevel.resize_edge bitmask (for interactive resize).
+pub const RESIZE_EDGE_NONE: u32 = 0;
+pub const RESIZE_EDGE_TOP: u32 = 1;
+pub const RESIZE_EDGE_BOTTOM: u32 = 2;
+pub const RESIZE_EDGE_LEFT: u32 = 4;
+pub const RESIZE_EDGE_TOP_LEFT: u32 = 5;
+pub const RESIZE_EDGE_BOTTOM_LEFT: u32 = 6;
+pub const RESIZE_EDGE_RIGHT: u32 = 8;
+pub const RESIZE_EDGE_TOP_RIGHT: u32 = 9;
+pub const RESIZE_EDGE_BOTTOM_RIGHT: u32 = 10;
+
+/// xdg_toplevel.state
+pub const STATE_MAXIMIZED: u32 = 1;
+pub const STATE_FULLSCREEN: u32 = 2;
+pub const STATE_RESIZING: u32 = 3;
+pub const STATE_ACTIVATED: u32 = 4;
 pub const KEY_ESC: u32 = 1; // linux evdev keycodes
 pub const KEY_SPACE: u32 = 57;
 pub const KEYBOARD_KEY_STATE_PRESSED: u32 = 1;
@@ -419,8 +442,36 @@ pub const XdgToplevel = opaque {
         _ = wl_proxy_marshal_flags(proxy(self), 5, null, version(self), 0, @as(*Proxy, @ptrCast(seat)), serial);
     }
 
+    /// resize (opcode 6): interactive resize toward `edges` (a `RESIZE_EDGE_*` bitmask).
+    pub fn resize(self: *XdgToplevel, seat: *Seat, serial: u32, edges: u32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 6, null, version(self), 0, @as(*Proxy, @ptrCast(seat)), serial, edges);
+    }
+
+    /// show_window_menu (opcode 4): ask the compositor for its own window menu at (x,y),
+    /// panel-relative. `serial` must come from a recent input event.
+    pub fn showWindowMenu(self: *XdgToplevel, seat: *Seat, serial: u32, x: i32, y: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 4, null, version(self), 0, @as(*Proxy, @ptrCast(seat)), serial, x, y);
+    }
+
     pub fn setMinSize(self: *XdgToplevel, w: i32, h: i32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 8, null, version(self), 0, w, h);
+    }
+
+    /// set_maximized (opcode 9): the compositor answers with a configure carrying the
+    /// maximized state and the tiled size.
+    pub fn setMaximized(self: *XdgToplevel) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 9, null, version(self), 0);
+    }
+
+    /// unset_maximized (opcode 10).
+    pub fn unsetMaximized(self: *XdgToplevel) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 10, null, version(self), 0);
+    }
+
+    /// set_minimized (opcode 13): request iconify. There is no matching state in configure
+    /// — minimized windows just stop being drawn — so nothing to restore on our side.
+    pub fn setMinimized(self: *XdgToplevel) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 13, null, version(self), 0);
     }
 
     /// set_fullscreen (opcode 11): output null = il compositore sceglie l'output.
@@ -470,6 +521,12 @@ pub const CursorShapeManager = opaque {
 
 pub const CursorShapeDevice = opaque {
     pub const SHAPE_DEFAULT: u32 = 1;
+    pub const SHAPE_POINTER: u32 = 4;
+    pub const SHAPE_MOVE: u32 = 13;
+    pub const SHAPE_EW_RESIZE: u32 = 26;
+    pub const SHAPE_NS_RESIZE: u32 = 27;
+    pub const SHAPE_NESW_RESIZE: u32 = 28;
+    pub const SHAPE_NWSE_RESIZE: u32 = 29;
 
     pub fn setShape(self: *CursorShapeDevice, serial: u32, shape: u32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, serial, shape);

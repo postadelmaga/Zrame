@@ -17,6 +17,8 @@ const Demo = struct {
     /// Accent color of the second info tile.
     tint: zrame.Color,
     glyph: []const Seg,
+    /// Title-bar control layout for this window.
+    tb: zrame.TitlebarStyle = .macos,
 };
 
 const glyph_a = [_]Seg{ .{ 0, 0, 10, 60 }, .{ 25, 0, 10, 60 }, .{ 0, 0, 35, 10 }, .{ 0, 25, 35, 10 } };
@@ -31,6 +33,7 @@ const demos = [_]Demo{
         .style = zrame.Style.fluent(),
         .tint = zrame.Color.rgba(255, 255, 255, 0.15),
         .glyph = &glyph_a,
+        .tb = .material,
     },
     .{
         .title = "zrame — Window B (Vision Pro Glass)",
@@ -90,6 +93,8 @@ pub fn main() !void {
             .on_draw = drawContent,
             .user = @ptrCast(@constCast(demo)),
             .style = demo.style,
+            .titlebar = true,
+            .titlebar_style = demo.tb,
         });
         opened += 1;
     }

@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
 
     // Examples: `zig build run-hello`, `zig build run-frames`.
-    inline for (.{ "hello", "frames" }) |name| {
+    inline for (.{ "hello", "frames", "scroll" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -72,4 +72,35 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("run-" ++ name, "Run the " ++ name ++ " example");
         run_step.dependOn(&run_cmd.step);
     }
+
+    // A loadable plugin built as a shared library, plus a host that dlopens it:
+    // `zig build run-plugin`. The plugin is a normal Zig object against the zrame module.
+    const clock = b.addLibrary(.{
+        .name = "zrame_clock",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/plugin_clock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zrame", .module = zrame }},
+        }),
+    });
+    b.installArtifact(clock);
+
+    const host_exe = b.addExecutable(.{
+        .name = "plugin_host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/plugin_host.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zrame", .module = zrame }},
+        }),
+    });
+    b.installArtifact(host_exe);
+    const host_run = b.addRunArtifact(host_exe);
+    // The host dlopens zig-out/lib/libzrame_clock.so, so make sure it's installed first.
+    host_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| host_run.addArgs(args);
+    const host_step = b.step("run-plugin", "Run the dlopen plugin host example");
+    host_step.dependOn(&host_run.step);
 }
