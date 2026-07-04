@@ -12,11 +12,12 @@
 //! | `window.zig` | the frameless glass window + event loop                     |
 //! | `sink.zig`   | zicro `video.FrameSink` adapter                             |
 
-pub const wl = @import("wl.zig");
-pub const paint = @import("paint.zig");
+const zicro = @import("zicro");
+pub const wl = zicro.wl;
+pub const paint = zicro.paint;
 pub const window = @import("window.zig");
 pub const sink = @import("sink.zig");
-pub const text = @import("text.zig");
+pub const text = zicro.text;
 
 pub const Window = window.Window;
 pub const Options = window.Options;
