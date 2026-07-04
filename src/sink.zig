@@ -47,4 +47,29 @@ pub const WindowSink = struct {
     pub fn frameSink(self: *WindowSink) zicro.video.FrameSink {
         return zicro.video.FrameSink.of(WindowSink, self);
     }
+
+    /// zicro `GpuFrameSink` entry point — present a dmabuf frame with **no CPU
+    /// copy**: the plane fd goes straight to the desynced video subsurface. This
+    /// keeps the fast path inside the zicro contract instead of forcing the app to
+    /// call `presentDmabuf` directly. Returns `false` when the window has no
+    /// dmabuf/subcompositor support (the caller falls back to a CPU `Frame`).
+    /// Single-plane RGBA today; the first plane's fd/stride drive the present.
+    pub fn presentGpu(self: *WindowSink, frame: *const zicro.video.GpuFrame) bool {
+        if (frame.planes.len == 0) return false;
+        const plane = frame.planes[0];
+        return self.win.presentDmabuf(
+            frame.slot,
+            plane.fd,
+            frame.width,
+            frame.height,
+            plane.stride,
+            frame.fourcc,
+            frame.modifier,
+        );
+    }
+
+    /// The vtable zicro wants for the zero-copy GPU path.
+    pub fn gpuFrameSink(self: *WindowSink) zicro.video.GpuFrameSink {
+        return zicro.video.GpuFrameSink.of(WindowSink, self);
+    }
 };
