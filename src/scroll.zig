@@ -22,6 +22,11 @@ const Rect = plugin.Rect;
 
 pub const Scroll = struct {
     inner: zicro.scroll.Scroll = .{},
+    /// When true (auto-mounted by `Window`), the panel derives its `viewport` from the
+    /// host's content rect each draw/input/tick, so the app only has to report the
+    /// content size via `setContent`. When false (the app owns the panel, e.g.
+    /// `examples/scroll.zig`), `viewport` is whatever the app set.
+    follow_content: bool = false,
 
     // --- app-facing API (adapts zrame's integer Rect to the primitive) -----------------
 
@@ -46,13 +51,21 @@ pub const Scroll = struct {
 
     // --- panel interface (maps plugin.Event onto the primitive) ------------------------
 
+    /// When auto-mounted, pin the viewport to the host's content rect (the panel
+    /// interior). No-op for app-owned panels.
+    fn syncViewport(self: *Scroll, host: plugin.Host) void {
+        if (!self.follow_content) return;
+        const c = host.info().content;
+        self.setViewport(.{ .x = c.x, .y = c.y, .w = c.w, .h = c.h });
+    }
+
     pub fn draw(self: *Scroll, canvas: *paint.Canvas, host: plugin.Host) void {
-        _ = host;
+        self.syncViewport(host);
         self.inner.draw(canvas);
     }
 
     pub fn onInput(self: *Scroll, event: plugin.Event, host: plugin.Host) bool {
-        _ = host;
+        self.syncViewport(host);
         return switch (event) {
             // wl_pointer axis: 0 = vertical scroll, 1 = horizontal.
             .axis => |a| self.inner.onWheel(
@@ -69,12 +82,18 @@ pub const Scroll = struct {
             else
                 self.inner.onButtonUp(),
             .motion => |m| self.inner.onMotion(m.x, m.y),
+            // Pointer left the surface: drop hover, but don't consume — every panel
+            // needs to see it to clear its own hover.
+            .leave => blk: {
+                self.inner.onLeave();
+                break :blk false;
+            },
             else => false,
         };
     }
 
     pub fn tick(self: *Scroll, dt: f32, host: plugin.Host) bool {
-        _ = host;
+        self.syncViewport(host);
         return self.inner.tick(dt);
     }
 };

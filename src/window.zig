@@ -23,6 +23,7 @@ const anim = zicro.anim;
 const plugin = @import("plugin.zig");
 const controls = @import("controls.zig");
 const menu = @import("menu.zig");
+const scroll = @import("scroll.zig");
 const tray_mod = @import("tray.zig");
 const dbusmenu = @import("dbusmenu.zig");
 const appmenu_mod = @import("appmenu.zig");
@@ -82,6 +83,9 @@ pub const TrayConfig = struct {
 pub const MouseEvent = union(enum) {
     motion: struct { x: f32, y: f32 },
     button: struct { button: u32, state: u32 },
+    /// The pointer left the window surface (`wl_pointer.leave`): apps drop hover
+    /// state (highlighted rows, custom cursors). Carries no position.
+    leave,
 };
 
 /// The panel-content rectangle in canvas coordinates (shared with the plugin seam).
@@ -188,6 +192,10 @@ pub const Window = struct {
     // Panels (title-bar controls, context menu, scrollbars, dlopen plugins) draw over the
     // content, receive input before the app callbacks, and animate off a shared clock.
     panels: plugin.Registry,
+    // Floating egui-style scrollbars, auto-mounted on every window as the bottom-most
+    // panel. Dormant (invisible) until the app reports its content size via
+    // `win.scrollbars.setContent(w, h)`; the viewport tracks the content rect for free.
+    scrollbars: scroll.Scroll = .{ .follow_content = true },
     // timerfd che batte l'orologio d'animazione: armato (~60 Hz) mentre un pannello si
     // anima, disarmato quando tutto si è assestato così `poll` torna a bloccarsi a riposo.
     timer_fd: posix.fd_t = -1,
@@ -308,8 +316,13 @@ pub const Window = struct {
 
         if (self.blur_manager) |mgr| self.blur = mgr.getBackgroundEffect(surface);
 
-        // Register the built-in title-bar controls as the first (bottom-most) panel, then
-        // the context menu on top of it so the menu draws over the bar and grabs input first.
+        // Floating scrollbars are the bottom-most panel: the title bar and context menu
+        // draw over them and grab input first. Borrowed — the Window owns the instance
+        // (as a field), so the registry must not deinit/free it.
+        try self.panels.add(Panel.of(scroll.Scroll, &self.scrollbars), false);
+
+        // Register the built-in title-bar controls next, then the context menu on top of
+        // it so the menu draws over the bar and grabs input first.
         if (opts.titlebar) {
             const c = try controls.Controls.create(gpa, opts.titlebar_style, opts.titlebar_height, opts.title);
             try self.panels.add(Panel.of(controls.Controls, c), true);
@@ -1291,7 +1304,14 @@ pub const Window = struct {
         if (self.cursor_device) |device| device.setShape(serial, wl.CursorShapeDevice.SHAPE_DEFAULT);
     }
 
-    fn onPointerLeave(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {}
+    fn onPointerLeave(data: ?*anyopaque, _: *wl.Pointer, _: u32, _: ?*wl.Surface) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        // Broadcast to every panel (none consumes `leave`) so hover states fade out,
+        // then hand it to the app. `routeInput` arms the animation timer, so the fade
+        // actually plays out.
+        _ = self.routeInput(.leave);
+        if (self.opts.on_mouse) |cb| cb(self, .leave, self.opts.user);
+    }
     fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         const fx = wl.fixedToF32(x);

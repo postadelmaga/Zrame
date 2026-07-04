@@ -35,6 +35,10 @@ pub const Event = union(enum) {
     /// false for trackpad pixel deltas (apply verbatim).
     axis: struct { x: f32, y: f32, axis: u32, value: f32, line: bool },
     key: struct { key: u32, pressed: bool },
+    /// The pointer left the surface (`wl_pointer.leave`). Carries no position; panels
+    /// use it to drop hover state. Broadcast to every panel — no panel should consume
+    /// it (return `false` from `onInput`).
+    leave,
 };
 
 /// A window operation a panel asks the host to perform. The host owns the Wayland
