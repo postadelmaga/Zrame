@@ -249,6 +249,10 @@ pub const Window = struct {
     video_subsurface: ?*wl.Subsurface = null,
     // 8 slots: enough for a few resolution tiers × double buffering.
     video_buffers: [8]?*wl.Buffer = @splat(null),
+    // The dmabuf params each slot's wl_buffer was imported with. When a present
+    // on a slot arrives with different params (a resized dmabuf — dynamic
+    // resolution), the cached wl_buffer is stale and must be re-imported.
+    video_params: [8]?StagedDma = @splat(null),
     staged_dma: ?StagedDma = null,
     /// True while a frame callback is outstanding on the video surface: the
     /// compositor has not yet consumed the last commit. Producers poll
@@ -444,7 +448,16 @@ pub const Window = struct {
         const dy = content.y + (content.h -| @min(req.height, content.h)) / 2;
         self.video_subsurface.?.setPosition(@intCast(dx), @intCast(dy));
 
-        if (self.video_buffers[req.slot] == null) {
+        // Re-import when the slot is empty OR the incoming dmabuf differs from
+        // the one cached for it (a resized buffer — dynamic resolution). Steady
+        // state (same size every frame) keeps the create-once fast path.
+        const stale = if (self.video_params[req.slot]) |p|
+            p.fd != req.fd or p.width != req.width or p.height != req.height or
+                p.stride != req.stride or p.fourcc != req.fourcc or p.modifier != req.modifier
+        else
+            true;
+        if (stale) {
+            if (self.video_buffers[req.slot]) |old| old.destroy();
             const params = self.dmabuf.?.createParams();
             params.add(req.fd, 0, 0, req.stride, req.modifier);
             self.video_buffers[req.slot] = params.createImmed(
@@ -454,6 +467,7 @@ pub const Window = struct {
                 0,
             );
             params.destroy();
+            self.video_params[req.slot] = req;
         }
         const vs = self.video_surface.?;
         vs.attach(self.video_buffers[req.slot], 0, 0);
