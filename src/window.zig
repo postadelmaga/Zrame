@@ -154,6 +154,10 @@ pub const Window = struct {
     panel_h: u32,
     configured: bool = false,
     needs_redraw: bool = false,
+    // True once `run` is pumping. Before that (init roundtrips) `onXdgConfigure` must
+    // redraw synchronously to map the window; during the loop it only flags a redraw so
+    // a burst of resize configures coalesces into one paint per iteration.
+    running: bool = false,
     /// Wall-clock ms of the last overlay-triggered parent repaint, to cap it (see
     /// the run loop): a HUD over a dmabuf video must not repaint at video rate.
     last_overlay_ms: i64 = 0,
@@ -204,6 +208,10 @@ pub const Window = struct {
     shm_fd: posix.fd_t = -1,
     shm_map: []align(std.heap.page_size_min) u8 = &.{},
     pool: ?*wl.ShmPool = null,
+    // Bytes backing `pool`/`shm_map`. Kept over-allocated so a resize only re-slices the
+    // two buffers instead of tearing down the memfd/mmap/pool every frame; grown (with
+    // headroom) only when the needed size exceeds it.
+    pool_cap: usize = 0,
     slots: [2]BufferSlot = .{ .{}, .{} },
     buf_w: u32 = 0,
     buf_h: u32 = 0,
@@ -461,6 +469,7 @@ pub const Window = struct {
 
     /// The event loop: blocks until the window is closed or the connection drops.
     pub fn run(self: *Window) !void {
+        self.running = true;
         // Bring up the tray icon once, if requested. Registration failure (no tray host on
         // the bus) is non-fatal: log and run without it.
         if (self.tray == null) {
@@ -882,25 +891,38 @@ pub const Window = struct {
         self.shm_map = &.{};
         if (self.shm_fd >= 0) _ = linux.close(self.shm_fd);
         self.shm_fd = -1;
+        self.pool_cap = 0;
         self.buf_w = 0;
         self.buf_h = 0;
     }
 
     fn resizeBuffers(self: *Window, bw: u32, bh: u32) !void {
-        self.dropBuffers();
-
         const stride = @as(usize, bw) * 4;
         const slot_size = stride * @as(usize, bh);
         const total = slot_size * self.slots.len;
 
-        const fd = try posix.memfd_create("zrame-shm", linux.MFD.CLOEXEC);
-        errdefer _ = linux.close(fd);
-        if (linux.errno(linux.ftruncate(fd, @intCast(total))) != .SUCCESS) return error.ShmSetupFailed;
-        const map = try posix.mmap(null, total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+        if (self.pool == null or total > self.pool_cap) {
+            // Grow: tear down the memfd/mmap/pool and reallocate with 50% headroom, so a
+            // continuing drag stops re-allocating once it has room.
+            self.dropBuffers();
+            const cap = total + total / 2;
+            const fd = try posix.memfd_create("zrame-shm", linux.MFD.CLOEXEC);
+            errdefer _ = linux.close(fd);
+            if (linux.errno(linux.ftruncate(fd, @intCast(cap))) != .SUCCESS) return error.ShmSetupFailed;
+            const map = try posix.mmap(null, cap, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+            self.shm_fd = fd;
+            self.shm_map = map;
+            self.pool = self.shm.?.createPool(fd, @intCast(cap));
+            self.pool_cap = cap;
+        } else {
+            // Reuse the existing pool/mapping; only the two buffer objects change geometry.
+            for (&self.slots) |*slot| {
+                if (slot.buffer) |b| b.destroy();
+                slot.buffer = null;
+            }
+        }
 
-        self.shm_fd = fd;
-        self.shm_map = map;
-        self.pool = self.shm.?.createPool(fd, @intCast(total));
+        const map = self.shm_map;
         for (&self.slots, 0..) |*slot, i| {
             const off = i * slot_size;
             slot.buffer = self.pool.?.createBuffer(@intCast(off), @intCast(bw), @intCast(bh), @intCast(stride), wl.SHM_FORMAT_ARGB8888);
@@ -1009,9 +1031,10 @@ pub const Window = struct {
         xdg_surface.ackConfigure(serial);
         self.configured = true;
         self.needs_redraw = true;
-        // During init (before run()) the loop isn't pumping yet: draw right here so the
-        // window appears mapped after the first roundtrip.
-        self.redraw() catch {};
+        // Before the loop is pumping (init roundtrips) draw right here so the window maps.
+        // Once running, only flag it: the loop paints once per iteration, so a burst of
+        // resize configures collapses into a single redraw instead of one apiece.
+        if (!self.running) self.redraw() catch {};
     }
 
     const toplevel_listener = wl.XdgToplevel.Listener{
