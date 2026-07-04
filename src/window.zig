@@ -298,14 +298,15 @@ pub const Window = struct {
     }
 
     /// Window-thread half of `presentDmabuf`: build the subsurface/buffers
-    /// lazily, then attach + commit the requested slot.
-    fn processVideo(self: *Window) void {
+    /// lazily, then attach + commit the requested slot. Returns true when a
+    /// staged frame was committed (so the caller can refresh a client overlay).
+    fn processVideo(self: *Window) bool {
         self.mutex.lock();
         const req_opt = self.staged_dma;
         self.staged_dma = null;
         self.mutex.unlock();
-        const req = req_opt orelse return;
-        if (!self.configured) return;
+        const req = req_opt orelse return false;
+        if (!self.configured) return false;
 
         if (self.video_surface == null) {
             const vs = self.compositor.?.createSurface();
@@ -345,6 +346,7 @@ pub const Window = struct {
         const cb = vs.frame();
         cb.setListener(&video_frame_listener, self);
         vs.commit();
+        return true;
     }
 
     const video_frame_listener = wl.Callback.Listener{ .done = onVideoFrameDone };
@@ -390,13 +392,15 @@ pub const Window = struct {
             if (fds[1].revents & posix.POLL.IN != 0) {
                 var drained: u64 = 0;
                 _ = posix.read(self.wake_fd, std.mem.asBytes(&drained)) catch {};
-                // Video frames commit their own subsurface; only a staged shm
-                // frame needs the full chrome redraw.
-                self.processVideo();
+                // A staged shm frame needs the full chrome redraw. A dmabuf frame
+                // commits its own subsurface, but when the client draws an overlay
+                // (`on_draw` — e.g. a live HUD) the parent must repaint too, or the
+                // overlay freezes on its first paint while the video keeps moving.
+                const had_video = self.processVideo();
                 self.mutex.lock();
                 const has_frame = self.staged.fresh;
                 self.mutex.unlock();
-                if (has_frame) self.needs_redraw = true;
+                if (has_frame or (had_video and self.opts.on_draw != null)) self.needs_redraw = true;
             }
 
             if (self.configured and self.needs_redraw) try self.redraw();
