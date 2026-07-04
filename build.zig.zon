@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zicro = .{
-            .path = "../Zicro",
+            .url = "git+https://github.com/postadelmaga/zicro#16978b4570bae8fdcc89edc1a60b749fbc65a803",
+            .hash = "zicro-0.0.0-f0uVSy6NEwBdqUf1lVsTgM-ivj2YrmTOM0jhd6WMtQSW",
         },
     },
     .paths = .{
