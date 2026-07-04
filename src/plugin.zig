@@ -15,8 +15,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const paint = @import("paint.zig");
-const text = @import("text.zig");
+const zicro = @import("zicro");
+const paint = zicro.paint;
+const text = zicro.text;
 
 /// An axis-aligned rectangle in canvas (buffer) pixels — the coordinate space of both
 /// the [`paint.Canvas`] and the pointer events (surface-local == buffer-local here).

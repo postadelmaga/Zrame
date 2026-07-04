@@ -15,9 +15,10 @@ const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const linux = std.os.linux;
 
-const wl = @import("wl.zig");
-const paint = @import("paint.zig");
-const text = @import("text.zig");
+const zicro = @import("zicro");
+const wl = zicro.wl;
+const paint = zicro.paint;
+const text = zicro.text;
 const plugin = @import("plugin.zig");
 const controls = @import("controls.zig");
 const menu = @import("menu.zig");

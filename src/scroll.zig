@@ -13,10 +13,11 @@
 
 const std = @import("std");
 
-const paint = @import("paint.zig");
+const zicro = @import("zicro");
+const paint = zicro.paint;
 const plugin = @import("plugin.zig");
 const ui = @import("ui.zig");
-const wl = @import("wl.zig");
+const wl = zicro.wl;
 
 const Color = paint.Color;
 const Rect = plugin.Rect;
@@ -360,7 +361,7 @@ fn undefinedHost() plugin.Host {
         fn info(_: *anyopaque) plugin.Info {
             return std.mem.zeroes(plugin.Info);
         }
-        fn font(_: *anyopaque) ?*@import("text.zig").Font {
+        fn font(_: *anyopaque) ?*zicro.text.Font {
             return null;
         }
         const vtable = plugin.Host.VTable{ .do = do, .info = info, .font = font };

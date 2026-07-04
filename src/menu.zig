@@ -12,10 +12,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const paint = @import("paint.zig");
+const zicro = @import("zicro");
+const paint = zicro.paint;
 const plugin = @import("plugin.zig");
 const ui = @import("ui.zig");
-const wl = @import("wl.zig");
+const wl = zicro.wl;
 
 const Color = paint.Color;
 
