@@ -19,6 +19,7 @@ const zicro = @import("zicro");
 const wl = zicro.wl;
 const paint = zicro.paint;
 const text = zicro.text;
+const anim = zicro.anim;
 const plugin = @import("plugin.zig");
 const controls = @import("controls.zig");
 const menu = @import("menu.zig");
@@ -194,16 +195,18 @@ pub const Window = struct {
     last_tick_ns: i64 = 0,
     // Client-driven animated resize toward a target panel size (see `animateResize`).
     // Wayland lets an unmaximized toplevel pick its own size, so we drive panel_w/panel_h
-    // with a spring off the same timerfd clock as the panel animations and repaint each
-    // tick. The spring (position + velocity per axis) gives a lively, slightly-overshooting
-    // settle; retargeting mid-flight keeps the velocity for fluid chained navigation.
-    resize_anim: bool = false,
-    resize_w: f32 = 0, // dimensione animata corrente (pannello)
-    resize_h: f32 = 0,
-    resize_vw: f32 = 0, // velocità della molla
-    resize_vh: f32 = 0,
-    resize_to_w: u32 = 0, // bersaglio
-    resize_to_h: u32 = 0,
+    // with one `zicro.anim.Spring` per axis off the same timerfd clock as the panel
+    // animations and repaint each tick. `snappy` gives a lively, slightly-overshooting
+    // settle; retargeting mid-flight keeps velocity for fluid chained navigation.
+    spring_w: anim.Spring = .{ .params = anim.snappy },
+    spring_h: anim.Spring = .{ .params = anim.snappy },
+    // Dimensione massima utile della geometria finestra suggerita dal compositore
+    // (xdg_toplevel.configure_bounds): l'area dello schermo meno pannelli/riserve.
+    // 0 = non nota. Vincola i ridimensionamenti così la finestra non sborda oltre
+    // lo schermo (in particolare sotto). Il client non può posizionarsi da sé su
+    // Wayland — il compositore piazza (e di norma centra) la finestra.
+    bounds_w: u32 = 0,
+    bounds_h: u32 = 0,
     // Optional StatusNotifierItem tray connection; created in `run` when `opts.tray` is set,
     // its bus fd is polled alongside Wayland. Null when no tray or registration failed.
     tray: ?*tray_mod.Tray = null,
@@ -803,14 +806,6 @@ pub const Window = struct {
         if (self.fullscreen) tl.unsetFullscreen() else tl.setFullscreen();
     }
 
-    // Molla del ridimensionamento. stiffness = ω², damping = 2·ζ·ω. Con questi
-    // valori ω≈18.4 rad/s e ζ≈0.65: assestamento vivace in ~0.45s con un lieve
-    // sovraelongazione (~7%) che dà il rimbalzo grazioso. Il passo d'integrazione
-    // fisso rende il moto identico a qualunque frame-rate.
-    const spring_stiffness: f32 = 340.0;
-    const spring_damping: f32 = 24.0;
-    const spring_substep: f32 = 1.0 / 240.0;
-
     /// Ridimensiona la finestra verso `target_w`×`target_h` (dimensione del
     /// *pannello* — geometria finestra, senza il gutter d'ombra) con
     /// un'animazione a molla: accelerazione morbida, lieve sovraelongazione e
@@ -821,61 +816,58 @@ pub const Window = struct {
     /// concatenate fluide. No-op in fullscreen/massimizzato (lì la dimensione la
     /// decide il compositore). Solo dal thread finestra (callback di input o
     /// prima di `run`).
+    /// Riduce (in scala, preservando le proporzioni) `w`×`h` perché la geometria
+    /// finestra stia nell'area utile suggerita dal compositore (`bounds_*`), con
+    /// un piccolo margine di sicurezza. Non ingrandisce mai. No-op se i bounds
+    /// non sono noti. Serve a non far sbordare la finestra oltre lo schermo.
+    fn fitBounds(self: *const Window, w: u32, h: u32) struct { w: u32, h: u32 } {
+        if (self.bounds_w == 0 or self.bounds_h == 0) return .{ .w = w, .h = h };
+        const inset: u32 = 8;
+        const bw: f32 = @floatFromInt(self.bounds_w -| inset);
+        const bh: f32 = @floatFromInt(self.bounds_h -| inset);
+        const fw: f32 = @floatFromInt(w);
+        const fh: f32 = @floatFromInt(h);
+        const scale = @min(@as(f32, 1.0), @min(bw / fw, bh / fh));
+        if (scale >= 1.0) return .{ .w = w, .h = h };
+        return .{
+            .w = @max(self.minPanel(), @as(u32, @intFromFloat(@round(fw * scale)))),
+            .h = @max(self.minPanel(), @as(u32, @intFromFloat(@round(fh * scale)))),
+        };
+    }
+
     pub fn animateResize(self: *Window, target_w: u32, target_h: u32) void {
         if (self.fullscreen or self.maximized) return;
-        const tw = @max(target_w, self.minPanel());
-        const th = @max(target_h, self.minPanel());
+        // Vincola il bersaglio all'area utile: cresce senza sbordare fuori schermo.
+        const fitted = self.fitBounds(target_w, target_h);
+        const tw = @max(fitted.w, self.minPanel());
+        const th = @max(fitted.h, self.minPanel());
+        const animating = self.spring_w.active or self.spring_h.active;
         // Già alla dimensione richiesta e nessuna animazione in corso: niente da fare.
-        if (tw == self.panel_w and th == self.panel_h and !self.resize_anim) return;
-        // Avvio a freddo: parte dalla dimensione corrente, ferma. Retarget in volo:
-        // mantiene resize_w/h e la velocità così la molla prosegue senza scatti.
-        if (!self.resize_anim) {
-            self.resize_w = @floatFromInt(self.panel_w);
-            self.resize_h = @floatFromInt(self.panel_h);
-            self.resize_vw = 0;
-            self.resize_vh = 0;
+        if (tw == self.panel_w and th == self.panel_h and !animating) return;
+        // Avvio a freddo: le molle partono dalla dimensione corrente, ferme. Retarget in
+        // volo: `retarget` conserva posizione e velocità → la molla prosegue senza scatti.
+        if (!animating) {
+            self.spring_w.reset(@floatFromInt(self.panel_w));
+            self.spring_h.reset(@floatFromInt(self.panel_h));
         }
-        self.resize_to_w = tw;
-        self.resize_to_h = th;
-        self.resize_anim = true;
+        self.spring_w.retarget(@floatFromInt(tw));
+        self.spring_h.retarget(@floatFromInt(th));
         self.armTimer();
     }
 
-    /// Avanza la molla del resize di `dt`; ritorna true finché è in corso. La
-    /// geometria finestra, la regione d'input e la decor le riallinea
-    /// `redraw`→`resizeBuffers`, che scatta a ogni frame perché la dimensione del
-    /// buffer cambia durante l'animazione.
+    /// Avanza le molle del resize di `dt`; ritorna true finché sono in corso. La geometria
+    /// finestra, la regione d'input e la decor le riallinea `redraw`→`resizeBuffers`, che
+    /// scatta a ogni frame perché la dimensione del buffer cambia durante l'animazione.
     fn stepResize(self: *Window, dt: f32) bool {
-        if (!self.resize_anim) return false;
-        const tw: f32 = @floatFromInt(self.resize_to_w);
-        const th: f32 = @floatFromInt(self.resize_to_h);
-        // Integrazione semi-implicita a sotto-passi fissi: stabile anche con dt
-        // grandi (finestra ridipinta a scatti) e indipendente dal frame-rate.
-        var remaining = dt;
-        while (remaining > 0) {
-            const st = @min(spring_substep, remaining);
-            remaining -= st;
-            self.resize_vw += (spring_stiffness * (tw - self.resize_w) - spring_damping * self.resize_vw) * st;
-            self.resize_vh += (spring_stiffness * (th - self.resize_h) - spring_damping * self.resize_vh) * st;
-            self.resize_w += self.resize_vw * st;
-            self.resize_h += self.resize_vh * st;
-        }
-        // Assestata: vicina al bersaglio e quasi ferma → aggancia e termina.
-        if (@abs(tw - self.resize_w) < 0.5 and @abs(th - self.resize_h) < 0.5 and
-            @abs(self.resize_vw) < 2.0 and @abs(self.resize_vh) < 2.0)
-        {
-            self.resize_w = tw;
-            self.resize_h = th;
-            self.resize_vw = 0;
-            self.resize_vh = 0;
-            self.resize_anim = false;
-        }
-        // Floor sul float PRIMA della conversione: una sovraelongazione in
-        // riduzione può portare resize_w/h sotto zero (illegale in @intFromFloat).
+        if (!self.spring_w.active and !self.spring_h.active) return false;
+        _ = self.spring_w.step(dt);
+        _ = self.spring_h.step(dt);
+        // Floor sul float PRIMA della conversione: una sovraelongazione in riduzione può
+        // portare la posizione sotto zero (illegale in @intFromFloat).
         const min_f: f32 = @floatFromInt(self.minPanel());
-        self.panel_w = @intFromFloat(@round(@max(min_f, self.resize_w)));
-        self.panel_h = @intFromFloat(@round(@max(min_f, self.resize_h)));
-        return self.resize_anim;
+        self.panel_w = @intFromFloat(@round(@max(min_f, self.spring_w.pos)));
+        self.panel_h = @intFromFloat(@round(@max(min_f, self.spring_h.pos)));
+        return self.spring_w.active or self.spring_h.active;
     }
 
     /// Motore di testo della finestra, creato pigramente col font di default
@@ -918,15 +910,17 @@ pub const Window = struct {
         return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
     }
 
-    fn redraw(self: *Window) !void {
-        const m = self.opts.style.margin;
-        const bw = self.panel_w + 2 * m;
-        const bh = self.panel_h + 2 * m;
-        if (bw != self.buf_w or bh != self.buf_h) try self.resizeBuffers(bw, bh);
-
-        const slot = self.freeSlot() orelse return; // both busy: retry on next wake
-        @memcpy(slot.pixels, self.decor);
-        var canvas = paint.Canvas.init(slot.pixels, bw, bh);
+    /// Composite one full window frame into `pixels` (an ARGB8888 buffer sized
+    /// `bw`×`bh`). Pure CPU: no windowing-system call happens here. It paints the
+    /// chrome decoration, the app `on_draw` overlay, the newest staged content
+    /// frame (taken via a lock-light buffer swap), and finally the panels stack.
+    ///
+    /// This is the platform seam for presentation: every backend — the Wayland
+    /// shm path below, or a future Cocoa/Metal path — acquires a writable pixel
+    /// buffer its own way, calls this to fill it, then presents it however it can.
+    fn composeFrame(self: *Window, pixels: []u32, bw: u32, bh: u32) void {
+        @memcpy(pixels, self.decor);
+        var canvas = paint.Canvas.init(pixels, bw, bh);
 
         if (self.opts.on_draw) |draw| draw(&canvas, self.contentRect(), self.opts.user);
 
@@ -952,6 +946,20 @@ pub const Window = struct {
         // Panels (title bar, scrollbars, context menu, plugins) composite last, on top of
         // both app content and any video frame.
         self.panels.draw(&canvas, self.host());
+    }
+
+    /// Wayland present path: size the shm buffers, acquire a free slot, compose
+    /// into it, then attach + damage + commit. The composition itself is backend
+    /// -agnostic (see `composeFrame`); only the slot acquisition and surface
+    /// commit are Wayland-specific.
+    fn redraw(self: *Window) !void {
+        const m = self.opts.style.margin;
+        const bw = self.panel_w + 2 * m;
+        const bh = self.panel_h + 2 * m;
+        if (bw != self.buf_w or bh != self.buf_h) try self.resizeBuffers(bw, bh);
+
+        const slot = self.freeSlot() orelse return; // both busy: retry on next wake
+        self.composeFrame(slot.pixels, bw, bh);
 
         const surface = self.surface.?;
         surface.attach(slot.buffer, 0, 0);
@@ -1187,7 +1195,24 @@ pub const Window = struct {
         self.closed = true;
     }
 
-    fn onConfigureBounds(_: ?*anyopaque, _: *wl.XdgToplevel, _: i32, _: i32) callconv(.c) void {}
+    fn onConfigureBounds(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        // Area utile massima per la geometria finestra (0 = "nessun vincolo").
+        if (width > 0) self.bounds_w = @intCast(width);
+        if (height > 0) self.bounds_h = @intCast(height);
+        // Se il contenuto attuale eccede l'area utile, riportalo dentro: prima della
+        // mappatura (init roundtrip) in modo istantaneo, a finestra viva con
+        // un'animazione. Così un documento più alto dello schermo non sborda sotto.
+        const fitted = self.fitBounds(self.panel_w, self.panel_h);
+        if (fitted.w != self.panel_w or fitted.h != self.panel_h) {
+            if (self.running) {
+                self.animateResize(fitted.w, fitted.h);
+            } else {
+                self.panel_w = fitted.w;
+                self.panel_h = fitted.h;
+            }
+        }
+    }
     fn onWmCapabilities(_: ?*anyopaque, _: *wl.XdgToplevel, _: ?*anyopaque) callconv(.c) void {}
 
     const buffer_listener = wl.Buffer.Listener{ .release = onBufferRelease };
