@@ -116,6 +116,9 @@ pub const Window = struct {
     panel_h: u32,
     configured: bool = false,
     needs_redraw: bool = false,
+    /// Wall-clock ms of the last overlay-triggered parent repaint, to cap it (see
+    /// the run loop): a HUD over a dmabuf video must not repaint at video rate.
+    last_overlay_ms: i64 = 0,
     closed: bool = false,
     // Stato fullscreen: in fullscreen il gutter/ombra/angoli vengono azzerati
     // così il contenuto riempie lo schermo; i valori originali si ripristinano
@@ -393,14 +396,28 @@ pub const Window = struct {
                 var drained: u64 = 0;
                 _ = posix.read(self.wake_fd, std.mem.asBytes(&drained)) catch {};
                 // A staged shm frame needs the full chrome redraw. A dmabuf frame
-                // commits its own subsurface, but when the client draws an overlay
+                // commits its own subsurface; when the client draws an overlay
                 // (`on_draw` — e.g. a live HUD) the parent must repaint too, or the
                 // overlay freezes on its first paint while the video keeps moving.
                 const had_video = self.processVideo();
                 self.mutex.lock();
                 const has_frame = self.staged.fresh;
                 self.mutex.unlock();
-                if (has_frame or (had_video and self.opts.on_draw != null)) self.needs_redraw = true;
+                if (has_frame) {
+                    self.needs_redraw = true;
+                } else if (had_video and self.opts.on_draw != null) {
+                    // Cap the overlay repaint at ~15 Hz. Repainting the whole parent
+                    // at video rate saturates this thread — which also dispatches
+                    // input — making input lag badly under interaction. A HUD reads
+                    // fine at 15 Hz; the video keeps its own (full-rate) subsurface.
+                    var ts: linux.timespec = undefined;
+                    _ = linux.clock_gettime(.MONOTONIC, &ts);
+                    const now_ms: i64 = @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+                    if (now_ms - self.last_overlay_ms >= 66) {
+                        self.last_overlay_ms = now_ms;
+                        self.needs_redraw = true;
+                    }
+                }
             }
 
             if (self.configured and self.needs_redraw) try self.redraw();
