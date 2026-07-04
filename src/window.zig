@@ -22,6 +22,7 @@ const text = zicro.text;
 const plugin = @import("plugin.zig");
 const controls = @import("controls.zig");
 const menu = @import("menu.zig");
+const tray_mod = @import("tray.zig");
 
 pub const Style = paint.Style;
 pub const Panel = plugin.Panel;
@@ -54,7 +55,21 @@ pub const Options = struct {
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
     /// Optional mouse event handler (motion or button clicks).
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) void = null,
+    /// Optional system-tray icon (StatusNotifierItem over DBus). When set, `run` opens a
+    /// session-bus connection, registers the item with the tray host, and services it off
+    /// the window's poll loop. A failure to register (no tray host present) is non-fatal —
+    /// the window runs without a tray.
+    tray: ?TrayConfig = null,
     user: ?*anyopaque = null,
+};
+
+/// Declarative tray-icon config (see `tray.zig`). `on_activate` fires on left-click.
+pub const TrayConfig = struct {
+    id: [:0]const u8 = "dev.zrame.window",
+    title: [:0]const u8 = "zrame",
+    icon_name: [:0]const u8 = "application-x-executable",
+    tooltip: [:0]const u8 = "",
+    on_activate: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
 };
 
 pub const MouseEvent = union(enum) {
@@ -167,6 +182,9 @@ pub const Window = struct {
     timer_fd: posix.fd_t = -1,
     timer_armed: bool = false,
     last_tick_ns: i64 = 0,
+    // Optional StatusNotifierItem tray connection; created in `run` when `opts.tray` is set,
+    // its bus fd is polled alongside Wayland. Null when no tray or registration failed.
+    tray: ?*tray_mod.Tray = null,
     // Open handles of `dlopen`'d plugin `.so`s. Closed after `panels.deinit` in `deinit`,
     // because the panels' `deinit` code lives inside these libraries.
     plugin_libs: std.ArrayList(std.DynLib) = .empty,
@@ -275,6 +293,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        if (self.tray) |t| t.deinit();
         // Panels first (runs plugin `deinit`s), then unload the libraries that hold them.
         self.panels.deinit();
         for (self.plugin_libs.items) |*lib| lib.close();
@@ -429,16 +448,37 @@ pub const Window = struct {
 
     /// The event loop: blocks until the window is closed or the connection drops.
     pub fn run(self: *Window) !void {
+        // Bring up the tray icon once, if requested. Registration failure (no tray host on
+        // the bus) is non-fatal: log and run without it.
+        if (self.tray == null) {
+            if (self.opts.tray) |tc| {
+                self.tray = tray_mod.Tray.init(self.gpa, .{
+                    .id = tc.id,
+                    .title = tc.title,
+                    .icon_name = tc.icon_name,
+                    .tooltip = tc.tooltip,
+                    .on_activate = onTrayActivate,
+                    .ctx = self,
+                }) catch |err| blk: {
+                    std.log.warn("zrame: tray icon unavailable ({s})", .{@errorName(err)});
+                    break :blk null;
+                };
+            }
+        }
+
         while (!self.closed) {
             while (wl.wl_display_prepare_read(self.display) != 0) {
                 if (wl.wl_display_dispatch_pending(self.display) < 0) return error.WaylandIo;
             }
             _ = wl.wl_display_flush(self.display);
+            if (self.tray) |t| t.flush();
 
             var fds = [_]posix.pollfd{
                 .{ .fd = wl.wl_display_get_fd(self.display), .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.wake_fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.timer_fd, .events = posix.POLL.IN, .revents = 0 },
+                // Negative fd = ignored by poll, so this slot is inert without a tray.
+                .{ .fd = if (self.tray) |t| t.fd() else -1, .events = posix.POLL.IN, .revents = 0 },
             };
             _ = posix.poll(&fds, -1) catch |err| {
                 wl.wl_display_cancel_read(self.display);
@@ -483,7 +523,20 @@ pub const Window = struct {
 
             if (fds[2].revents & posix.POLL.IN != 0) self.onTimerTick();
 
+            if (self.tray) |t| {
+                if (fds[3].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) t.process();
+            }
+
             if (self.configured and self.needs_redraw) try self.redraw();
+        }
+    }
+
+    /// sd-bus `Activate` trampoline: recover the window from the tray's ctx and forward to
+    /// the caller's `on_activate` (see `TrayConfig`).
+    fn onTrayActivate(ctx: ?*anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(ctx.?));
+        if (self.opts.tray) |tc| {
+            if (tc.on_activate) |cb| cb(self, self.opts.user);
         }
     }
 

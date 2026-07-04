@@ -32,6 +32,9 @@ pub fn build(b: *std.Build) void {
         },
     });
     zrame.linkSystemLibrary("wayland-client", .{});
+    // Tray icon (StatusNotifierItem) talks to the session bus through sd-bus. We
+    // hand-declare the FFI, so no headers are needed — just link libsystemd.
+    zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
 
     for (protocol_xmls) |xml| {
         const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
@@ -47,7 +50,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
 
     // Examples: `zig build run-hello`, `zig build run-frames`.
-    inline for (.{ "hello", "frames", "scroll" }) |name| {
+    inline for (.{ "hello", "frames", "scroll", "tray" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

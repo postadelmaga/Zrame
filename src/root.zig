@@ -23,6 +23,7 @@ pub const ui = @import("ui.zig");
 pub const controls = @import("controls.zig");
 pub const menu = @import("menu.zig");
 pub const scroll = @import("scroll.zig");
+pub const tray = @import("tray.zig");
 
 pub const Window = window.Window;
 pub const Options = window.Options;
