@@ -16,6 +16,7 @@ pub const wl = @import("wl.zig");
 pub const paint = @import("paint.zig");
 pub const window = @import("window.zig");
 pub const sink = @import("sink.zig");
+pub const text = @import("text.zig");
 
 pub const Window = window.Window;
 pub const Options = window.Options;
@@ -25,6 +26,9 @@ pub const MouseEvent = window.MouseEvent;
 pub const Color = paint.Color;
 pub const Canvas = paint.Canvas;
 pub const WindowSink = sink.WindowSink;
+pub const Font = text.Font;
+pub const TextStyle = text.Style;
+pub const TextOpts = paint.TextOpts;
 
 test {
     @import("std").testing.refAllDecls(@This());

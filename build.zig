@@ -32,6 +32,14 @@ pub fn build(b: *std.Build) void {
         },
     });
     zrame.linkSystemLibrary("wayland-client", .{});
+    // Motore di testo nativo: stb_truetype rasterizza i glifi (font Hack
+    // embeddati). -fno-sanitize=undefined perché zig cc abilita UBSan e stb
+    // contiene UB benigno.
+    zrame.addIncludePath(b.path("vendor/stb"));
+    zrame.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_truetype_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
     for (protocol_xmls) |xml| {
         const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
         scan.addFileArg(.{ .cwd_relative = xml });

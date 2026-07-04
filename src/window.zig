@@ -17,6 +17,7 @@ const linux = std.os.linux;
 
 const wl = @import("wl.zig");
 const paint = @import("paint.zig");
+const text = @import("text.zig");
 
 pub const Style = paint.Style;
 
@@ -116,6 +117,17 @@ pub const Window = struct {
     configured: bool = false,
     needs_redraw: bool = false,
     closed: bool = false,
+    // Stato fullscreen: in fullscreen il gutter/ombra/angoli vengono azzerati
+    // così il contenuto riempie lo schermo; i valori originali si ripristinano
+    // all'uscita insieme alla dimensione del pannello a finestra.
+    fullscreen: bool = false,
+    saved_panel_w: u32 = 0,
+    saved_panel_h: u32 = 0,
+    saved_margin: u32 = 0,
+    saved_radius: f32 = 0,
+    // Motore di testo (stb_truetype), creato pigramente al primo uso: font di
+    // default Hack regular+bold, sostituibile con `setFont`/`loadFont`.
+    font: ?text.Font = null,
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
 
@@ -206,6 +218,7 @@ pub const Window = struct {
 
     pub fn deinit(self: *Window) void {
         self.dropBuffers();
+        if (self.font) |*f| f.deinit();
         if (self.decor.len > 0) self.gpa.free(self.decor);
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
@@ -403,6 +416,36 @@ pub const Window = struct {
         try self.repaintDecor(self.panel_w + 2 * m, self.panel_h + 2 * m);
         self.applySurfaceMetrics();
         self.needs_redraw = true;
+    }
+
+    /// Alterna la modalità a schermo intero. Si limita a chiedere/rilasciare il
+    /// fullscreen al compositore: la dimensione reale e lo stato arrivano dal
+    /// `configure` successivo (onToplevelConfigure), che azzera/ripristina
+    /// gutter/ombra/angoli. Solo dal thread finestra (parla con oggetti Wayland):
+    /// chiamalo da una callback di input.
+    pub fn toggleFullscreen(self: *Window) void {
+        const tl = self.toplevel orelse return;
+        if (self.fullscreen) tl.unsetFullscreen() else tl.setFullscreen();
+    }
+
+    /// Motore di testo della finestra, creato pigramente col font di default
+    /// (Hack regular+bold). Usalo per disegnare testo in `on_draw`:
+    /// `canvas.drawText(try win.textFont(), x, baseline, "…", .{})`.
+    pub fn textFont(self: *Window) !*text.Font {
+        if (self.font == null) self.font = try text.Font.initDefault(self.gpa);
+        return &self.font.?;
+    }
+
+    /// Sostituisce la faccia regular del font con byte TTF (es. un `@embedFile`).
+    pub fn setFont(self: *Window, ttf: []const u8) !void {
+        const f = try self.textFont();
+        try f.setFace(.regular, ttf, false);
+    }
+
+    /// Carica la faccia regular da un file .ttf/.otf su disco.
+    pub fn loadFont(self: *Window, path: []const u8) !void {
+        const f = try self.textFont();
+        try f.loadFace(.regular, path);
     }
 
     // --- drawing --------------------------------------------------------------------
@@ -611,8 +654,50 @@ pub const Window = struct {
         .wm_capabilities = onWmCapabilities,
     };
 
-    fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32, _: ?*anyopaque) callconv(.c) void {
+    // wl_array: buffer dinamico Wayland. `states` di xdg_toplevel.configure è un
+    // array di u32 (enum di stato); `size` è in byte.
+    const WlArray = extern struct { size: usize, alloc: usize, data: ?[*]u32 };
+    // xdg_toplevel.state
+    const STATE_FULLSCREEN: u32 = 2;
+
+    fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32, states: ?*anyopaque) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+
+        // Rileva lo stato fullscreen dall'array di stati del compositore.
+        var is_fs = false;
+        if (states) |sp| {
+            const arr: *const WlArray = @ptrCast(@alignCast(sp));
+            if (arr.data) |d| {
+                const n = arr.size / @sizeOf(u32);
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    if (d[i] == STATE_FULLSCREEN) is_fs = true;
+                }
+            }
+        }
+
+        // Ingresso/uscita da fullscreen: azzera o ripristina gutter/ombra/angoli.
+        // La dimensione la porta il `width`/`height` di questa stessa configure;
+        // il repaint della decor e la geometria li aggiorna il redraw sul resize.
+        if (is_fs != self.fullscreen) {
+            self.fullscreen = is_fs;
+            if (is_fs) {
+                self.saved_panel_w = self.panel_w;
+                self.saved_panel_h = self.panel_h;
+                self.saved_margin = self.opts.style.margin;
+                self.saved_radius = self.opts.style.corner_radius;
+                self.opts.style.margin = 0;
+                self.opts.style.corner_radius = 0;
+            } else {
+                self.opts.style.margin = self.saved_margin;
+                self.opts.style.corner_radius = self.saved_radius;
+                // Se il compositore non suggerisce una dimensione (0), torna a
+                // quella pre-fullscreen.
+                if (width <= 0) self.panel_w = self.saved_panel_w;
+                if (height <= 0) self.panel_h = self.saved_panel_h;
+            }
+        }
+
         // The suggested size is window geometry — the panel. 0 means "you pick".
         if (width > 0) self.panel_w = @max(@as(u32, @intCast(width)), self.minPanel());
         if (height > 0) self.panel_h = @max(@as(u32, @intCast(height)), self.minPanel());

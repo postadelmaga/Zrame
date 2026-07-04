@@ -422,6 +422,16 @@ pub const XdgToplevel = opaque {
     pub fn setMinSize(self: *XdgToplevel, w: i32, h: i32) void {
         _ = wl_proxy_marshal_flags(proxy(self), 8, null, version(self), 0, w, h);
     }
+
+    /// set_fullscreen (opcode 11): output null = il compositore sceglie l'output.
+    pub fn setFullscreen(self: *XdgToplevel) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 11, null, version(self), 0, @as(?*Proxy, null));
+    }
+
+    /// unset_fullscreen (opcode 12): torna allo stato a finestra.
+    pub fn unsetFullscreen(self: *XdgToplevel) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 12, null, version(self), 0);
+    }
 };
 
 // --- ext-background-effect-v1 (compositor blur) -------------------------------------------

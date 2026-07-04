@@ -7,6 +7,14 @@
 //! a decorated frame is just math over pixels.
 
 const std = @import("std");
+pub const text = @import("text.zig");
+
+/// Opzioni di disegno del testo: dimensione in pixel, stile (faccia) e colore.
+pub const TextOpts = struct {
+    size: u16 = 14,
+    style: text.Style = .regular,
+    color: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+};
 
 /// A straight (non-premultiplied) color; premultiplication happens at draw time.
 pub const Color = struct {
@@ -332,7 +340,82 @@ pub const Canvas = struct {
             }
         }
     }
+
+    /// Disegna `s` con `font` a partire da `x` (bordo sinistro) e `baseline_y`
+    /// (baseline del testo), avanzando la penna glifo per glifo. Compone la
+    /// copertura sopra i pixel premoltiplicati (source-over). Usa `font.ascent`
+    /// per convertire un bordo superiore in baseline se serve.
+    pub fn drawText(self: *Canvas, font: *text.Font, x: i32, baseline_y: i32, s: []const u8, opts: TextOpts) void {
+        var pen_x: i32 = x;
+        var i: usize = 0;
+        while (i < s.len) {
+            const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+            const end = @min(i + seq, s.len);
+            const cp: u32 = std.unicode.utf8Decode(s[i..end]) catch s[i];
+            i = end;
+            const g = font.getGlyph(opts.size, opts.style, cp) catch continue;
+            self.blitGlyph(g, pen_x, baseline_y, opts.color);
+            pen_x += g.advance;
+        }
+    }
+
+    /// Fonde la copertura di un glifo (colore straight) sul canvas premoltiplicato.
+    fn blitGlyph(self: *Canvas, g: *const text.Glyph, pen_x: i32, baseline_y: i32, color: Color) void {
+        if (g.bitmap.len == 0) return;
+        const gx0 = pen_x + g.xoff;
+        const gy0 = baseline_y + g.yoff;
+        const W: i32 = @intCast(self.width);
+        const H: i32 = @intCast(self.height);
+        var gy: i32 = 0;
+        while (gy < g.h) : (gy += 1) {
+            const py = gy0 + gy;
+            if (py < 0 or py >= H) continue;
+            var gx: i32 = 0;
+            while (gx < g.w) : (gx += 1) {
+                const px = gx0 + gx;
+                if (px < 0 or px >= W) continue;
+                const cov = g.bitmap[@intCast(gy * g.w + gx)];
+                if (cov == 0) continue;
+                const sa = color.a * (@as(f32, @floatFromInt(cov)) / 255.0);
+                if (sa <= 0.0) continue;
+                const idx = @as(usize, @intCast(py)) * self.width + @as(usize, @intCast(px));
+                const dr, const dg, const db, const da = unpackPremul(self.pixels[idx]);
+                const inv = 1.0 - sa;
+                self.pixels[idx] = packPremul(
+                    color.r * sa + dr * inv,
+                    color.g * sa + dg * inv,
+                    color.b * sa + db * inv,
+                    sa + da * inv,
+                );
+            }
+        }
+    }
 };
+
+test "drawText produces ink and renders a preview" {
+    const gpa = std.testing.allocator;
+    const W: u32 = 460;
+    const H: u32 = 90;
+    const pixels = try gpa.alloc(u32, W * H);
+    defer gpa.free(pixels);
+    // Sfondo scuro opaco.
+    @memset(pixels, packPremul(0.07, 0.07, 0.1, 1.0));
+
+    var canvas = Canvas.init(pixels, W, H);
+    var font = try text.Font.initDefault(gpa);
+    defer font.deinit();
+
+    const v = font.vmetrics(34, .bold);
+    canvas.drawText(&font, 20, 16 + v.ascent, "zrame text ✓ Ag", .{ .size = 34, .style = .bold, .color = Color.rgba(235, 238, 250, 1.0) });
+
+    // Molti pixel differiscono dallo sfondo (i glifi hanno lasciato inchiostro).
+    const bg = packPremul(0.07, 0.07, 0.1, 1.0);
+    var ink: usize = 0;
+    for (pixels) |p| {
+        if (p != bg) ink += 1;
+    }
+    try std.testing.expect(ink > 100);
+}
 
 test "sdf signs" {
     // Center of a 100x100 rounded rect is deep inside, far corner is outside.
