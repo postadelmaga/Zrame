@@ -75,6 +75,10 @@ pub extern const ext_background_effect_manager_v1_interface: Interface;
 pub extern const ext_background_effect_surface_v1_interface: Interface;
 pub extern const wp_cursor_shape_manager_v1_interface: Interface;
 pub extern const wp_cursor_shape_device_v1_interface: Interface;
+pub extern const wl_subcompositor_interface: Interface;
+pub extern const wl_subsurface_interface: Interface;
+pub extern const zwp_linux_dmabuf_v1_interface: Interface;
+pub extern const zwp_linux_buffer_params_v1_interface: Interface;
 
 /// 24.8 fixed point, the wire format of pointer coordinates.
 pub const Fixed = i32;
@@ -226,13 +230,66 @@ pub const Buffer = opaque {
     }
 };
 
+// --- wl_subcompositor / wl_subsurface ----------------------------------------------------
+
+pub const Subcompositor = opaque {
+    pub fn getSubsurface(self: *Subcompositor, surface: *Surface, parent: *Surface) *Subsurface {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &wl_subsurface_interface, version(self), 0, @as(?*Proxy, null), @as(*Proxy, @ptrCast(surface)), @as(*Proxy, @ptrCast(parent)));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const Subsurface = opaque {
+    pub fn destroy(self: *Subsurface) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+
+    pub fn setPosition(self: *Subsurface, x: i32, y: i32) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, x, y);
+    }
+
+    /// Desync: the video subsurface commits on its own cadence, independent of
+    /// the parent's (rare) chrome redraws.
+    pub fn setDesync(self: *Subsurface) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 5, null, version(self), 0);
+    }
+};
+
+// --- zwp_linux_dmabuf_v1 ------------------------------------------------------------------
+
+pub const LinuxDmabuf = opaque {
+    pub fn createParams(self: *LinuxDmabuf) *BufferParams {
+        const p = wl_proxy_marshal_flags(proxy(self), 1, &zwp_linux_buffer_params_v1_interface, version(self), 0, @as(?*Proxy, null));
+        return @ptrCast(p.?);
+    }
+};
+
+pub const BufferParams = opaque {
+    pub fn destroy(self: *BufferParams) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 0, null, version(self), MARSHAL_FLAG_DESTROY);
+    }
+
+    pub fn add(self: *BufferParams, fd: c_int, plane: u32, offset: u32, stride: u32, modifier: u64) void {
+        _ = wl_proxy_marshal_flags(proxy(self), 1, null, version(self), 0, fd, plane, offset, stride, @as(u32, @intCast(modifier >> 32)), @as(u32, @truncate(modifier)));
+    }
+
+    /// `create_immed` (v2+): synchronous buffer creation — an invalid dmabuf is
+    /// a protocol error instead of an event, which is fine: our fds come from
+    /// a Vulkan export we already validated.
+    pub fn createImmed(self: *BufferParams, w: i32, h: i32, format: u32, flags: u32) *Buffer {
+        const p = wl_proxy_marshal_flags(proxy(self), 3, &wl_buffer_interface, version(self), 0, @as(?*Proxy, null), w, h, format, flags);
+        return @ptrCast(p.?);
+    }
+};
+
 // --- wl_seat / wl_pointer ---------------------------------------------------------------
 
 pub const SEAT_CAPABILITY_POINTER: u32 = 1;
 pub const SEAT_CAPABILITY_KEYBOARD: u32 = 2;
 pub const BTN_LEFT: u32 = 0x110;
 pub const POINTER_BUTTON_STATE_PRESSED: u32 = 1;
-pub const KEY_ESC: u32 = 1; // linux evdev keycode
+pub const KEY_ESC: u32 = 1; // linux evdev keycodes
+pub const KEY_SPACE: u32 = 57;
 pub const KEYBOARD_KEY_STATE_PRESSED: u32 = 1;
 
 pub const Seat = opaque {

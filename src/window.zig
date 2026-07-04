@@ -55,6 +55,17 @@ const Staged = struct {
     fresh: bool = false,
 };
 
+/// One pending dmabuf present (see `Window.presentDmabuf`).
+const StagedDma = struct {
+    slot: u8,
+    fd: posix.fd_t,
+    width: u32,
+    height: u32,
+    stride: u32,
+    fourcc: u32,
+    modifier: u64,
+};
+
 /// Zig 0.16 keeps blocking mutexes behind `std.Io`; the staging handoff is a short,
 /// bounded copy at frame cadence, so a spin on the lock-free `std.atomic.Mutex` is
 /// simpler than threading an `Io` through the window.
@@ -84,6 +95,8 @@ pub const Window = struct {
     registry: *wl.Registry,
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
+    subcompositor: ?*wl.Subcompositor = null,
+    dmabuf: ?*wl.LinuxDmabuf = null,
     wm_base: ?*wl.XdgWmBase = null,
     seat: ?*wl.Seat = null,
     blur_manager: ?*wl.BackgroundEffectManager = null,
@@ -123,6 +136,21 @@ pub const Window = struct {
     staged: Staged = .{},
     front: Staged = .{},
     wake_fd: posix.fd_t,
+
+    // The zero-copy video path: GPU frames arrive as dmabufs and go to a
+    // desynced subsurface over the content area — no CPU pixels involved.
+    // `staged_dma` is the cross-thread mailbox (same wake fd as `staged`);
+    // wl_buffers are created once per slot and reused every frame.
+    video_surface: ?*wl.Surface = null,
+    video_subsurface: ?*wl.Subsurface = null,
+    // 8 slots: enough for a few resolution tiers × double buffering.
+    video_buffers: [8]?*wl.Buffer = @splat(null),
+    staged_dma: ?StagedDma = null,
+    /// True while a frame callback is outstanding on the video surface: the
+    /// compositor has not yet consumed the last commit. Producers poll
+    /// `videoBusy` to pace themselves to the refresh rate instead of
+    /// free-running (mailbox semantics: staging while busy replaces).
+    video_pending: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const display = wl.wl_display_connect(null) orelse return error.NoWaylandDisplay;
@@ -181,6 +209,11 @@ pub const Window = struct {
         if (self.decor.len > 0) self.gpa.free(self.decor);
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
+        for (self.video_buffers) |vb| {
+            if (vb) |b| b.destroy();
+        }
+        if (self.video_subsurface) |ss| ss.destroy();
+        if (self.video_surface) |vs| vs.destroy();
         if (self.blur) |b| wl.wl_proxy_destroy(@ptrCast(b));
         if (self.cursor_device) |c| wl.wl_proxy_destroy(@ptrCast(c));
         if (self.keyboard) |k| wl.wl_proxy_destroy(@ptrCast(k));
@@ -224,6 +257,98 @@ pub const Window = struct {
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
+    /// Present a GPU frame with zero CPU pixel work: `fd` is a dmabuf export
+    /// of the frame image (`fourcc`/`stride`/`modifier` as the exporter
+    /// reports them). `slot` (0..2) identifies a persistent image the caller
+    /// re-renders into; its wl_buffer is created once and reused. Returns
+    /// false when the compositor lacks linux-dmabuf/subcompositor support —
+    /// fall back to `presentRgba`. Thread-safe, same mailbox as `presentRgba`.
+    pub fn presentDmabuf(self: *Window, slot: u8, fd: posix.fd_t, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64) bool {
+        if (self.dmabuf == null or self.subcompositor == null) return false;
+        std.debug.assert(slot < self.video_buffers.len);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.staged_dma = .{
+                .slot = slot,
+                .fd = fd,
+                .width = width,
+                .height = height,
+                .stride = stride,
+                .fourcc = fourcc,
+                .modifier = modifier,
+            };
+        }
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        return true;
+    }
+
+    /// Window-thread half of `presentDmabuf`: build the subsurface/buffers
+    /// lazily, then attach + commit the requested slot.
+    fn processVideo(self: *Window) void {
+        self.mutex.lock();
+        const req_opt = self.staged_dma;
+        self.staged_dma = null;
+        self.mutex.unlock();
+        const req = req_opt orelse return;
+        if (!self.configured) return;
+
+        if (self.video_surface == null) {
+            const vs = self.compositor.?.createSurface();
+            // Input passes through to the glass parent (drag/keys still work).
+            const empty = self.compositor.?.createRegion();
+            vs.setInputRegion(empty);
+            empty.destroy();
+            const ss = self.subcompositor.?.getSubsurface(vs, self.surface.?);
+            ss.setDesync();
+            self.video_surface = vs;
+            self.video_subsurface = ss;
+            // Mapping and position are parent state: one chrome commit seals them.
+            self.needs_redraw = true;
+        }
+        const content = self.contentRect();
+        const dx = content.x + (content.w -| @min(req.width, content.w)) / 2;
+        const dy = content.y + (content.h -| @min(req.height, content.h)) / 2;
+        self.video_subsurface.?.setPosition(@intCast(dx), @intCast(dy));
+
+        if (self.video_buffers[req.slot] == null) {
+            const params = self.dmabuf.?.createParams();
+            params.add(req.fd, 0, 0, req.stride, req.modifier);
+            self.video_buffers[req.slot] = params.createImmed(
+                @intCast(req.width),
+                @intCast(req.height),
+                req.fourcc,
+                0,
+            );
+            params.destroy();
+        }
+        const vs = self.video_surface.?;
+        vs.attach(self.video_buffers[req.slot], 0, 0);
+        vs.damageBuffer(0, 0, @intCast(req.width), @intCast(req.height));
+        // Refresh pacing: one frame callback per commit; producers that honor
+        // `videoBusy` settle at the compositor's cadence.
+        self.video_pending.store(true, .release);
+        const cb = vs.frame();
+        cb.setListener(&video_frame_listener, self);
+        vs.commit();
+    }
+
+    const video_frame_listener = wl.Callback.Listener{ .done = onVideoFrameDone };
+
+    fn onVideoFrameDone(data: ?*anyopaque, callback: *wl.Callback, _: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        callback.destroy();
+        self.video_pending.store(false, .release);
+    }
+
+    /// True while the compositor still owes a frame-done for the last video
+    /// commit — render the next frame when this turns false to run at the
+    /// refresh rate instead of burning frames nobody sees.
+    pub fn videoBusy(self: *const Window) bool {
+        return self.video_pending.load(.acquire);
+    }
+
     /// The event loop: blocks until the window is closed or the connection drops.
     pub fn run(self: *Window) !void {
         while (!self.closed) {
@@ -252,7 +377,13 @@ pub const Window = struct {
             if (fds[1].revents & posix.POLL.IN != 0) {
                 var drained: u64 = 0;
                 _ = posix.read(self.wake_fd, std.mem.asBytes(&drained)) catch {};
-                self.needs_redraw = true;
+                // Video frames commit their own subsurface; only a staged shm
+                // frame needs the full chrome redraw.
+                self.processVideo();
+                self.mutex.lock();
+                const has_frame = self.staged.fresh;
+                self.mutex.unlock();
+                if (has_frame) self.needs_redraw = true;
             }
 
             if (self.configured and self.needs_redraw) try self.redraw();
@@ -433,6 +564,12 @@ pub const Window = struct {
             self.compositor = @ptrCast(registry.bind(name, &wl.wl_compositor_interface, @min(ver, 4)).?);
         } else if (std.mem.eql(u8, iface, "wl_shm")) {
             self.shm = @ptrCast(registry.bind(name, &wl.wl_shm_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, "wl_subcompositor")) {
+            self.subcompositor = @ptrCast(registry.bind(name, &wl.wl_subcompositor_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
+            // v2 is enough (create_immed); cap at 4 (v5 changes nothing we use).
+            if (ver >= 2)
+                self.dmabuf = @ptrCast(registry.bind(name, &wl.zwp_linux_dmabuf_v1_interface, @min(ver, 4)).?);
         } else if (std.mem.eql(u8, iface, "xdg_wm_base")) {
             self.wm_base = @ptrCast(registry.bind(name, &wl.xdg_wm_base_interface, @min(ver, 6)).?);
         } else if (std.mem.eql(u8, iface, "wl_seat")) {

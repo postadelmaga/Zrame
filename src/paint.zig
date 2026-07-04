@@ -91,8 +91,19 @@ pub const Style = struct {
     content_fade_width: f32 = 0,
     /// Inset of the compositor blur region relative to the panel (0 for full panel blur).
     blur_inset: f32 = 0,
-    /// Whether only the border region should show the animated blitted content.
-    animate_border_only: bool = false,
+    /// Width of the animated border band: blitted frames only show within this
+    /// distance of the panel edge, fading toward the center (0 = frames fill the
+    /// panel). Orthogonal to the presets — compose it onto any of them with
+    /// [`withBorderAnim`].
+    border_anim_width: f32 = 0,
+
+    /// Copy of the style with the animated border band enabled; composes with every
+    /// preset: `Style.fluent().withBorderAnim(80)`.
+    pub fn withBorderAnim(self: Style, width: f32) Style {
+        var s = self;
+        s.border_anim_width = width;
+        return s;
+    }
 
     /// Preset: Apple macOS Vision Pro Glassmorphism
     pub fn macos() Style {
@@ -146,14 +157,14 @@ pub const Style = struct {
         return .{
             .corner_radius = 32,
             .glass = Color.rgba(240, 0, 255, 0.30),
-            .glass_fade_width = 45.0,
+            .glass_fade_width = 80.0,
             .border_alpha = 0.60,
             .content_radius = 24,
-            .content_fade_width = 35.0,
+            .content_fade_width = 60.0,
             .shadow_alpha = 0.40,
             .shadow_blur = 25,
             .shadow_offset_y = 10,
-            .animate_border_only = true,
+            .border_anim_width = 80.0,
         };
     }
 };
@@ -269,9 +280,8 @@ pub const Canvas = struct {
                     content_cov *= smoothstep(0.0, style.content_fade_width, -d_content);
                 }
 
-                if (style.animate_border_only) {
-                    const border_fade = 1.0 - smoothstep(0.0, style.glass_fade_width, -d_panel);
-                    content_cov *= border_fade;
+                if (style.border_anim_width > 0.0) {
+                    content_cov *= 1.0 - smoothstep(0.0, style.border_anim_width, -d_panel);
                 }
 
                 const sp = src_row[@as(usize, sx) * 4 ..][0..4];

@@ -51,7 +51,7 @@ src/
 ```sh
 zig build test         # unit tests (SDF, premultiplication invariants)
 zig build run-hello    # four styled glass windows (one per preset), drag to move
-zig build run-frames   # zicro sources → sinks: 60 Hz plasma through media.latest
+zig build run-frames   # 60 Hz plasma in the animated border band; Space cycles presets
 ```
 
 Requirements: Linux + Wayland, `libwayland-client`, `wayland-scanner`,

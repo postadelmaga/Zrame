@@ -9,11 +9,15 @@ const protocol_xmls = [_][]const u8{
     "/usr/share/wayland-protocols/staging/cursor-shape/cursor-shape-v1.xml",
     // cursor-shape references zwp_tablet_tool_v2, so its tables must exist too.
     "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml",
+    // GPU frames land in the video subsurface as dmabufs (zero-copy path).
+    "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
 };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Everything zrame draws is per-pixel software rendering; Debug builds can't hold
+    // 60 Hz on the demos, so optimized is the default (-Doptimize=Debug to override).
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
 
     const zicro = b.dependency("zicro", .{ .target = target, .optimize = optimize });
 
