@@ -4,7 +4,10 @@
     .fingerprint = 0x10e8464e485429a3, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .zicro = .{ .path = "../Zicro" },
+        .zicro = .{
+            .url = "git+https://github.com/postadelmaga/zicro#993dc45b4738322198222e24036ad2390816f8ab",
+            .hash = "zicro-0.0.0-f0uVS8w8BAAEOcvdmvEmY5jEzevfSWWWwLrQ0-oZCkrL",
+        },
     },
     .paths = .{
         "build.zig",
