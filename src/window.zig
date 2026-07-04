@@ -192,6 +192,18 @@ pub const Window = struct {
     timer_fd: posix.fd_t = -1,
     timer_armed: bool = false,
     last_tick_ns: i64 = 0,
+    // Client-driven animated resize toward a target panel size (see `animateResize`).
+    // Wayland lets an unmaximized toplevel pick its own size, so we drive panel_w/panel_h
+    // with a spring off the same timerfd clock as the panel animations and repaint each
+    // tick. The spring (position + velocity per axis) gives a lively, slightly-overshooting
+    // settle; retargeting mid-flight keeps the velocity for fluid chained navigation.
+    resize_anim: bool = false,
+    resize_w: f32 = 0, // dimensione animata corrente (pannello)
+    resize_h: f32 = 0,
+    resize_vw: f32 = 0, // velocità della molla
+    resize_vh: f32 = 0,
+    resize_to_w: u32 = 0, // bersaglio
+    resize_to_h: u32 = 0,
     // Optional StatusNotifierItem tray connection; created in `run` when `opts.tray` is set,
     // its bus fd is polled alongside Wayland. Null when no tray or registration failed.
     tray: ?*tray_mod.Tray = null,
@@ -610,9 +622,10 @@ pub const Window = struct {
         else
             0.016;
         self.last_tick_ns = now;
-        const active = self.panels.tick(dt, self.host());
+        const panels_active = self.panels.tick(dt, self.host());
+        const resize_active = self.stepResize(dt);
         self.needs_redraw = true;
-        if (!active) self.disarmTimer();
+        if (!panels_active and !resize_active) self.disarmTimer();
     }
 
     fn monotonicNs() i64 {
@@ -788,6 +801,81 @@ pub const Window = struct {
     pub fn toggleFullscreen(self: *Window) void {
         const tl = self.toplevel orelse return;
         if (self.fullscreen) tl.unsetFullscreen() else tl.setFullscreen();
+    }
+
+    // Molla del ridimensionamento. stiffness = ω², damping = 2·ζ·ω. Con questi
+    // valori ω≈18.4 rad/s e ζ≈0.65: assestamento vivace in ~0.45s con un lieve
+    // sovraelongazione (~7%) che dà il rimbalzo grazioso. Il passo d'integrazione
+    // fisso rende il moto identico a qualunque frame-rate.
+    const spring_stiffness: f32 = 340.0;
+    const spring_damping: f32 = 24.0;
+    const spring_substep: f32 = 1.0 / 240.0;
+
+    /// Ridimensiona la finestra verso `target_w`×`target_h` (dimensione del
+    /// *pannello* — geometria finestra, senza il gutter d'ombra) con
+    /// un'animazione a molla: accelerazione morbida, lieve sovraelongazione e
+    /// assestamento. Su Wayland il client sceglie la propria dimensione, quindi
+    /// qui basta pilotare panel_w/panel_h e ridisegnare a ogni tick (i buffer
+    /// crescono pigramente in `redraw`). Se un'animazione è già in corso, cambia
+    /// solo il bersaglio conservando posizione e velocità → navigazioni
+    /// concatenate fluide. No-op in fullscreen/massimizzato (lì la dimensione la
+    /// decide il compositore). Solo dal thread finestra (callback di input o
+    /// prima di `run`).
+    pub fn animateResize(self: *Window, target_w: u32, target_h: u32) void {
+        if (self.fullscreen or self.maximized) return;
+        const tw = @max(target_w, self.minPanel());
+        const th = @max(target_h, self.minPanel());
+        // Già alla dimensione richiesta e nessuna animazione in corso: niente da fare.
+        if (tw == self.panel_w and th == self.panel_h and !self.resize_anim) return;
+        // Avvio a freddo: parte dalla dimensione corrente, ferma. Retarget in volo:
+        // mantiene resize_w/h e la velocità così la molla prosegue senza scatti.
+        if (!self.resize_anim) {
+            self.resize_w = @floatFromInt(self.panel_w);
+            self.resize_h = @floatFromInt(self.panel_h);
+            self.resize_vw = 0;
+            self.resize_vh = 0;
+        }
+        self.resize_to_w = tw;
+        self.resize_to_h = th;
+        self.resize_anim = true;
+        self.armTimer();
+    }
+
+    /// Avanza la molla del resize di `dt`; ritorna true finché è in corso. La
+    /// geometria finestra, la regione d'input e la decor le riallinea
+    /// `redraw`→`resizeBuffers`, che scatta a ogni frame perché la dimensione del
+    /// buffer cambia durante l'animazione.
+    fn stepResize(self: *Window, dt: f32) bool {
+        if (!self.resize_anim) return false;
+        const tw: f32 = @floatFromInt(self.resize_to_w);
+        const th: f32 = @floatFromInt(self.resize_to_h);
+        // Integrazione semi-implicita a sotto-passi fissi: stabile anche con dt
+        // grandi (finestra ridipinta a scatti) e indipendente dal frame-rate.
+        var remaining = dt;
+        while (remaining > 0) {
+            const st = @min(spring_substep, remaining);
+            remaining -= st;
+            self.resize_vw += (spring_stiffness * (tw - self.resize_w) - spring_damping * self.resize_vw) * st;
+            self.resize_vh += (spring_stiffness * (th - self.resize_h) - spring_damping * self.resize_vh) * st;
+            self.resize_w += self.resize_vw * st;
+            self.resize_h += self.resize_vh * st;
+        }
+        // Assestata: vicina al bersaglio e quasi ferma → aggancia e termina.
+        if (@abs(tw - self.resize_w) < 0.5 and @abs(th - self.resize_h) < 0.5 and
+            @abs(self.resize_vw) < 2.0 and @abs(self.resize_vh) < 2.0)
+        {
+            self.resize_w = tw;
+            self.resize_h = th;
+            self.resize_vw = 0;
+            self.resize_vh = 0;
+            self.resize_anim = false;
+        }
+        // Floor sul float PRIMA della conversione: una sovraelongazione in
+        // riduzione può portare resize_w/h sotto zero (illegale in @intFromFloat).
+        const min_f: f32 = @floatFromInt(self.minPanel());
+        self.panel_w = @intFromFloat(@round(@max(min_f, self.resize_w)));
+        self.panel_h = @intFromFloat(@round(@max(min_f, self.resize_h)));
+        return self.resize_anim;
     }
 
     /// Motore di testo della finestra, creato pigramente col font di default
