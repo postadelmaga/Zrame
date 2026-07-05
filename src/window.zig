@@ -57,8 +57,14 @@ pub const Options = struct {
     on_key: ?*const fn (window: *Window, key: u32, state: u32, user: ?*anyopaque) void = null,
     /// Optional scroll handler (axis, discrete/value).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
-    /// Optional mouse event handler (motion or button clicks).
-    on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) void = null,
+    /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates
+    /// are **content-local** — top-left of the app's content rect is (0,0) — so an app
+    /// that presents a content-sized frame can hit-test without knowing the shadow
+    /// margin or title-bar height. Returns **true to consume** the event: the window
+    /// then skips its own default handling (border drag-move / edge resize on a
+    /// title-bar-less window), so an app can claim clicks on its own edge widgets
+    /// (e.g. a scrollbar) before the window tries to move.
+    on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) bool = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). When set, `run` opens a
     /// session-bus connection, registers the item with the tray host, and services it off
     /// the window's poll loop. A failure to register (no tray host present) is non-fatal —
@@ -1310,7 +1316,7 @@ pub const Window = struct {
         // then hand it to the app. `routeInput` arms the animation timer, so the fade
         // actually plays out.
         _ = self.routeInput(.leave);
-        if (self.opts.on_mouse) |cb| cb(self, .leave, self.opts.user);
+        if (self.opts.on_mouse) |cb| _ = cb(self, .leave, self.opts.user);
     }
     fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
@@ -1319,14 +1325,27 @@ pub const Window = struct {
         self.pointer_x = fx;
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
-        // Not over a panel: reflect the resize band in the cursor, else default.
+        if (self.opts.on_mouse) |cb| {
+            // The app draws in content-local space (its presented frame sits at the
+            // content rect), so hand it content-local pointer coords — top-left of the
+            // content is (0,0). Panels above still get buffer-space via routeInput.
+            const c = self.contentRect();
+            const consumed = cb(self, .{ .motion = .{
+                .x = fx - @as(f32, @floatFromInt(c.x)),
+                .y = fy - @as(f32, @floatFromInt(c.y)),
+            } }, self.opts.user);
+            if (consumed) {
+                // The app owns this motion (e.g. hovering/dragging its own scrollbar):
+                // keep the normal cursor, don't flash the resize arrows over its widget.
+                self.setCursorShape(wl.CursorShapeDevice.SHAPE_DEFAULT);
+                return;
+            }
+        }
+        // Not over a panel/app widget: reflect the resize band in the cursor, else default.
         if (!self.fullscreen and !self.maximized) {
             self.setCursorShape(edgeCursor(self.resizeEdgeAt(fx, fy)));
         } else {
             self.setCursorShape(wl.CursorShapeDevice.SHAPE_DEFAULT);
-        }
-        if (self.opts.on_mouse) |cb| {
-            cb(self, .{ .motion = .{ .x = fx, .y = fy } }, self.opts.user);
         }
     }
 
@@ -1336,7 +1355,9 @@ pub const Window = struct {
         const pressed = state == wl.POINTER_BUTTON_STATE_PRESSED;
         if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = button, .pressed = pressed } })) return;
         if (self.opts.on_mouse) |cb| {
-            cb(self, .{ .button = .{ .button = button, .state = state } }, self.opts.user);
+            // App consumed it (e.g. grabbed its own scrollbar) → skip the default
+            // window move/resize so the two don't fight over the same click.
+            if (cb(self, .{ .button = .{ .button = button, .state = state } }, self.opts.user)) return;
         }
         if (button == wl.BTN_LEFT and state == wl.POINTER_BUTTON_STATE_PRESSED) {
             const edge = self.resizeEdgeAt(self.pointer_x, self.pointer_y);
