@@ -52,6 +52,9 @@ pub fn build(b: *std.Build) void {
         }
     } else if (target.result.os.tag == .windows) {
         zrame.linkSystemLibrary("user32", .{});
+        // GDI: the DIB section + memory DC behind the layered-window (UpdateLayeredWindow)
+        // glass presentation. The rounded panel + drop shadow are painted client-side, so no
+        // DWM is needed (and none is used — the glass shows even under Wine).
         zrame.linkSystemLibrary("gdi32", .{});
     }
 

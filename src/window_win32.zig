@@ -1,10 +1,20 @@
-//! # zrame.window (Win32 backend) — a native decorated window
+//! # zrame.window (Win32 backend) — a frameless, client-decorated *layered* window
 //!
-//! The Windows counterpart to `window_wayland.zig`. Where the Wayland backend paints its
-//! own glass chrome (rounded panel, drop shadow) into a transparent-margin buffer, on
-//! Windows we let the OS draw the frame (title bar, min/max/close, resizable borders) and
-//! fill the client area ourselves: the content frame the app presents, with zrame's panels
-//! (floating scrollbars, right-click menu) composited on top, blitted through GDI.
+//! The Windows counterpart to `window_wayland.zig`, with the same **frameless glass**
+//! experience: no OS title bar or borders — `WM_NCCALCSIZE` collapses the non-client area so
+//! the client fills the whole window — and the *entire* window (rounded glass panel, drop
+//! shadow, translucency, plus the app's own chrome: title-bar controls when enabled, floating
+//! scrollbars, right-click menu) is composited client-side into a DIB and pushed with
+//! per-pixel alpha via `UpdateLayeredWindow`. It uses the very same `paint.drawChrome` the
+//! Wayland backend paints, over a shadow-gutter margin, so the look matches 1:1 — and because
+//! the compositing is client-side it shows **even under Wine**, where DWM acrylic cannot. The
+//! one piece reserved for real Windows is the *frosted blur behind* the glass (needs the DWM
+//! compositor, exactly as the Wayland blur needs KWin).
+//!
+//! Interaction mirrors the Wayland path exactly: near-edge drags resize (8px band → the OS
+//! `SC_SIZE` loop, with native cursors + Aero snap), an unconsumed border drag moves the
+//! window (30px band → a synthetic `HTCAPTION`), and panels/`on_mouse` get first dibs on
+//! every click so content interactions never fight the move/resize.
 //!
 //! The public surface matches the Wayland backend exactly (see the facade `window.zig`),
 //! so `sink.zig` and callers such as zuer-gui are backend-agnostic. Key/mouse/scroll
@@ -147,7 +157,24 @@ extern "user32" fn SetTimer(HWND, usize, u32, ?*anyopaque) callconv(.winapi) usi
 extern "user32" fn KillTimer(HWND, usize) callconv(.winapi) i32;
 extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) i32;
 extern "user32" fn GetWindowPlacement(HWND, *WINDOWPLACEMENT) callconv(.winapi) i32;
-extern "gdi32" fn SetDIBitsToDevice(HDC, i32, i32, u32, u32, i32, i32, u32, u32, ?*const anyopaque, *const BITMAPINFO, u32) callconv(.winapi) i32;
+extern "user32" fn SendMessageW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
+extern "user32" fn GetCursorPos(*POINT) callconv(.winapi) i32;
+extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) i32;
+// Layered-window presentation: the whole window (glass chrome + content) is composed into a
+// DIB section and pushed with per-pixel alpha via UpdateLayeredWindow. So the rounded panel,
+// drop shadow and translucency are painted *client-side* — exactly the same `drawChrome` the
+// Wayland backend uses — and show even without a compositor (i.e. under Wine, unlike DWM
+// acrylic blur which fundamentally needs the real Windows compositor).
+extern "user32" fn UpdateLayeredWindow(HWND, HDC, ?*const POINT, ?*const SIZE, HDC, ?*const POINT, u32, *const BLENDFUNCTION, u32) callconv(.winapi) i32;
+extern "gdi32" fn CreateCompatibleDC(HDC) callconv(.winapi) HDC;
+extern "gdi32" fn CreateDIBSection(HDC, *const BITMAPINFO, u32, *?*anyopaque, ?*anyopaque, u32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn SelectObject(HDC, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) i32;
+extern "gdi32" fn DeleteDC(HDC) callconv(.winapi) i32;
+
+const SIZE = extern struct { cx: i32, cy: i32 };
+const BLENDFUNCTION = extern struct { BlendOp: u8, BlendFlags: u8, SourceConstantAlpha: u8, AlphaFormat: u8 };
 
 // Window/message constants.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
@@ -163,10 +190,18 @@ const SW_RESTORE: i32 = 9;
 const SW_SHOWNORMAL: i32 = 1;
 const SW_MAX_STATE: u32 = 3; // SW_SHOWMAXIMIZED value seen in WINDOWPLACEMENT.showCmd
 
+const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_FRAMECHANGED: u32 = 0x0020;
 const SWP_SHOWWINDOW: u32 = 0x0040;
+
+// Layered window (WS_EX_LAYERED) + UpdateLayeredWindow per-pixel alpha.
+const WS_EX_LAYERED: u32 = 0x00080000;
+const ULW_ALPHA: u32 = 0x02;
+const AC_SRC_OVER: u8 = 0x00;
+const AC_SRC_ALPHA: u8 = 0x01;
+const DIB_RGB_COLORS: u32 = 0;
 
 const WM_DESTROY: u32 = 0x0002;
 const WM_SIZE: u32 = 0x0005;
@@ -184,11 +219,44 @@ const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_TIMER: u32 = 0x0113;
+const WM_NCCALCSIZE: u32 = 0x0083;
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+const WM_SETCURSOR: u32 = 0x0020;
+const WM_SYSCOMMAND: u32 = 0x0112;
 const WM_APP_PRESENT: u32 = 0x8001; // WM_APP + 1: a freshly staged frame is ready
 
+// Frameless move/resize: hand a client drag to the OS via a synthetic caption hit
+// (WM_NCLBUTTONDOWN) or a sizing command (SC_SIZE + edge). Same modal loops the native
+// title bar/borders use, so Aero snap and cursors come for free.
+const HTCLIENT = 1;
+const HTCAPTION = 2;
+const SC_SIZE: WPARAM = 0xF000;
+// SC_SIZE + these directions = the border the OS starts sizing from.
+const WMSZ_LEFT: WPARAM = 1;
+const WMSZ_RIGHT: WPARAM = 2;
+const WMSZ_TOP: WPARAM = 3;
+const WMSZ_TOPLEFT: WPARAM = 4;
+const WMSZ_TOPRIGHT: WPARAM = 5;
+const WMSZ_BOTTOM: WPARAM = 6;
+const WMSZ_BOTTOMLEFT: WPARAM = 7;
+const WMSZ_BOTTOMRIGHT: WPARAM = 8;
+
 const IDC_ARROW: usize = 32512;
+const IDC_SIZENWSE: usize = 32642;
+const IDC_SIZENESW: usize = 32643;
+const IDC_SIZEWE: usize = 32644;
+const IDC_SIZENS: usize = 32645;
+
+// Resize-edge band (px) and window-move border band (px), mirroring the Wayland backend
+// (`resizeEdgeAt` = 8px, the titlebar-less move grab = 30px).
+const RESIZE_BAND: f32 = 8.0;
+const MOVE_BAND: f32 = 30.0;
+
 const TME_LEAVE: u32 = 0x00000002;
 const ANIM_TIMER_ID: usize = 1;
+
+/// Which window border a pointer is over, for frameless resize.
+const Edge = enum { none, left, right, top, bottom, top_left, top_right, bottom_left, bottom_right };
 
 // evdev button codes, matching the Wayland path (`BTN_LEFT`/`BTN_RIGHT`).
 const BTN_LEFT: u32 = 0x110;
@@ -211,6 +279,7 @@ pub const Window = struct {
     fullscreen: bool = false,
     maximized: bool = false,
     saved_style: u32 = 0,
+    saved_margin: u32 = 0,
     saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
     font: ?text.Font = null,
@@ -228,10 +297,17 @@ pub const Window = struct {
     lock: SpinLock = .{},
     staged: Staged = .{},
     front: Staged = .{},
-    // The composited, client-sized buffer we blit; kept so WM_PAINT can re-blit on expose.
-    frame: []u32 = &.{},
-    frame_w: u32 = 0,
-    frame_h: u32 = 0,
+
+    // Layered-window presentation buffers. `buf` maps the pixels of a top-down 32bpp DIB
+    // section we compose the whole window into and hand to UpdateLayeredWindow; `decor` is
+    // the pre-painted glass chrome (rounded panel + drop shadow) memcpy'd in as the
+    // background every frame — same split as the Wayland backend's `decor`.
+    mem_dc: HDC = null,
+    dib: ?*anyopaque = null,
+    buf: []u32 = &.{}, // aliases the DIB section (owned by the HBITMAP, not the gpa)
+    decor: []u32 = &.{},
+    buf_w: u32 = 0,
+    buf_h: u32 = 0,
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const self = try gpa.create(Window);
@@ -255,28 +331,34 @@ pub const Window = struct {
         };
         _ = RegisterClassExW(&wc);
 
-        // Native decorated, resizable window. Grow the outer rect so the *client* area is
-        // panel_w×panel_h (AdjustWindowRectEx accounts for the frame + title bar).
-        var rect = RECT{ .left = 0, .top = 0, .right = @intCast(self.panel_w), .bottom = @intCast(self.panel_h) };
-        _ = AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, 0, 0);
+        // Frameless *layered* window: WS_EX_LAYERED so UpdateLayeredWindow drives every pixel
+        // (glass chrome + shadow + content) with per-pixel alpha; WS_OVERLAPPEDWINDOW keeps
+        // the taskbar entry + min/max/snap, and `WM_NCCALCSIZE` collapses the OS frame so the
+        // client fills the whole window. The window is sized panel + a shadow-gutter margin on
+        // every side (same as the Wayland buffer), so the drop shadow has room to fall.
+        const m = self.opts.style.margin;
         const title = try toUtf16Z(gpa, opts.title);
         defer gpa.free(title);
 
         const hwnd = CreateWindowExW(
-            0,
+            WS_EX_LAYERED,
             class_name,
             title.ptr,
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            @intCast(self.panel_w + 2 * m),
+            @intCast(self.panel_h + 2 * m),
             null,
             null,
             hinst,
             self,
         ) orelse return error.WindowCreationFailed;
         self.hwnd = hwnd;
+
+        // Re-run frame calc now that the window exists, so the frameless client takes hold.
+        // NOSIZE|NOMOVE: only trigger WM_NCCALCSIZE, don't actually move/resize the window.
+        _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
         // Floating scrollbars are the bottom-most panel (borrowed: the Window owns the
         // field instance, so the registry must not free it). Mirrors the Wayland backend.
@@ -290,15 +372,20 @@ pub const Window = struct {
             try self.panels.add(Panel.of(menu.Menu, mnu), true);
         }
 
-        _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         self.syncClientSize();
+        // A layered window shows nothing until its first UpdateLayeredWindow, so compose and
+        // push one frame *before* ShowWindow — otherwise the first paint flashes empty.
+        self.present();
+        _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         return self;
     }
 
     pub fn deinit(self: *Window) void {
         self.panels.deinit();
         if (self.font) |*f| f.deinit();
-        if (self.frame.len > 0) self.gpa.free(self.frame);
+        if (self.decor.len > 0) self.gpa.free(self.decor);
+        if (self.dib) |d| _ = DeleteObject(d);
+        if (self.mem_dc != null) _ = DeleteDC(self.mem_dc);
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
         if (self.hwnd) |h| _ = DestroyWindow(h);
@@ -354,6 +441,10 @@ pub const Window = struct {
         const h = self.hwnd orelse return;
         self.fullscreen = !self.fullscreen;
         if (self.fullscreen) {
+            // Drop the shadow gutter so the content fills the whole screen edge-to-edge
+            // (mirrors the Wayland backend zeroing style.margin on fullscreen).
+            self.saved_margin = self.opts.style.margin;
+            self.opts.style.margin = 0;
             self.saved_style = @bitCast(GetWindowLongW(h, GWL_STYLE));
             _ = GetWindowRect(h, &self.saved_rect);
             _ = SetWindowLongW(h, GWL_STYLE, @bitCast(WS_POPUP | WS_VISIBLE));
@@ -361,12 +452,14 @@ pub const Window = struct {
             const sh = GetSystemMetrics(1); // SM_CYSCREEN
             _ = SetWindowPos(h, null, 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         } else {
+            self.opts.style.margin = self.saved_margin;
             _ = SetWindowLongW(h, GWL_STYLE, @bitCast(self.saved_style));
             const rw = self.saved_rect.right - self.saved_rect.left;
             const rh = self.saved_rect.bottom - self.saved_rect.top;
             _ = SetWindowPos(h, null, self.saved_rect.left, self.saved_rect.top, rw, rh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
         self.syncClientSize();
+        self.present();
     }
 
     /// Resize the window so its client area becomes `target_w`×`target_h`, keeping the
@@ -378,10 +471,10 @@ pub const Window = struct {
         const tw = @max(target_w, 160);
         const th = @max(target_h, 120);
         if (tw == self.panel_w and th == self.panel_h) return;
-        var rect = RECT{ .left = 0, .top = 0, .right = @intCast(tw), .bottom = @intCast(th) };
-        const style: u32 = @bitCast(GetWindowLongW(h, GWL_STYLE));
-        _ = AdjustWindowRectEx(&rect, style, 0, 0);
-        _ = SetWindowPos(h, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER);
+        // Frameless layered: the window is the panel plus the shadow-gutter margin on each
+        // side, so size it to target + 2·margin. WM_SIZE then re-syncs and re-presents.
+        const m = self.opts.style.margin;
+        _ = SetWindowPos(h, null, 0, 0, @intCast(tw + 2 * m), @intCast(th + 2 * m), SWP_NOMOVE | SWP_NOZORDER);
         self.syncClientSize();
     }
 
@@ -458,7 +551,7 @@ pub const Window = struct {
             .content = self.contentRect(),
             .panel_w = self.panel_w,
             .panel_h = self.panel_h,
-            .margin = 0, // no shadow gutter with native decorations
+            .margin = self.opts.style.margin,
             .maximized = self.maximized,
             .fullscreen = self.fullscreen,
         };
@@ -471,21 +564,93 @@ pub const Window = struct {
 
     // --- geometry / drawing -----------------------------------------------------------
 
-    /// With native decorations there is no client-side margin or title bar: the content
-    /// rect is the whole client area.
-    fn contentRect(self: *Window) Rect {
-        return .{ .x = 0, .y = 0, .w = self.panel_w, .h = self.panel_h };
+    /// Height the (optional) client-side title bar steals from the top of the content —
+    /// mirrors the Wayland backend. zuer-gui runs title-bar-less (tb = 0).
+    fn titlebarHeight(self: *Window) u32 {
+        if (!self.opts.titlebar or self.fullscreen) return 0;
+        return @min(self.opts.titlebar_height, self.panel_h);
     }
 
-    /// Pull the current client-area size from the OS into `panel_w`/`panel_h`.
+    /// The content rect within the layered buffer: the panel sits inset by the shadow-gutter
+    /// margin on every side, minus the (optional) title bar band at its top. Same geometry as
+    /// the Wayland backend, so the app content lands in the identical spot.
+    fn contentRect(self: *Window) Rect {
+        const m = self.opts.style.margin;
+        const tb = self.titlebarHeight();
+        return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
+    }
+
+    /// Which resize border the buffer point (sx,sy) is over (8px band around the panel), or
+    /// `.none`. Coords are buffer-space (include the margin), so shift into panel space first
+    /// — matching the Wayland `resizeEdgeAt`.
+    fn resizeEdgeAt(self: *Window, sx: f32, sy: f32) Edge {
+        const m: f32 = @floatFromInt(self.opts.style.margin);
+        const px = sx - m;
+        const py = sy - m;
+        const w: f32 = @floatFromInt(self.panel_w);
+        const h: f32 = @floatFromInt(self.panel_h);
+        if (px < 0 or py < 0 or px >= w or py >= h) return .none;
+        const l = px < RESIZE_BAND;
+        const r = px >= w - RESIZE_BAND;
+        const t = py < RESIZE_BAND;
+        const b = py >= h - RESIZE_BAND;
+        if (t and l) return .top_left;
+        if (t and r) return .top_right;
+        if (b and l) return .bottom_left;
+        if (b and r) return .bottom_right;
+        if (l) return .left;
+        if (r) return .right;
+        if (t) return .top;
+        if (b) return .bottom;
+        return .none;
+    }
+
+    /// True when the buffer point (sx,sy) is within `band` px of the panel border (the move
+    /// grab zone). Buffer coords → shift into panel space, mirroring the Wayland backend.
+    fn nearBorder(self: *Window, sx: f32, sy: f32, band: f32) bool {
+        const m: f32 = @floatFromInt(self.opts.style.margin);
+        const px = sx - m;
+        const py = sy - m;
+        const w: f32 = @floatFromInt(self.panel_w);
+        const h: f32 = @floatFromInt(self.panel_h);
+        return px < band or py < band or px > w - band or py > h - band;
+    }
+
+    /// Hand the drag to the OS interactive-move loop (Aero snap included), as if the click
+    /// had landed on a native title bar.
+    fn beginMove(self: *Window) void {
+        _ = ReleaseCapture();
+        _ = SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+
+    /// Hand the drag to the OS interactive-resize loop from the given border.
+    fn beginResize(self: *Window, edge: Edge) void {
+        const dir: WPARAM = switch (edge) {
+            .left => WMSZ_LEFT,
+            .right => WMSZ_RIGHT,
+            .top => WMSZ_TOP,
+            .bottom => WMSZ_BOTTOM,
+            .top_left => WMSZ_TOPLEFT,
+            .top_right => WMSZ_TOPRIGHT,
+            .bottom_left => WMSZ_BOTTOMLEFT,
+            .bottom_right => WMSZ_BOTTOMRIGHT,
+            .none => return,
+        };
+        _ = ReleaseCapture();
+        _ = SendMessageW(self.hwnd, WM_SYSCOMMAND, SC_SIZE + dir, 0);
+    }
+
+    /// Pull the current client size from the OS and derive the panel size from it: the window
+    /// is the panel plus the shadow-gutter margin on each side, so subtract 2·margin.
     fn syncClientSize(self: *Window) void {
         const h = self.hwnd orelse return;
         var rc: RECT = undefined;
         if (GetClientRect(h, &rc) == 0) return;
-        const w: u32 = @intCast(@max(rc.right - rc.left, 1));
-        const ph: u32 = @intCast(@max(rc.bottom - rc.top, 1));
-        self.panel_w = w;
-        self.panel_h = ph;
+        const cw: u32 = @intCast(@max(rc.right - rc.left, 1));
+        const ch: u32 = @intCast(@max(rc.bottom - rc.top, 1));
+        const gutter = 2 * self.opts.style.margin;
+        self.panel_w = if (cw > gutter) cw - gutter else 1;
+        self.panel_h = if (ch > gutter) ch - gutter else 1;
         self.requestRedraw();
     }
 
@@ -493,44 +658,77 @@ pub const Window = struct {
         if (self.hwnd) |h| _ = InvalidateRect(h, null, 0);
     }
 
-    /// Composite one client-sized frame: opaque background, the app `on_draw` overlay, the
-    /// newest staged content frame (buffer-swapped, lock held only for a few words), then
-    /// the panels stack. Same composition order as the Wayland `composeFrame`.
-    fn compose(self: *Window) void {
-        const w = self.panel_w;
-        const h = self.panel_h;
-        const len = @as(usize, w) * h;
-        if (self.frame_w != w or self.frame_h != h or self.frame.len != len) {
-            const nf = self.gpa.alloc(u32, len) catch return;
-            if (self.frame.len > 0) self.gpa.free(self.frame);
-            self.frame = nf;
-            self.frame_w = w;
-            self.frame_h = h;
+    /// Ensure the layered buffers match the current `buf_w`×`buf_h`: a top-down 32bpp DIB
+    /// section (aliased by `self.buf`) plus the pre-painted glass chrome (`self.decor`).
+    /// Returns false if allocation fails, so callers skip the frame rather than blit garbage.
+    fn ensureBuffers(self: *Window, bw: u32, bh: u32) bool {
+        if (self.buf_w == bw and self.buf_h == bh and self.dib != null) return true;
+        const len = @as(usize, bw) * bh;
+
+        // Pre-paint the glass chrome (rounded panel + drop shadow, premultiplied ARGB) — the
+        // exact same `drawChrome` the Wayland backend uses. memcpy'd in as the background
+        // each frame; only re-run when the size changes.
+        if (self.decor.len != len) {
+            const nd = self.gpa.alloc(u32, len) catch return false;
+            if (self.decor.len > 0) self.gpa.free(self.decor);
+            self.decor = nd;
         }
-        // Opaque background (the app content usually covers it; the border shows only
-        // during a resize). ARGB8888, matching paint.Canvas / GDI 32bpp byte order.
-        @memset(self.frame, 0xFF141414);
-        var canvas = paint.Canvas.init(self.frame, w, h);
+        var dc = paint.Canvas.init(self.decor, bw, bh);
+        dc.drawChrome(self.opts.style);
+
+        // (Re)create the DIB section we compose into and hand to UpdateLayeredWindow.
+        if (self.mem_dc == null) self.mem_dc = CreateCompatibleDC(null);
+        if (self.dib) |d| _ = DeleteObject(d);
+        self.dib = null;
+        var bmi = BITMAPINFO{
+            .bmiHeader = .{
+                .biWidth = @intCast(bw),
+                .biHeight = -@as(i32, @intCast(bh)), // negative = top-down, matching paint.Canvas
+                .biBitCount = 32,
+            },
+        };
+        var bits: ?*anyopaque = null;
+        const hbmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse return false;
+        _ = SelectObject(self.mem_dc, hbmp);
+        self.dib = hbmp;
+        self.buf = @as([*]u32, @ptrCast(@alignCast(bits)))[0..len];
+        self.buf_w = bw;
+        self.buf_h = bh;
+        return true;
+    }
+
+    /// Composite one full window into the DIB: glass chrome background, the app `on_draw`
+    /// overlay, the newest staged content frame (buffer-swapped, lock held only for a few
+    /// words), then the panels stack. Same composition as the Wayland `composeFrame`.
+    fn compose(self: *Window) void {
+        const m = self.opts.style.margin;
+        const bw = self.panel_w + 2 * m;
+        const bh = self.panel_h + 2 * m;
+        if (!self.ensureBuffers(bw, bh)) return;
+        @memcpy(self.buf, self.decor);
+        var canvas = paint.Canvas.init(self.buf, bw, bh);
         chrome.swapFront(&self.lock, &self.staged, &self.front);
         chrome.composeContent(&canvas, self.contentRect(), &self.front, self.opts.style, &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
-    /// Blit the composed frame to the window via GDI (top-down DIB → SetDIBitsToDevice).
-    fn blit(self: *Window, hdc: HDC) void {
-        if (self.frame.len == 0) return;
-        var bmi = BITMAPINFO{ .bmiHeader = .{
-            .biWidth = @intCast(self.frame_w),
-            .biHeight = -@as(i32, @intCast(self.frame_h)), // negative = top-down
-            .biBitCount = 32,
-        } };
-        _ = SetDIBitsToDevice(hdc, 0, 0, self.frame_w, self.frame_h, 0, 0, 0, self.frame_h, self.frame.ptr, &bmi, 0);
-    }
-
-    fn composeAndBlit(self: *Window) void {
+    /// Compose and push the whole window with per-pixel alpha via UpdateLayeredWindow. `psize`
+    /// resizes the window to the buffer (a no-op when it already matches, e.g. after an OS
+    /// drag); `pptDst = null` keeps the current position. Under Wine this composites in
+    /// software, so the rounded panel + shadow + translucency show without any DWM.
+    fn present(self: *Window) void {
         self.compose();
-        const hdc = GetDC(self.hwnd);
-        defer _ = ReleaseDC(self.hwnd, hdc);
-        self.blit(hdc);
+        if (self.dib == null) return;
+        const screen = GetDC(null);
+        defer _ = ReleaseDC(null, screen);
+        var sz = SIZE{ .cx = @intCast(self.buf_w), .cy = @intCast(self.buf_h) };
+        var src = POINT{ .x = 0, .y = 0 };
+        const blend = BLENDFUNCTION{
+            .BlendOp = AC_SRC_OVER,
+            .BlendFlags = 0,
+            .SourceConstantAlpha = 255,
+            .AlphaFormat = AC_SRC_ALPHA, // the DIB is premultiplied (drawChrome / blitRgba)
+        };
+        _ = UpdateLayeredWindow(self.hwnd, screen, null, &sz, self.mem_dc, &src, 0, &blend, ULW_ALPHA);
     }
 
     // --- input / animation ------------------------------------------------------------
@@ -564,7 +762,7 @@ pub const Window = struct {
             0.016;
         self.last_tick_ms = now;
         const active = self.panels.tick(dt, self.host());
-        self.composeAndBlit();
+        self.present();
         if (!active) self.disarmTimer();
     }
 
@@ -599,23 +797,46 @@ pub const Window = struct {
                 PostQuitMessage(0);
                 return 0;
             },
-            WM_ERASEBKGND => return 1, // we paint every pixel; skip the flash-clear
+            WM_ERASEBKGND => return 1, // layered surface owns every pixel; skip the flash-clear
+            WM_NCCALCSIZE => {
+                if (wparam == 0) return DefWindowProcW(hwnd, msg, wparam, lparam);
+                // Collapse the whole non-client frame: the client area becomes the entire
+                // window (frameless), so the layered buffer we push covers it 1:1.
+                return 0;
+            },
+            WM_SETCURSOR => {
+                // Inside the client, show a resize cursor near the edges; elsewhere the
+                // arrow. Outside (shouldn't happen frameless) let the OS decide.
+                if (@as(u16, @truncate(@as(usize, @bitCast(lparam)))) != HTCLIENT)
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                var pt: POINT = undefined;
+                if (!self.maximized and !self.fullscreen and GetCursorPos(&pt) != 0 and ScreenToClient(hwnd, &pt) != 0) {
+                    const edge = self.resizeEdgeAt(@floatFromInt(pt.x), @floatFromInt(pt.y));
+                    if (edge != .none) {
+                        _ = SetCursor(LoadCursorW(null, cursorIdForEdge(edge)));
+                        return 1;
+                    }
+                }
+                _ = SetCursor(LoadCursorW(null, IDC_ARROW));
+                return 1;
+            },
             WM_SIZE => {
                 self.refreshMaximized();
                 self.syncClientSize();
-                self.composeAndBlit();
+                self.present();
                 return 0;
             },
             WM_PAINT => {
+                // The layered surface is retained by the system, so an expose needs no re-blit
+                // — just validate the update region. (A fresh present still goes through
+                // WM_APP_PRESENT / WM_SIZE / the anim timer.)
                 var ps: PAINTSTRUCT = undefined;
-                const hdc = BeginPaint(hwnd, &ps);
-                if (self.frame.len == 0) self.compose();
-                self.blit(hdc);
+                _ = BeginPaint(hwnd, &ps);
                 _ = EndPaint(hwnd, &ps);
                 return 0;
             },
             WM_APP_PRESENT => {
-                self.composeAndBlit();
+                self.present();
                 return 0;
             },
             WM_TIMER => {
@@ -642,8 +863,14 @@ pub const Window = struct {
                 }
                 if (self.routeInput(.{ .motion = .{ .x = p.x, .y = p.y } })) return 0;
                 if (self.opts.on_mouse) |cb| {
-                    // Content-local coords: content rect starts at (0,0) here.
-                    _ = cb(self, .{ .motion = .{ .x = p.x, .y = p.y } }, self.opts.user);
+                    // The app draws in content-local space (its frame sits at the content
+                    // rect), so hand it content-local coords — panels already got buffer-space
+                    // coords via routeInput. Same split as the Wayland backend.
+                    const c = self.contentRect();
+                    _ = cb(self, .{ .motion = .{
+                        .x = p.x - @as(f32, @floatFromInt(c.x)),
+                        .y = p.y - @as(f32, @floatFromInt(c.y)),
+                    } }, self.opts.user);
                 }
                 return 0;
             },
@@ -658,7 +885,19 @@ pub const Window = struct {
                 const pressed = (msg == WM_LBUTTONDOWN or msg == WM_RBUTTONDOWN);
                 const button: u32 = if (is_left) BTN_LEFT else BTN_RIGHT;
                 if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = button, .pressed = pressed } })) return 0;
-                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = button, .state = @intFromBool(pressed) } }, self.opts.user);
+                var consumed = false;
+                if (self.opts.on_mouse) |cb| consumed = cb(self, .{ .button = .{ .button = button, .state = @intFromBool(pressed) } }, self.opts.user);
+                // Unconsumed left-press drives the frameless window's own move/resize, the
+                // same order as Wayland: panels/app first, then edge resize, then (title-bar
+                // -less only) a border-band move. The OS runs the modal loop from here.
+                if (!consumed and msg == WM_LBUTTONDOWN and !self.fullscreen) {
+                    const edge = self.resizeEdgeAt(self.pointer_x, self.pointer_y);
+                    if (edge != .none and !self.maximized) {
+                        self.beginResize(edge);
+                    } else if (!self.opts.titlebar and self.nearBorder(self.pointer_x, self.pointer_y, MOVE_BAND)) {
+                        self.beginMove();
+                    }
+                }
                 return 0;
             },
             WM_MOUSEWHEEL, WM_MOUSEHWHEEL => {
@@ -678,6 +917,16 @@ pub const Window = struct {
     }
 };
 
+fn cursorIdForEdge(edge: Edge) usize {
+    return switch (edge) {
+        .left, .right => IDC_SIZEWE,
+        .top, .bottom => IDC_SIZENS,
+        .top_left, .bottom_right => IDC_SIZENWSE,
+        .top_right, .bottom_left => IDC_SIZENESW,
+        .none => IDC_ARROW,
+    };
+}
+
 fn lparamPoint(lparam: LPARAM) struct { x: f32, y: f32 } {
     const lo: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) & 0xFFFF)));
     const hi: i16 = @bitCast(@as(u16, @truncate((@as(usize, @bitCast(lparam)) >> 16) & 0xFFFF)));
@@ -692,13 +941,42 @@ fn toUtf16Z(gpa: Allocator, s: [:0]const u8) ![:0]u16 {
 /// `on_key` handlers are identical across platforms.
 fn mapVk(vk: WPARAM) u32 {
     return switch (vk) {
-        'A' => 30, 'B' => 48, 'C' => 46, 'D' => 32, 'E' => 18,
-        'F' => 33, 'G' => 34, 'H' => 35, 'I' => 23, 'J' => 36,
-        'K' => 37, 'L' => 38, 'M' => 50, 'N' => 49, 'O' => 24,
-        'P' => 25, 'Q' => 16, 'R' => 19, 'S' => 31, 'T' => 20,
-        'U' => 22, 'V' => 47, 'W' => 17, 'X' => 45, 'Y' => 21, 'Z' => 44,
-        '1' => 2, '2' => 3, '3' => 4, '4' => 5, '5' => 6,
-        '6' => 7, '7' => 8, '8' => 9, '9' => 10, '0' => 11,
+        'A' => 30,
+        'B' => 48,
+        'C' => 46,
+        'D' => 32,
+        'E' => 18,
+        'F' => 33,
+        'G' => 34,
+        'H' => 35,
+        'I' => 23,
+        'J' => 36,
+        'K' => 37,
+        'L' => 38,
+        'M' => 50,
+        'N' => 49,
+        'O' => 24,
+        'P' => 25,
+        'Q' => 16,
+        'R' => 19,
+        'S' => 31,
+        'T' => 20,
+        'U' => 22,
+        'V' => 47,
+        'W' => 17,
+        'X' => 45,
+        'Y' => 21,
+        'Z' => 44,
+        '1' => 2,
+        '2' => 3,
+        '3' => 4,
+        '4' => 5,
+        '5' => 6,
+        '6' => 7,
+        '7' => 8,
+        '8' => 9,
+        '9' => 10,
+        '0' => 11,
         0x1B => 1, // VK_ESCAPE -> KEY_ESC
         0x20 => 57, // VK_SPACE
         0x0D => 28, // VK_RETURN -> KEY_ENTER
