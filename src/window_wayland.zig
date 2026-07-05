@@ -42,13 +42,9 @@ pub const TrayConfig = facade.TrayConfig;
 pub const MouseEvent = facade.MouseEvent;
 pub const Rect = facade.Rect;
 
-const Staged = struct {
-    pixels: std.ArrayList(u8) = .empty,
-    width: u32 = 0,
-    height: u32 = 0,
-    /// Set by `presentRgba`, cleared when `redraw` swaps the frame to the front slot.
-    fresh: bool = false,
-};
+// The cross-thread frame mailbox and its composition are shared with the Win32 backend.
+const chrome = @import("chrome.zig");
+const Staged = chrome.Staged;
 
 /// One pending dmabuf present (see `Window.presentDmabuf`).
 const StagedDma = struct {
@@ -64,17 +60,7 @@ const StagedDma = struct {
 /// Zig 0.16 keeps blocking mutexes behind `std.Io`; the staging handoff is a short,
 /// bounded copy at frame cadence, so a spin on the lock-free `std.atomic.Mutex` is
 /// simpler than threading an `Io` through the window.
-const SpinLock = struct {
-    state: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *SpinLock) void {
-        while (!self.state.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.state.unlock();
-    }
-};
+const SpinLock = chrome.SpinLock;
 
 const BufferSlot = struct {
     buffer: ?*wl.Buffer = null,
@@ -323,26 +309,10 @@ pub const Window = struct {
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; the
     /// newest frame wins (latest-value semantics, same spirit as zicro's media plane).
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        const need = @as(usize, width) * @as(usize, height) * 4;
-        if (rgba.len < need) return;
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.staged.pixels.clearRetainingCapacity();
-            self.staged.pixels.appendSlice(self.gpa, rgba[0..need]) catch {
-                // Keep the invariant `pixels.len == width * height * 4`: a stale
-                // width over emptied pixels would send redraw out of bounds.
-                self.staged.width = 0;
-                self.staged.height = 0;
-                self.staged.fresh = false;
-                return;
-            };
-            self.staged.width = width;
-            self.staged.height = height;
-            self.staged.fresh = true;
+        if (chrome.stageFrame(self.gpa, &self.mutex, &self.staged, width, height, rgba)) {
+            const one: u64 = 1;
+            _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
         }
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
     /// Present a GPU frame with zero CPU pixel work: `fd` is a dmabuf export
@@ -866,31 +836,8 @@ pub const Window = struct {
     fn composeFrame(self: *Window, pixels: []u32, bw: u32, bh: u32) void {
         @memcpy(pixels, self.decor);
         var canvas = paint.Canvas.init(pixels, bw, bh);
-
-        if (self.opts.on_draw) |draw| draw(&canvas, self.contentRect(), self.opts.user);
-
-        // Take the newest frame with a buffer swap: the lock is held for a few word
-        // writes, never for the per-pixel blit, so producers don't spin behind it.
-        // The swapped-out front buffer becomes the producer's next staging capacity.
-        self.mutex.lock();
-        if (self.staged.fresh) {
-            std.mem.swap(Staged, &self.staged, &self.front);
-            self.staged.fresh = false;
-        }
-        self.mutex.unlock();
-
-        if (self.front.width > 0) {
-            const content = self.contentRect();
-            const fw = @min(self.front.width, content.w);
-            const fh = @min(self.front.height, content.h);
-            const dx = content.x + (content.w - fw) / 2;
-            const dy = content.y + (content.h - fh) / 2;
-            canvas.blitRgba(dx, dy, self.front.pixels.items, self.front.width, self.front.height, self.opts.style);
-        }
-
-        // Panels (title bar, scrollbars, context menu, plugins) composite last, on top of
-        // both app content and any video frame.
-        self.panels.draw(&canvas, self.host());
+        chrome.swapFront(&self.mutex, &self.staged, &self.front);
+        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.opts.style, &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Wayland present path: size the shm buffers, acquire a free slot, compose

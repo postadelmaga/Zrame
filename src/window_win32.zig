@@ -194,22 +194,10 @@ const ANIM_TIMER_ID: usize = 1;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 
-const SpinLock = struct {
-    flag: std.atomic.Value(bool) = .init(false),
-    fn lock(self: *SpinLock) void {
-        while (self.flag.swap(true, .acquire)) std.atomic.spinLoopHint();
-    }
-    fn unlock(self: *SpinLock) void {
-        self.flag.store(false, .release);
-    }
-};
-
-const Staged = struct {
-    pixels: std.ArrayList(u8) = .empty,
-    width: u32 = 0,
-    height: u32 = 0,
-    fresh: bool = false,
-};
+// The cross-thread frame mailbox and its composition are shared with the Wayland backend.
+const chrome = @import("chrome.zig");
+const SpinLock = chrome.SpinLock;
+const Staged = chrome.Staged;
 
 pub const Window = struct {
     gpa: Allocator,
@@ -326,23 +314,9 @@ pub const Window = struct {
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; newest
     /// frame wins. Wakes the UI thread with a thread-safe PostMessageW.
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        const need = @as(usize, width) * @as(usize, height) * 4;
-        if (rgba.len < need) return;
-        {
-            self.lock.lock();
-            defer self.lock.unlock();
-            self.staged.pixels.clearRetainingCapacity();
-            self.staged.pixels.appendSlice(self.gpa, rgba[0..need]) catch {
-                self.staged.width = 0;
-                self.staged.height = 0;
-                self.staged.fresh = false;
-                return;
-            };
-            self.staged.width = width;
-            self.staged.height = height;
-            self.staged.fresh = true;
+        if (chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba)) {
+            _ = PostMessageW(self.hwnd, WM_APP_PRESENT, 0, 0);
         }
-        _ = PostMessageW(self.hwnd, WM_APP_PRESENT, 0, 0);
     }
 
     /// dmabuf zero-copy present is a Linux/Wayland path; on Windows there is no equivalent,
@@ -537,26 +511,8 @@ pub const Window = struct {
         // during a resize). ARGB8888, matching paint.Canvas / GDI 32bpp byte order.
         @memset(self.frame, 0xFF141414);
         var canvas = paint.Canvas.init(self.frame, w, h);
-
-        if (self.opts.on_draw) |draw| draw(&canvas, self.contentRect(), self.opts.user);
-
-        self.lock.lock();
-        if (self.staged.fresh) {
-            std.mem.swap(Staged, &self.staged, &self.front);
-            self.staged.fresh = false;
-        }
-        self.lock.unlock();
-
-        if (self.front.width > 0) {
-            const content = self.contentRect();
-            const fw = @min(self.front.width, content.w);
-            const fh = @min(self.front.height, content.h);
-            const dx = content.x + (content.w - fw) / 2;
-            const dy = content.y + (content.h - fh) / 2;
-            canvas.blitRgba(dx, dy, self.front.pixels.items, self.front.width, self.front.height, self.opts.style);
-        }
-
-        self.panels.draw(&canvas, self.host());
+        chrome.swapFront(&self.lock, &self.staged, &self.front);
+        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.opts.style, &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Blit the composed frame to the window via GDI (top-down DIB → SetDIBitsToDevice).
