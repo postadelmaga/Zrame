@@ -172,6 +172,11 @@ extern "gdi32" fn CreateDIBSection(HDC, *const BITMAPINFO, u32, *?*anyopaque, ?*
 extern "gdi32" fn SelectObject(HDC, ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) i32;
 extern "gdi32" fn DeleteDC(HDC) callconv(.winapi) i32;
+// Opaque fast-path (ZUER_OPAQUE=1): a straight top-down-DIB BitBlt, no per-pixel alpha. Under
+// Wine — which has no DWM to GPU-composite the layered glass — this trades the glass for a
+// fast blit, so 3D/video stay fluid while testing. The layered glass is the default.
+extern "gdi32" fn SetDIBitsToDevice(HDC, i32, i32, u32, u32, i32, i32, u32, u32, ?*const anyopaque, *const BITMAPINFO, u32) callconv(.winapi) i32;
+extern fn getenv([*:0]const u8) ?[*:0]const u8;
 
 const SIZE = extern struct { cx: i32, cy: i32 };
 const BLENDFUNCTION = extern struct { BlendOp: u8, BlendFlags: u8, SourceConstantAlpha: u8, AlphaFormat: u8 };
@@ -278,6 +283,9 @@ pub const Window = struct {
     closed: bool = false,
     fullscreen: bool = false,
     maximized: bool = false,
+    /// ZUER_OPAQUE=1: skip WS_EX_LAYERED + the glass, present with a plain opaque BitBlt.
+    /// A perf escape hatch for Wine (no DWM → the layered glass composites in software).
+    opaque_mode: bool = false,
     saved_style: u32 = 0,
     saved_margin: u32 = 0,
     saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
@@ -318,6 +326,7 @@ pub const Window = struct {
             .panel_w = @max(opts.width, 160),
             .panel_h = @max(opts.height, 120),
             .panels = plugin.Registry.init(gpa),
+            .opaque_mode = if (getenv("ZUER_OPAQUE")) |v| v[0] != '0' and v[0] != 0 else false,
         };
 
         const hinst = GetModuleHandleW(null);
@@ -335,13 +344,15 @@ pub const Window = struct {
         // (glass chrome + shadow + content) with per-pixel alpha; WS_OVERLAPPEDWINDOW keeps
         // the taskbar entry + min/max/snap, and `WM_NCCALCSIZE` collapses the OS frame so the
         // client fills the whole window. The window is sized panel + a shadow-gutter margin on
-        // every side (same as the Wayland buffer), so the drop shadow has room to fall.
-        const m = self.opts.style.margin;
+        // every side (same as the Wayland buffer), so the drop shadow has room to fall. In the
+        // opaque escape-hatch there is no gutter and no WS_EX_LAYERED — a plain square window.
+        const m = self.curMargin();
+        const ex_style: u32 = if (self.opaque_mode) 0 else WS_EX_LAYERED;
         const title = try toUtf16Z(gpa, opts.title);
         defer gpa.free(title);
 
         const hwnd = CreateWindowExW(
-            WS_EX_LAYERED,
+            ex_style,
             class_name,
             title.ptr,
             WS_OVERLAPPEDWINDOW,
@@ -472,8 +483,9 @@ pub const Window = struct {
         const th = @max(target_h, 120);
         if (tw == self.panel_w and th == self.panel_h) return;
         // Frameless layered: the window is the panel plus the shadow-gutter margin on each
-        // side, so size it to target + 2·margin. WM_SIZE then re-syncs and re-presents.
-        const m = self.opts.style.margin;
+        // side, so size it to target + 2·margin (margin is 0 in opaque mode). WM_SIZE then
+        // re-syncs and re-presents.
+        const m = self.curMargin();
         _ = SetWindowPos(h, null, 0, 0, @intCast(tw + 2 * m), @intCast(th + 2 * m), SWP_NOMOVE | SWP_NOZORDER);
         self.syncClientSize();
     }
@@ -571,11 +583,29 @@ pub const Window = struct {
         return @min(self.opts.titlebar_height, self.panel_h);
     }
 
+    /// The shadow-gutter margin in effect: the style margin for the layered glass, but 0 in
+    /// the opaque escape-hatch (a plain square window with no gutter). Also 0 in fullscreen,
+    /// where `toggleFullscreen` already zeros `style.margin`.
+    fn curMargin(self: *const Window) u32 {
+        return if (self.opaque_mode) 0 else self.opts.style.margin;
+    }
+
+    /// The style used for content compositing (`composeContent` → `blitRgba`'s rounded mask).
+    /// In opaque mode the mask must not round-clip the square window, so drop the margin and
+    /// corner radius; otherwise it's the real glass style (mask hugs the rounded panel).
+    fn presentStyle(self: *const Window) Style {
+        if (!self.opaque_mode) return self.opts.style;
+        var s = self.opts.style;
+        s.margin = 0;
+        s.corner_radius = 0;
+        return s;
+    }
+
     /// The content rect within the layered buffer: the panel sits inset by the shadow-gutter
     /// margin on every side, minus the (optional) title bar band at its top. Same geometry as
     /// the Wayland backend, so the app content lands in the identical spot.
     fn contentRect(self: *Window) Rect {
-        const m = self.opts.style.margin;
+        const m = self.curMargin();
         const tb = self.titlebarHeight();
         return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
     }
@@ -584,7 +614,7 @@ pub const Window = struct {
     /// `.none`. Coords are buffer-space (include the margin), so shift into panel space first
     /// — matching the Wayland `resizeEdgeAt`.
     fn resizeEdgeAt(self: *Window, sx: f32, sy: f32) Edge {
-        const m: f32 = @floatFromInt(self.opts.style.margin);
+        const m: f32 = @floatFromInt(self.curMargin());
         const px = sx - m;
         const py = sy - m;
         const w: f32 = @floatFromInt(self.panel_w);
@@ -608,7 +638,7 @@ pub const Window = struct {
     /// True when the buffer point (sx,sy) is within `band` px of the panel border (the move
     /// grab zone). Buffer coords → shift into panel space, mirroring the Wayland backend.
     fn nearBorder(self: *Window, sx: f32, sy: f32, band: f32) bool {
-        const m: f32 = @floatFromInt(self.opts.style.margin);
+        const m: f32 = @floatFromInt(self.curMargin());
         const px = sx - m;
         const py = sy - m;
         const w: f32 = @floatFromInt(self.panel_w);
@@ -648,7 +678,7 @@ pub const Window = struct {
         if (GetClientRect(h, &rc) == 0) return;
         const cw: u32 = @intCast(@max(rc.right - rc.left, 1));
         const ch: u32 = @intCast(@max(rc.bottom - rc.top, 1));
-        const gutter = 2 * self.opts.style.margin;
+        const gutter = 2 * self.curMargin();
         self.panel_w = if (cw > gutter) cw - gutter else 1;
         self.panel_h = if (ch > gutter) ch - gutter else 1;
         self.requestRedraw();
@@ -659,24 +689,26 @@ pub const Window = struct {
     }
 
     /// Ensure the layered buffers match the current `buf_w`×`buf_h`: a top-down 32bpp DIB
-    /// section (aliased by `self.buf`) plus the pre-painted glass chrome (`self.decor`).
+    /// section (aliased by `self.buf`) plus, for the glass, the pre-painted chrome (`decor`).
     /// Returns false if allocation fails, so callers skip the frame rather than blit garbage.
     fn ensureBuffers(self: *Window, bw: u32, bh: u32) bool {
         if (self.buf_w == bw and self.buf_h == bh and self.dib != null) return true;
         const len = @as(usize, bw) * bh;
 
         // Pre-paint the glass chrome (rounded panel + drop shadow, premultiplied ARGB) — the
-        // exact same `drawChrome` the Wayland backend uses. memcpy'd in as the background
-        // each frame; only re-run when the size changes.
-        if (self.decor.len != len) {
-            const nd = self.gpa.alloc(u32, len) catch return false;
-            if (self.decor.len > 0) self.gpa.free(self.decor);
-            self.decor = nd;
+        // exact same `drawChrome` the Wayland backend uses. memcpy'd in as the background each
+        // frame; only re-run when the size changes. Skipped in opaque mode (flat fill instead).
+        if (!self.opaque_mode) {
+            if (self.decor.len != len) {
+                const nd = self.gpa.alloc(u32, len) catch return false;
+                if (self.decor.len > 0) self.gpa.free(self.decor);
+                self.decor = nd;
+            }
+            var dc = paint.Canvas.init(self.decor, bw, bh);
+            dc.drawChrome(self.opts.style);
         }
-        var dc = paint.Canvas.init(self.decor, bw, bh);
-        dc.drawChrome(self.opts.style);
 
-        // (Re)create the DIB section we compose into and hand to UpdateLayeredWindow.
+        // (Re)create the DIB section we compose into and hand to UpdateLayeredWindow / BitBlt.
         if (self.mem_dc == null) self.mem_dc = CreateCompatibleDC(null);
         if (self.dib) |d| _ = DeleteObject(d);
         self.dib = null;
@@ -701,23 +733,39 @@ pub const Window = struct {
     /// overlay, the newest staged content frame (buffer-swapped, lock held only for a few
     /// words), then the panels stack. Same composition as the Wayland `composeFrame`.
     fn compose(self: *Window) void {
-        const m = self.opts.style.margin;
+        const m = self.curMargin();
         const bw = self.panel_w + 2 * m;
         const bh = self.panel_h + 2 * m;
         if (!self.ensureBuffers(bw, bh)) return;
-        @memcpy(self.buf, self.decor);
+        // Background: the pre-painted glass chrome, or a flat opaque fill in opaque mode.
+        if (self.opaque_mode) @memset(self.buf, 0xFF141414) else @memcpy(self.buf, self.decor);
         var canvas = paint.Canvas.init(self.buf, bw, bh);
         chrome.swapFront(&self.lock, &self.staged, &self.front);
-        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.opts.style, &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
-    /// Compose and push the whole window with per-pixel alpha via UpdateLayeredWindow. `psize`
-    /// resizes the window to the buffer (a no-op when it already matches, e.g. after an OS
-    /// drag); `pptDst = null` keeps the current position. Under Wine this composites in
-    /// software, so the rounded panel + shadow + translucency show without any DWM.
+    /// Compose and push the whole window. Glass (default): per-pixel alpha via
+    /// UpdateLayeredWindow — `psize` resizes the window to the buffer (a no-op when it already
+    /// matches, e.g. after an OS drag), `pptDst = null` keeps the position; under Wine this
+    /// composites in software so the rounded panel + shadow + translucency show without DWM.
+    /// Opaque (ZUER_OPAQUE=1): a plain top-down-DIB BitBlt into the window DC — no alpha
+    /// compositing, so it stays fast under Wine at the cost of the glass.
     fn present(self: *Window) void {
         self.compose();
         if (self.dib == null) return;
+        if (self.opaque_mode) {
+            const hdc = GetDC(self.hwnd);
+            defer _ = ReleaseDC(self.hwnd, hdc);
+            var bmi = BITMAPINFO{
+                .bmiHeader = .{
+                    .biWidth = @intCast(self.buf_w),
+                    .biHeight = -@as(i32, @intCast(self.buf_h)), // negative = top-down
+                    .biBitCount = 32,
+                },
+            };
+            _ = SetDIBitsToDevice(hdc, 0, 0, self.buf_w, self.buf_h, 0, 0, 0, self.buf_h, self.buf.ptr, &bmi, 0);
+            return;
+        }
         const screen = GetDC(null);
         defer _ = ReleaseDC(null, screen);
         var sz = SIZE{ .cx = @intCast(self.buf_w), .cy = @intCast(self.buf_h) };
@@ -827,11 +875,13 @@ pub const Window = struct {
                 return 0;
             },
             WM_PAINT => {
-                // The layered surface is retained by the system, so an expose needs no re-blit
-                // — just validate the update region. (A fresh present still goes through
-                // WM_APP_PRESENT / WM_SIZE / the anim timer.)
+                // Layered: the surface is retained by the system, so an expose needs no re-blit
+                // — just validate the update region (a fresh present goes through
+                // WM_APP_PRESENT / WM_SIZE / the anim timer). Opaque: the window DC is *not*
+                // retained across exposes, so re-blit the composed frame on paint.
                 var ps: PAINTSTRUCT = undefined;
                 _ = BeginPaint(hwnd, &ps);
+                if (self.opaque_mode) self.present();
                 _ = EndPaint(hwnd, &ps);
                 return 0;
             },
