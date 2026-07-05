@@ -207,13 +207,6 @@ pub const Window = struct {
     timer_fd: posix.fd_t = -1,
     timer_armed: bool = false,
     last_tick_ns: i64 = 0,
-    // Client-driven animated resize toward a target panel size (see `animateResize`).
-    // Wayland lets an unmaximized toplevel pick its own size, so we drive panel_w/panel_h
-    // with one `zicro.anim.Spring` per axis off the same timerfd clock as the panel
-    // animations and repaint each tick. `snappy` gives a lively, slightly-overshooting
-    // settle; retargeting mid-flight keeps velocity for fluid chained navigation.
-    spring_w: anim.Spring = .{ .params = anim.snappy },
-    spring_h: anim.Spring = .{ .params = anim.snappy },
     // Dimensione massima utile della geometria finestra suggerita dal compositore
     // (xdg_toplevel.configure_bounds): l'area dello schermo meno pannelli/riserve.
     // 0 = non nota. Vincola i ridimensionamenti così la finestra non sborda oltre
@@ -645,9 +638,8 @@ pub const Window = struct {
             0.016;
         self.last_tick_ns = now;
         const panels_active = self.panels.tick(dt, self.host());
-        const resize_active = self.stepResize(dt);
         self.needs_redraw = true;
-        if (!panels_active and !resize_active) self.disarmTimer();
+        if (!panels_active) self.disarmTimer();
     }
 
     fn monotonicNs() i64 {
@@ -825,16 +817,6 @@ pub const Window = struct {
         if (self.fullscreen) tl.unsetFullscreen() else tl.setFullscreen();
     }
 
-    /// Ridimensiona la finestra verso `target_w`×`target_h` (dimensione del
-    /// *pannello* — geometria finestra, senza il gutter d'ombra) con
-    /// un'animazione a molla: accelerazione morbida, lieve sovraelongazione e
-    /// assestamento. Su Wayland il client sceglie la propria dimensione, quindi
-    /// qui basta pilotare panel_w/panel_h e ridisegnare a ogni tick (i buffer
-    /// crescono pigramente in `redraw`). Se un'animazione è già in corso, cambia
-    /// solo il bersaglio conservando posizione e velocità → navigazioni
-    /// concatenate fluide. No-op in fullscreen/massimizzato (lì la dimensione la
-    /// decide il compositore). Solo dal thread finestra (callback di input o
-    /// prima di `run`).
     /// Riduce (in scala, preservando le proporzioni) `w`×`h` perché la geometria
     /// finestra stia nell'area utile suggerita dal compositore (`bounds_*`), con
     /// un piccolo margine di sicurezza. Non ingrandisce mai. No-op se i bounds
@@ -854,39 +836,38 @@ pub const Window = struct {
         };
     }
 
+    /// Porta la finestra al pannello `target_w`×`target_h`, capato all'area utile
+    /// (`fitBounds` → mai fuori schermo), e la ri-centra. Su Wayland il client non può
+    /// spostare il proprio toplevel: l'unico modo per ri-centrare dopo un resize è
+    /// smappare e rimappare la surface (un breve "flash"), così il compositore riesegue
+    /// il placement e la rimette al centro. No-op in fullscreen/massimizzato o se la
+    /// dimensione non cambia. Solo dal thread finestra (callback di input o prima di run).
     pub fn animateResize(self: *Window, target_w: u32, target_h: u32) void {
         if (self.fullscreen or self.maximized) return;
-        // Vincola il bersaglio all'area utile: cresce senza sbordare fuori schermo.
         const fitted = self.fitBounds(target_w, target_h);
         const tw = @max(fitted.w, self.minPanel());
         const th = @max(fitted.h, self.minPanel());
-        const animating = self.spring_w.active or self.spring_h.active;
-        // Già alla dimensione richiesta e nessuna animazione in corso: niente da fare.
-        if (tw == self.panel_w and th == self.panel_h and !animating) return;
-        // Avvio a freddo: le molle partono dalla dimensione corrente, ferme. Retarget in
-        // volo: `retarget` conserva posizione e velocità → la molla prosegue senza scatti.
-        if (!animating) {
-            self.spring_w.reset(@floatFromInt(self.panel_w));
-            self.spring_h.reset(@floatFromInt(self.panel_h));
+        if (tw == self.panel_w and th == self.panel_h) return; // già a misura
+        self.panel_w = tw;
+        self.panel_h = th;
+        // Non ancora mappata (init, prima del primo map): imposta soltanto — il primo
+        // map la centrerà da sé.
+        if (!self.configured or self.surface == null) {
+            self.needs_redraw = true;
+            return;
         }
-        self.spring_w.retarget(@floatFromInt(tw));
-        self.spring_h.retarget(@floatFromInt(th));
-        self.armTimer();
-    }
-
-    /// Avanza le molle del resize di `dt`; ritorna true finché sono in corso. La geometria
-    /// finestra, la regione d'input e la decor le riallinea `redraw`→`resizeBuffers`, che
-    /// scatta a ogni frame perché la dimensione del buffer cambia durante l'animazione.
-    fn stepResize(self: *Window, dt: f32) bool {
-        if (!self.spring_w.active and !self.spring_h.active) return false;
-        _ = self.spring_w.step(dt);
-        _ = self.spring_h.step(dt);
-        // Floor sul float PRIMA della conversione: una sovraelongazione in riduzione può
-        // portare la posizione sotto zero (illegale in @intFromFloat).
-        const min_f: f32 = @floatFromInt(self.minPanel());
-        self.panel_w = @intFromFloat(@round(@max(min_f, self.spring_w.pos)));
-        self.panel_h = @intFromFloat(@round(@max(min_f, self.spring_h.pos)));
-        return self.spring_w.active or self.spring_h.active;
+        // Smappa e rimappa così il compositore rifà il placement e ri-centra la finestra
+        // (unico aggancio su Wayland). Il protocollo xdg impone la sequenza di re-map:
+        // attach(null)+commit per smappare, poi un commit "iniziale" senza buffer e si
+        // ATTENDE un nuovo configure prima di ri-attaccare pixel (altrimenti
+        // `unconfigured_buffer`). Marcando `configured=false` il loop non ridisegna finché
+        // il configure non arriva; onXdgConfigure lo rialza e il redraw riattacca → re-map.
+        const surface = self.surface.?;
+        surface.attach(null, 0, 0);
+        surface.commit();
+        self.configured = false;
+        surface.commit();
+        self.needs_redraw = true;
     }
 
     /// Motore di testo della finestra, creato pigramente col font di default
