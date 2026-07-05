@@ -494,6 +494,13 @@ pub const Window = struct {
         self.syncClientSize();
     }
 
+    /// Parità API con il backend Wayland: là il resize dev'essere differito al
+    /// thread finestra; su Win32 `SetWindowPos` marshalla da sé al thread della
+    /// finestra, quindi si può chiamare direttamente.
+    pub fn requestResize(self: *Window, width: u32, height: u32) void {
+        self.animateResize(width, height);
+    }
+
     pub fn textFont(self: *Window) !*text.Font {
         if (self.font == null) self.font = try text.Font.initDefault(self.gpa);
         return &self.font.?;

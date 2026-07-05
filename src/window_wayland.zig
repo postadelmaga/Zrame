@@ -96,6 +96,10 @@ pub const Window = struct {
     panel_h: u32,
     configured: bool = false,
     needs_redraw: bool = false,
+    // Resize richiesto da un altro thread (protetto da `mutex`): le operazioni
+    // sulla surface Wayland NON sono thread-safe, quindi `requestResize` deposita
+    // solo il target e il run loop chiama `animateResize` sul thread finestra.
+    pending_resize: ?[2]u32 = null,
     // True once `run` is pumping. Before that (init roundtrips) `onXdgConfigure` must
     // redraw synchronously to map the window; during the loop it only flags a redraw so
     // a burst of resize configures coalesces into one paint per iteration.
@@ -315,6 +319,19 @@ pub const Window = struct {
         }
     }
 
+    /// Richiede un resize della finestra da un thread qualsiasi. Deposita il
+    /// target e sveglia il run loop, che eseguirà `animateResize` sul thread
+    /// finestra: le operazioni sulla surface Wayland (attach/commit) non sono
+    /// thread-safe e chiamarle da un worker durante `run` corrompe il protocollo
+    /// (es. `xdg_surface: attached a buffer before configure`).
+    pub fn requestResize(self: *Window, width: u32, height: u32) void {
+        self.mutex.lock();
+        self.pending_resize = .{ width, height };
+        self.mutex.unlock();
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
     /// Present a GPU frame with zero CPU pixel work: `fd` is a dmabuf export
     /// of the frame image (`fourcc`/`stride`/`modifier` as the exporter
     /// reports them). `slot` (0..2) identifies a persistent image the caller
@@ -501,6 +518,14 @@ pub const Window = struct {
             if (self.menu) |mnu| {
                 if (fds[4].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) mnu.process();
             }
+
+            // Resize richiesto da un altro thread: eseguilo QUI, sul thread
+            // finestra, prima del redraw (le surface Wayland non sono thread-safe).
+            self.mutex.lock();
+            const rr = self.pending_resize;
+            self.pending_resize = null;
+            self.mutex.unlock();
+            if (rr) |wh| self.animateResize(wh[0], wh[1]);
 
             if (self.configured and self.needs_redraw) try self.redraw();
         }
