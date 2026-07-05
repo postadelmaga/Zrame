@@ -35,16 +35,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zicro", .module = zicro.module("zicro") },
         },
     });
-    zrame.linkSystemLibrary("wayland-client", .{});
-    // Tray icon (StatusNotifierItem) talks to the session bus through sd-bus. We
-    // hand-declare the FFI, so no headers are needed — just link libsystemd.
-    zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
+    // The window transport is per-OS: Wayland on Linux (client-side glass chrome, sd-bus
+    // tray/menu, dmabuf video), a native GDI window on Windows. Only link and generate the
+    // Linux stack for a Linux target; on Windows link the Win32 GUI libraries instead.
+    if (target.result.os.tag == .linux) {
+        zrame.linkSystemLibrary("wayland-client", .{});
+        // Tray icon (StatusNotifierItem) talks to the session bus through sd-bus. We
+        // hand-declare the FFI, so no headers are needed — just link libsystemd.
+        zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
 
-    for (protocol_xmls) |xml| {
-        const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
-        scan.addFileArg(.{ .cwd_relative = xml });
-        const c_file = scan.addOutputFileArg("protocol.c");
-        zrame.addCSourceFile(.{ .file = c_file });
+        for (protocol_xmls) |xml| {
+            const scan = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+            scan.addFileArg(.{ .cwd_relative = xml });
+            const c_file = scan.addOutputFileArg("protocol.c");
+            zrame.addCSourceFile(.{ .file = c_file });
+        }
+    } else if (target.result.os.tag == .windows) {
+        zrame.linkSystemLibrary("user32", .{});
+        zrame.linkSystemLibrary("gdi32", .{});
     }
 
     // `zig build test` — every `test` block in the library.
@@ -53,28 +61,37 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    // Examples: `zig build run-hello`, `zig build run-frames`.
-    inline for (.{ "hello", "frames", "scroll", "tray", "menu" }) |name| {
-        const exe = b.addExecutable(.{
-            .name = name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("examples/" ++ name ++ ".zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "zrame", .module = zrame },
-                    .{ .name = "zicro", .module = zicro.module("zicro") },
-                },
-            }),
-        });
-        b.installArtifact(exe);
-        const run_cmd = b.addRunArtifact(exe);
-        const run_step = b.step("run-" ++ name, "Run the " ++ name ++ " example");
-        run_step.dependOn(&run_cmd.step);
+    // Examples: `zig build run-hello`, `zig build run-frames`. `tray` and `menu` exercise
+    // Linux-desktop-only surfaces (StatusNotifierItem, KDE global menu) and drive the
+    // Wayland poll loop directly, so they only build on Linux; the rest are portable.
+    const addExample = struct {
+        fn add(bb: *std.Build, t: anytype, o: anytype, zr: *std.Build.Module, zi: *std.Build.Dependency, comptime name: []const u8) void {
+            const exe = bb.addExecutable(.{
+                .name = name,
+                .root_module = bb.createModule(.{
+                    .root_source_file = bb.path("examples/" ++ name ++ ".zig"),
+                    .target = t,
+                    .optimize = o,
+                    .imports = &.{
+                        .{ .name = "zrame", .module = zr },
+                        .{ .name = "zicro", .module = zi.module("zicro") },
+                    },
+                }),
+            });
+            bb.installArtifact(exe);
+            const run_cmd = bb.addRunArtifact(exe);
+            const run_step = bb.step("run-" ++ name, "Run the " ++ name ++ " example");
+            run_step.dependOn(&run_cmd.step);
+        }
+    }.add;
+    inline for (.{ "hello", "frames", "scroll" }) |name| addExample(b, target, optimize, zrame, zicro, name);
+    if (target.result.os.tag == .linux) {
+        inline for (.{ "tray", "menu" }) |name| addExample(b, target, optimize, zrame, zicro, name);
     }
 
     // A loadable plugin built as a shared library, plus a host that dlopens it:
-    // `zig build run-plugin`. The plugin is a normal Zig object against the zrame module.
+    // `zig build run-plugin`. The host hardcodes a `.so` path, so build it on Linux only.
+    if (target.result.os.tag == .linux) {
     const clock = b.addLibrary(.{
         .name = "zrame_clock",
         .linkage = .dynamic,
@@ -103,4 +120,5 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| host_run.addArgs(args);
     const host_step = b.step("run-plugin", "Run the dlopen plugin host example");
     host_step.dependOn(&host_run.step);
+    }
 }
