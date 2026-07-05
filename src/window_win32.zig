@@ -306,13 +306,16 @@ pub const Window = struct {
     staged: Staged = .{},
     front: Staged = .{},
 
-    // Layered-window presentation buffers. `buf` maps the pixels of a top-down 32bpp DIB
-    // section we compose the whole window into and hand to UpdateLayeredWindow; `decor` is
-    // the pre-painted glass chrome (rounded panel + drop shadow) memcpy'd in as the
-    // background every frame — same split as the Wayland backend's `decor`.
+    // Presentation buffers. We compose into `frame`, a plain gpa heap buffer — composing
+    // straight into DIB-section memory is pathologically slow under Wine (blitRgba's per-pixel
+    // read-modify-write hits GDI-synced memory), so we keep composition on fast heap RAM and
+    // move the finished frame out in one bulk transfer: opaque BitBlts `frame` directly, glass
+    // memcpy's it into the DIB `buf` once, then UpdateLayeredWindow. `decor` is the pre-painted
+    // glass chrome (rounded panel + drop shadow) copied in as the background each frame.
     mem_dc: HDC = null,
     dib: ?*anyopaque = null,
-    buf: []u32 = &.{}, // aliases the DIB section (owned by the HBITMAP, not the gpa)
+    buf: []u32 = &.{}, // aliases the DIB section (glass only; owned by the HBITMAP, not the gpa)
+    frame: []u32 = &.{}, // gpa heap compose target
     decor: []u32 = &.{},
     buf_w: u32 = 0,
     buf_h: u32 = 0,
@@ -394,6 +397,7 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         self.panels.deinit();
         if (self.font) |*f| f.deinit();
+        if (self.frame.len > 0) self.gpa.free(self.frame);
         if (self.decor.len > 0) self.gpa.free(self.decor);
         if (self.dib) |d| _ = DeleteObject(d);
         if (self.mem_dc != null) _ = DeleteDC(self.mem_dc);
@@ -596,8 +600,13 @@ pub const Window = struct {
     fn presentStyle(self: *const Window) Style {
         if (!self.opaque_mode) return self.opts.style;
         var s = self.opts.style;
+        // Zero every mask/fade field so blitRgba takes its trivial fast path (no per-pixel
+        // SDF): a plain square opaque window doesn't want rounded/faded content clipping.
         s.margin = 0;
         s.corner_radius = 0;
+        s.content_radius = 0;
+        s.content_fade_width = 0;
+        s.border_anim_width = 0;
         return s;
     }
 
@@ -688,17 +697,24 @@ pub const Window = struct {
         if (self.hwnd) |h| _ = InvalidateRect(h, null, 0);
     }
 
-    /// Ensure the layered buffers match the current `buf_w`×`buf_h`: a top-down 32bpp DIB
-    /// section (aliased by `self.buf`) plus, for the glass, the pre-painted chrome (`decor`).
-    /// Returns false if allocation fails, so callers skip the frame rather than blit garbage.
+    /// Ensure the buffers match the current `buf_w`×`buf_h`: the heap compose target `frame`
+    /// always, plus (glass only) the DIB section handed to UpdateLayeredWindow and the pre-
+    /// painted chrome `decor`. Returns false if allocation fails, so callers skip the frame.
     fn ensureBuffers(self: *Window, bw: u32, bh: u32) bool {
-        if (self.buf_w == bw and self.buf_h == bh and self.dib != null) return true;
+        const ready = self.buf_w == bw and self.buf_h == bh and self.frame.len == @as(usize, bw) * bh and
+            (self.opaque_mode or self.dib != null);
+        if (ready) return true;
         const len = @as(usize, bw) * bh;
 
-        // Pre-paint the glass chrome (rounded panel + drop shadow, premultiplied ARGB) — the
-        // exact same `drawChrome` the Wayland backend uses. memcpy'd in as the background each
-        // frame; only re-run when the size changes. Skipped in opaque mode (flat fill instead).
+        if (self.frame.len != len) {
+            const nf = self.gpa.alloc(u32, len) catch return false;
+            if (self.frame.len > 0) self.gpa.free(self.frame);
+            self.frame = nf;
+        }
+
         if (!self.opaque_mode) {
+            // Pre-paint the glass chrome (rounded panel + drop shadow, premultiplied ARGB) —
+            // the exact same `drawChrome` the Wayland backend uses. Only re-run on size change.
             if (self.decor.len != len) {
                 const nd = self.gpa.alloc(u32, len) catch return false;
                 if (self.decor.len > 0) self.gpa.free(self.decor);
@@ -706,40 +722,41 @@ pub const Window = struct {
             }
             var dc = paint.Canvas.init(self.decor, bw, bh);
             dc.drawChrome(self.opts.style);
-        }
 
-        // (Re)create the DIB section we compose into and hand to UpdateLayeredWindow / BitBlt.
-        if (self.mem_dc == null) self.mem_dc = CreateCompatibleDC(null);
-        if (self.dib) |d| _ = DeleteObject(d);
-        self.dib = null;
-        var bmi = BITMAPINFO{
-            .bmiHeader = .{
-                .biWidth = @intCast(bw),
-                .biHeight = -@as(i32, @intCast(bh)), // negative = top-down, matching paint.Canvas
-                .biBitCount = 32,
-            },
-        };
-        var bits: ?*anyopaque = null;
-        const hbmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse return false;
-        _ = SelectObject(self.mem_dc, hbmp);
-        self.dib = hbmp;
-        self.buf = @as([*]u32, @ptrCast(@alignCast(bits)))[0..len];
+            // (Re)create the DIB section UpdateLayeredWindow reads from (glass only).
+            if (self.mem_dc == null) self.mem_dc = CreateCompatibleDC(null);
+            if (self.dib) |d| _ = DeleteObject(d);
+            self.dib = null;
+            var bmi = BITMAPINFO{
+                .bmiHeader = .{
+                    .biWidth = @intCast(bw),
+                    .biHeight = -@as(i32, @intCast(bh)), // negative = top-down, matching paint.Canvas
+                    .biBitCount = 32,
+                },
+            };
+            var bits: ?*anyopaque = null;
+            const hbmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse return false;
+            _ = SelectObject(self.mem_dc, hbmp);
+            self.dib = hbmp;
+            self.buf = @as([*]u32, @ptrCast(@alignCast(bits)))[0..len];
+        }
         self.buf_w = bw;
         self.buf_h = bh;
         return true;
     }
 
-    /// Composite one full window into the DIB: glass chrome background, the app `on_draw`
-    /// overlay, the newest staged content frame (buffer-swapped, lock held only for a few
-    /// words), then the panels stack. Same composition as the Wayland `composeFrame`.
+    /// Composite one full window into the heap `frame`: glass chrome background, the app
+    /// `on_draw` overlay, the newest staged content frame (buffer-swapped, lock held only for a
+    /// few words), then the panels stack. Same composition as the Wayland `composeFrame`.
+    /// Composing into heap RAM (not the DIB) is the whole point — see `frame`'s doc.
     fn compose(self: *Window) void {
         const m = self.curMargin();
         const bw = self.panel_w + 2 * m;
         const bh = self.panel_h + 2 * m;
         if (!self.ensureBuffers(bw, bh)) return;
         // Background: the pre-painted glass chrome, or a flat opaque fill in opaque mode.
-        if (self.opaque_mode) @memset(self.buf, 0xFF141414) else @memcpy(self.buf, self.decor);
-        var canvas = paint.Canvas.init(self.buf, bw, bh);
+        if (self.opaque_mode) @memset(self.frame, 0xFF141414) else @memcpy(self.frame, self.decor);
+        var canvas = paint.Canvas.init(self.frame, bw, bh);
         chrome.swapFront(&self.lock, &self.staged, &self.front);
         chrome.composeContent(&canvas, self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
@@ -752,7 +769,7 @@ pub const Window = struct {
     /// compositing, so it stays fast under Wine at the cost of the glass.
     fn present(self: *Window) void {
         self.compose();
-        if (self.dib == null) return;
+        if (self.frame.len == 0) return;
         if (self.opaque_mode) {
             const hdc = GetDC(self.hwnd);
             defer _ = ReleaseDC(self.hwnd, hdc);
@@ -763,9 +780,11 @@ pub const Window = struct {
                     .biBitCount = 32,
                 },
             };
-            _ = SetDIBitsToDevice(hdc, 0, 0, self.buf_w, self.buf_h, 0, 0, 0, self.buf_h, self.buf.ptr, &bmi, 0);
+            _ = SetDIBitsToDevice(hdc, 0, 0, self.buf_w, self.buf_h, 0, 0, 0, self.buf_h, self.frame.ptr, &bmi, 0);
             return;
         }
+        if (self.dib == null) return;
+        @memcpy(self.buf, self.frame); // heap → DIB in one linear pass (the only DIB write)
         const screen = GetDC(null);
         defer _ = ReleaseDC(null, screen);
         var sz = SIZE{ .cx = @intCast(self.buf_w), .cy = @intCast(self.buf_h) };
