@@ -2,15 +2,40 @@
 
 # ▢ zrame
 
-**The window layer of the Frame architecture — a frameless glass window for
+**The window layer of the Frame architecture — a cross-platform window for
 [zicro](../Zicro), in Zig.**
 
 zicro deliberately stops at the `FrameSink` contract ("the actual GPU/window backend is
-the app's job"). zrame is that backend: one Wayland toplevel with no server decorations —
-rounded translucent glass, a soft drop shadow, and real compositor background blur —
-plus the adapter that lands zicro's zero-copy `media.Frame`s inside it.
+the app's job"). zrame is that backend, and it owns the OS: the app hands it a
+premultiplied-ARGB frame and hooks `on_key` / `on_mouse` / `on_scroll`, and zrame does
+whatever each platform needs to put a window on screen. On Linux that's a frameless
+Wayland glass toplevel (rounded translucent chrome, drop shadow, real compositor blur);
+on Windows it's a native decorated GDI window. Same public API either way — **apps built
+on zrame don't know which OS they're running on.**
 
 </div>
+
+---
+
+## Cross-platform by design
+
+zrame (and [zicro](../Zicro) beneath it) exist so that **Frame apps stay OS-agnostic**.
+The window is one type with a per-OS backend, selected at compile time — the same shape
+zicro uses for its own `Window`:
+
+| OS      | backend            | how it presents                                             |
+|---------|--------------------|-------------------------------------------------------------|
+| Linux   | `window_wayland.zig` | frameless Wayland toplevel: client-side glass chrome, `ext-background-effect-v1` blur, sd-bus tray + KDE global menu, dmabuf zero-copy video |
+| Windows | `window_win32.zig`   | native decorated, resizable window; the composed ARGB frame blitted via GDI (`SetDIBitsToDevice`) |
+| macOS   | *planned*          | zicro already ships a Cocoa `Window` backend to build on    |
+
+The whole compositing pipeline — chrome, panels (title bar, context menu, floating
+scrollbars), fonts, animation — is pure-CPU and platform-independent (`composeFrame` is
+the documented seam). Only the *transport* differs: how each backend acquires a writable
+pixel buffer, pumps events, and presents. Input is normalized so callbacks are identical
+everywhere — Win32 `VK` codes are translated to the same evdev keycodes Wayland emits,
+wheel deltas to the same 1/256 axis units. Linux-desktop-only surfaces (tray, global
+menu, compositor blur) degrade to no-ops where the OS has no equivalent.
 
 ---
 
