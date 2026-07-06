@@ -27,6 +27,8 @@ pub const sdbus = @import("sdbus.zig");
 pub const tray = @import("tray.zig");
 pub const dbusmenu = @import("dbusmenu.zig");
 pub const appmenu = @import("appmenu.zig");
+pub const widget = @import("widget.zig");
+pub const keymap = @import("keymap.zig");
 
 pub const Window = window.Window;
 pub const Options = window.Options;

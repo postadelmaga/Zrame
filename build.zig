@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
             run_step.dependOn(&run_cmd.step);
         }
     }.add;
-    inline for (.{ "hello", "frames", "scroll" }) |name| addExample(b, target, optimize, zrame, zicro, name);
+    inline for (.{ "hello", "frames", "scroll", "widgets" }) |name| addExample(b, target, optimize, zrame, zicro, name);
     if (target.result.os.tag == .linux) {
         inline for (.{ "tray", "menu" }) |name| addExample(b, target, optimize, zrame, zicro, name);
     }
