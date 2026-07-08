@@ -37,6 +37,7 @@ pub const Rect = plugin.Rect;
 /// signature is exactly the backend struct the caller receives.
 pub const Window = switch (builtin.os.tag) {
     .windows => @import("window_win32.zig").Window,
+    .macos => @import("window_cocoa.zig").Window,
     else => @import("window_wayland.zig").Window,
 };
 
