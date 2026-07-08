@@ -128,11 +128,10 @@ pub const Controls = struct {
     }
 
     /// Bounding box of the macOS cluster (for the glyph-reveal hover region).
-    fn clusterBox(self: *const Controls, b: Bar) Bar {
+    fn clusterBox(b: Bar) Bar {
         const d = discDiameter(b);
         const left = discCenter(.close, b).x - d / 2.0 - 6.0;
         const right = discCenter(.maximize, b).x + d / 2.0 + 6.0;
-        _ = self;
         return .{ .x = left, .y = b.y, .w = right - left, .h = b.h };
     }
 
@@ -192,9 +191,12 @@ pub const Controls = struct {
             .minimize => mac_min,
             .maximize => mac_max,
         };
-        // Brighten slightly on direct hover.
+        // Schiarisce leggermente il disco al passaggio diretto (stile macOS).
+        const lift = 0.18 * hf;
+        col.r += (1.0 - col.r) * lift;
+        col.g += (1.0 - col.g) * lift;
+        col.b += (1.0 - col.b) * lift;
         col.a = 1.0;
-        _ = hf;
         canvas.fillRoundedRect(c.x - d / 2.0, c.y - d / 2.0, d, d, d / 2.0, col);
 
         // Glyphs fade in with the cluster reveal.
@@ -269,7 +271,7 @@ pub const Controls = struct {
                 const b = self.bar(info);
                 self.over_cluster = switch (self.layout) {
                     .macos => blk: {
-                        const box = self.clusterBox(b);
+                        const box = clusterBox(b);
                         break :blk m.x >= box.x and m.x < box.x + box.w and m.y >= box.y and m.y < box.y + box.h;
                     },
                     .material => self.hovered != null,

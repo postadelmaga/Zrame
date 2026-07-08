@@ -42,7 +42,7 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
         &demo.store,
         canvas,
         font,
-        demo.theme,
+        demo.theme.scaled(win.scaleFactor()),
         .{
             .x = @floatFromInt(content.x),
             .y = @floatFromInt(content.y),

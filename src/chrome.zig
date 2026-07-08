@@ -95,7 +95,25 @@ pub fn composeContent(
         const fh = @min(front.height, content.h);
         const dx = content.x + (content.w - fw) / 2;
         const dy = content.y + (content.h - fh) / 2;
-        canvas.blitRgba(dx, dy, front.pixels.items, front.width, front.height, style);
+        if (fw == front.width) {
+            // Le righe sorgenti sono contigue: per un frame più alto del contenuto
+            // (frame stantio durante uno shrink-resize) basta troncare l'altezza,
+            // così non si sborda mai sotto il content rect.
+            canvas.blitRgba(dx, dy, front.pixels.items[0 .. @as(usize, fw) * fh * 4], fw, fh, style);
+        } else {
+            // Frame più largo del contenuto: `blitRgba` usa src_w anche come stride,
+            // quindi il ritaglio in larghezza va fatto riga per riga (senza toccare
+            // zicro). Il raggio del contenuto si perde per quei pochi frame stantii:
+            // meglio che sbordare sul chrome.
+            var row_style = style;
+            row_style.content_radius = 0;
+            row_style.content_fade_width = 0;
+            var sy: u32 = 0;
+            while (sy < fh) : (sy += 1) {
+                const src_row = front.pixels.items[@as(usize, sy) * front.width * 4 ..][0 .. @as(usize, fw) * 4];
+                canvas.blitRgba(dx, dy + sy, src_row, fw, 1, row_style);
+            }
+        }
     }
 
     // Panels (title bar, scrollbars, context menu, plugins) composite last, on top of both

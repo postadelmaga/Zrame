@@ -13,6 +13,10 @@ const protocol_xmls = [_][]const u8{
     "/usr/share/wayland-protocols/stable/tablet/tablet-v2.xml",
     // GPU frames land in the video subsurface as dmabufs (zero-copy path).
     "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
+    // HiDPI: physically-sized buffers presented at logical size (crisp text on
+    // fractionally scaled outputs — KDE "Scale: 1.1" etc.).
+    "/usr/share/wayland-protocols/stable/viewporter/viewporter.xml",
+    "/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml",
     // KDE global menu: link the toplevel to a com.canonical.dbusmenu address.
     "/usr/share/qt6/wayland/protocols/appmenu/appmenu.xml",
 };

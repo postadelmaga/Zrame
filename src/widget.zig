@@ -155,6 +155,28 @@ pub const Theme = struct {
         };
     }
 
+    /// A copy with all geometry × `f` (font sizes rounded). Pair with the window's
+    /// fractional scale (`win.scaleFactor()`) so widgets keep their visual size on
+    /// HiDPI outputs while rendering at native (crisp) pixels.
+    pub fn scaled(t: Theme, f: f32) Theme {
+        var s = t;
+        s.window_pad *= f;
+        s.gap *= f;
+        s.pad_x *= f;
+        s.radius *= f;
+        s.ctl_h *= f;
+        s.check_size *= f;
+        s.font_size = scaleFont(t.font_size, f);
+        s.font_small = scaleFont(t.font_small, f);
+        s.font_heading = scaleFont(t.font_heading, f);
+        return s;
+    }
+
+    fn scaleFont(px: u16, f: f32) u16 {
+        const v = @as(f32, @floatFromInt(px)) * f;
+        return @intFromFloat(@max(1, @round(v)));
+    }
+
     pub fn light() Theme {
         return .{
             .text = Color.rgba(24, 28, 38, 0.95),

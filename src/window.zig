@@ -8,8 +8,11 @@
 //! | windows  | `window_win32.zig`  | native decorated window, GDI blit      |
 //!
 //! Both backends expose the SAME public surface (`init`/`run`/`presentRgba`/
-//! `toggleFullscreen`/`setStyle`/`animateResize`/`close` + the `panel_w`/`panel_h`/
-//! `closed` fields), so callers — and zrame's own `sink.zig` — are backend-agnostic.
+//! `waitFrame`/`toggleFullscreen`/`setStyle`/`animateResize`/`close` + the
+//! `panel_w`/`panel_h`/`closed` fields), so callers — and zrame's own `sink.zig` —
+//! are backend-agnostic. `waitFrame(timeout_ms)` blocks any thread until the
+//! compositor's next frame callback (Wayland); on Win32 it returns false at once
+//! and callers fall back to their own software pacer.
 //! This file owns the platform-independent public *types* both backends share, so the
 //! callback signatures (`fn (window: *Window, …)`) resolve to the selected backend.
 
@@ -81,8 +84,10 @@ pub const Options = struct {
     /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
     /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates
-    /// are **content-local** — top-left of the app's content rect is (0,0). Returns
-    /// **true to consume** the event so the window skips its default handling.
+    /// are in **canvas coordinates** — the same space as the `content` rect passed to
+    /// `on_draw` (so use `content.x/content.y` as the origin for both drawing and
+    /// hit-testing). Returns **true to consume** the event so the window skips its
+    /// default handling.
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) bool = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). Linux-only; a no-op
     /// elsewhere.

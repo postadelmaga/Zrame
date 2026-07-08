@@ -288,6 +288,7 @@ pub const Window = struct {
     opaque_mode: bool = false,
     saved_style: u32 = 0,
     saved_margin: u32 = 0,
+    saved_content_radius: f32 = 0,
     saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
     font: ?text.Font = null,
@@ -413,6 +414,11 @@ pub const Window = struct {
         return false;
     }
 
+    /// Per-monitor DPI awareness is not wired yet on Win32 — the buffer is 1:1.
+    pub fn scaleFactor(_: *const Window) f32 {
+        return 1.0;
+    }
+
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; newest
     /// frame wins. Wakes the UI thread with a thread-safe PostMessageW.
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
@@ -428,6 +434,14 @@ pub const Window = struct {
     }
 
     pub fn videoBusy(_: *const Window) bool {
+        return false;
+    }
+
+    /// Parità di API col backend Wayland: su Win32 non c'è (ancora) un aggancio
+    /// al vsync del compositore, quindi ritorna SUBITO `false` senza bloccare —
+    /// il chiamante degrada al proprio pacer software (stesso contratto del
+    /// timeout scaduto su Wayland).
+    pub fn waitFrame(_: *Window, _: u32) bool {
         return false;
     }
 
@@ -459,7 +473,9 @@ pub const Window = struct {
             // Drop the shadow gutter so the content fills the whole screen edge-to-edge
             // (mirrors the Wayland backend zeroing style.margin on fullscreen).
             self.saved_margin = self.opts.style.margin;
+            self.saved_content_radius = self.opts.style.content_radius;
             self.opts.style.margin = 0;
+            self.opts.style.content_radius = 0;
             self.saved_style = @bitCast(GetWindowLongW(h, GWL_STYLE));
             _ = GetWindowRect(h, &self.saved_rect);
             _ = SetWindowLongW(h, GWL_STYLE, @bitCast(WS_POPUP | WS_VISIBLE));
@@ -468,6 +484,7 @@ pub const Window = struct {
             _ = SetWindowPos(h, null, 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         } else {
             self.opts.style.margin = self.saved_margin;
+            self.opts.style.content_radius = self.saved_content_radius;
             _ = SetWindowLongW(h, GWL_STYLE, @bitCast(self.saved_style));
             const rw = self.saved_rect.right - self.saved_rect.left;
             const rh = self.saved_rect.bottom - self.saved_rect.top;
@@ -938,16 +955,9 @@ pub const Window = struct {
                     self.tracking_leave = true;
                 }
                 if (self.routeInput(.{ .motion = .{ .x = p.x, .y = p.y } })) return 0;
-                if (self.opts.on_mouse) |cb| {
-                    // The app draws in content-local space (its frame sits at the content
-                    // rect), so hand it content-local coords — panels already got buffer-space
-                    // coords via routeInput. Same split as the Wayland backend.
-                    const c = self.contentRect();
-                    _ = cb(self, .{ .motion = .{
-                        .x = p.x - @as(f32, @floatFromInt(c.x)),
-                        .y = p.y - @as(f32, @floatFromInt(c.y)),
-                    } }, self.opts.user);
-                }
+                // Mouse in coordinate CANVAS (come on_draw e i pannelli via routeInput):
+                // l'app usa content.x/y come origine per disegno e hit-test in modo coerente.
+                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .motion = .{ .x = p.x, .y = p.y } }, self.opts.user);
                 return 0;
             },
             WM_MOUSELEAVE => {

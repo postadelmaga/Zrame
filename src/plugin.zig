@@ -189,6 +189,13 @@ pub const Registry = struct {
         var i = self.panels.items.len;
         while (i > 0) {
             i -= 1;
+            // Un pannello può rimuoversi (o rimuoverne altri) dentro `onInput` e la
+            // lista si accorcia sotto i piedi: riallinea l'indice alla nuova coda
+            // prima di dereferenziare.
+            if (i >= self.panels.items.len) {
+                i = self.panels.items.len;
+                continue;
+            }
             if (self.panels.items[i].panel.onInput(event, host)) return true;
         }
         return false;

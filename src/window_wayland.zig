@@ -82,6 +82,8 @@ pub const Window = struct {
     seat: ?*wl.Seat = null,
     blur_manager: ?*wl.BackgroundEffectManager = null,
     cursor_shapes: ?*wl.CursorShapeManager = null,
+    viewporter: ?*wl.Viewporter = null,
+    fractional_manager: ?*wl.FractionalScaleManager = null,
 
     surface: ?*wl.Surface = null,
     xdg_surface: ?*wl.XdgSurface = null,
@@ -89,7 +91,18 @@ pub const Window = struct {
     blur: ?*wl.BackgroundEffectSurface = null,
     pointer: ?*wl.Pointer = null,
     keyboard: ?*wl.Keyboard = null,
+    touch: ?*wl.Touch = null,
+    /// Slot del dito primario attivo (`-1` = nessuno): il touch a un dito è sintetizzato
+    /// come pointer, così le app funzionano al tocco senza modifiche.
+    touch_id: i32 = -1,
     cursor_device: ?*wl.CursorShapeDevice = null,
+    // HiDPI: with both globals present the buffer is rendered at `logical × scale`
+    // physical pixels and presented at logical size through the viewport — crisp on
+    // fractionally scaled outputs. Without them scale stays 1.0 (previous behavior).
+    viewport: ?*wl.Viewport = null,
+    fractional: ?*wl.FractionalScale = null,
+    /// Compositor-preferred surface scale in 120ths (`wp_fractional_scale_v1`): 120 = 1.0.
+    scale120: u32 = 120,
 
     /// Panel (window-geometry) size; buffer size adds the shadow margin on each side.
     panel_w: u32,
@@ -116,6 +129,7 @@ pub const Window = struct {
     saved_panel_h: u32 = 0,
     saved_margin: u32 = 0,
     saved_radius: f32 = 0,
+    saved_content_radius: f32 = 0,
     // Motore di testo (stb_truetype), creato pigramente al primo uso: font di
     // default Hack regular+bold, sostituibile con `setFont`/`loadFont`.
     font: ?text.Font = null,
@@ -198,6 +212,23 @@ pub const Window = struct {
     /// free-running (mailbox semantics: staging while busy replaces).
     video_pending: std.atomic.Value(bool) = .init(false),
 
+    // --- attesa vsync (`waitFrame`) -----------------------------------------------
+    // Contatore dei frame callback del compositor sulla surface principale: il
+    // dispatch (thread finestra) lo incrementa e sveglia i waiter via futex; i
+    // chiamanti di `waitFrame` dormono in FUTEX_WAIT proprio su questo indirizzo.
+    // (Zig 0.16 tiene mutex/condvar bloccanti dietro `std.Io`, vedi `SpinLock`:
+    // per un'attesa bloccante con timeout il futex raw è la primitiva giusta qui,
+    // e questo backend è comunque solo-Linux.)
+    frame_seq: std.atomic.Value(u32) = .init(0),
+    /// Solo thread finestra: true mentre un `wl_surface.frame` è in volo sulla
+    /// surface principale (al massimo un callback pendente per volta, richiesto
+    /// insieme al commit in `redraw`).
+    frame_cb_pending: bool = false,
+    /// Alzato al teardown (uscita dal run loop o `deinit`): i waiter vengono
+    /// svegliati e `waitFrame` ritorna false invece di aspettare un callback che
+    /// non arriverà più.
+    frame_teardown: std.atomic.Value(bool) = .init(false),
+
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const display = wl.wl_display_connect(null) orelse return error.NoWaylandDisplay;
         errdefer wl.wl_display_disconnect(display);
@@ -250,6 +281,14 @@ pub const Window = struct {
 
         if (self.blur_manager) |mgr| self.blur = mgr.getBackgroundEffect(surface);
 
+        // Fractional HiDPI needs BOTH: the scale preference and the viewport that maps
+        // the physically-sized buffer back to the logical window size.
+        if (self.viewporter != null and self.fractional_manager != null) {
+            self.viewport = self.viewporter.?.getViewport(surface);
+            self.fractional = self.fractional_manager.?.getFractionalScale(surface);
+            self.fractional.?.setListener(&fractional_listener, self);
+        }
+
         // Floating scrollbars are the bottom-most panel: the title bar and context menu
         // draw over them and grab input first. Borrowed — the Window owns the instance
         // (as a field), so the registry must not deinit/free it.
@@ -274,6 +313,12 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        // Cintura di sicurezza per chi non è mai entrato in `run`: segna il
+        // teardown e sveglia eventuali waiter di `waitFrame` PRIMA di smontare.
+        // (Il contratto resta: i thread che chiamano waitFrame vanno joinati
+        // prima di deinit — qui si riduce solo la finestra di corsa.)
+        self.frame_teardown.store(true, .release);
+        self.wakeFrameWaiters();
         if (self.appmenu_obj) |o| o.release();
         if (self.menu) |mnu| mnu.deinit();
         if (self.tray) |t| t.deinit();
@@ -291,6 +336,8 @@ pub const Window = struct {
         }
         if (self.video_subsurface) |ss| ss.destroy();
         if (self.video_surface) |vs| vs.destroy();
+        if (self.fractional) |f| wl.wl_proxy_destroy(@ptrCast(f));
+        if (self.viewport) |v| wl.wl_proxy_destroy(@ptrCast(v));
         if (self.blur) |b| wl.wl_proxy_destroy(@ptrCast(b));
         if (self.cursor_device) |c| wl.wl_proxy_destroy(@ptrCast(c));
         if (self.keyboard) |k| wl.wl_proxy_destroy(@ptrCast(k));
@@ -426,9 +473,86 @@ pub const Window = struct {
         return self.video_pending.load(.acquire);
     }
 
+    /// Blocca il thread chiamante (uno QUALSIASI, tipicamente il render worker
+    /// dell'app) fino al prossimo frame callback del compositor — il momento
+    /// giusto per comporre il frame successivo — o fino a `timeout_ms`.
+    /// Ritorna `true` se svegliato dal callback, `false` su timeout o a
+    /// finestra chiusa/in teardown (il chiamante degrada al proprio pacer).
+    ///
+    /// Contratto:
+    /// - Il callback viene richiesto solo quando `redraw` committa davvero un
+    ///   frame: senza commit dall'ultimo callback (es. video in pausa) o con la
+    ///   finestra nascosta/occlusa (i compositor fermano i frame callback)
+    ///   l'attesa scade col timeout — è la rete di sicurezza, non un errore.
+    /// - Più waiter contemporanei sono ammessi (il risveglio è broadcast).
+    /// - Alla chiusura della finestra i waiter vengono svegliati e ricevono
+    ///   `false`; il chiamante deve essere uscito da `waitFrame` (cioè il suo
+    ///   thread raggiunto/joinato) prima di chiamare `deinit`.
+    /// - Su Win32 il metodo omologo ritorna sempre subito `false` (nessun
+    ///   aggancio vsync): lì il chiamante usa il suo pacer software.
+    pub fn waitFrame(self: *Window, timeout_ms: u32) bool {
+        if (self.frame_teardown.load(.acquire)) return false;
+        const start = self.frame_seq.load(.acquire);
+        const deadline = monotonicNs() + @as(i64, timeout_ms) * 1_000_000;
+        while (true) {
+            const now = monotonicNs();
+            if (now >= deadline) return false;
+            const left: u64 = @intCast(deadline - now);
+            const ts: linux.timespec = .{
+                .sec = @intCast(left / 1_000_000_000),
+                .nsec = @intCast(left % 1_000_000_000),
+            };
+            // FUTEX_WAIT dorme solo se `frame_seq` vale ancora `start`: un
+            // callback arrivato tra la load e la wait fa fallire la wait con
+            // EAGAIN — niente lost wake-up. Timeout relativo, clock monotonico.
+            const rc = linux.futex_4arg(
+                &self.frame_seq.raw,
+                .{ .cmd = .WAIT, .private = true },
+                start,
+                &ts,
+            );
+            switch (linux.errno(rc)) {
+                .SUCCESS, .AGAIN, .INTR => {},
+                else => return false, // TIMEDOUT o errore inatteso
+            }
+            if (self.frame_teardown.load(.acquire)) return false;
+            if (self.frame_seq.load(.acquire) != start) return true;
+            // Risveglio spurio/EINTR: il tempo rimasto si ricalcola e si riprova.
+        }
+    }
+
+    /// Sveglia in broadcast tutti i thread fermi in `waitFrame` (store già fatto
+    /// dal chiamante: qui solo la syscall di wake).
+    fn wakeFrameWaiters(self: *Window) void {
+        _ = linux.futex_3arg(
+            &self.frame_seq.raw,
+            .{ .cmd = .WAKE, .private = true },
+            std.math.maxInt(i32),
+        );
+    }
+
+    const frame_done_listener = wl.Callback.Listener{ .done = onFrameDone };
+
+    /// Frame callback della surface principale (dispatch sul thread finestra):
+    /// SOLO store + wake, nessun lavoro pesante nel dispatch Wayland.
+    fn onFrameDone(data: ?*anyopaque, callback: *wl.Callback, _: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        callback.destroy();
+        self.frame_cb_pending = false;
+        _ = self.frame_seq.fetchAdd(1, .release);
+        self.wakeFrameWaiters();
+    }
+
     /// The event loop: blocks until the window is closed or the connection drops.
     pub fn run(self: *Window) !void {
         self.running = true;
+        // All'uscita dal loop (chiusura o errore di connessione) nessun frame
+        // callback arriverà più: sveglia chi è fermo in `waitFrame`, che così
+        // ritorna false e lascia terminare il proprio thread.
+        defer {
+            self.frame_teardown.store(true, .release);
+            self.wakeFrameWaiters();
+        }
         // Bring up the tray icon once, if requested. Registration failure (no tray host on
         // the bus) is non-fatal: log and run without it.
         if (self.tray == null) {
@@ -660,13 +784,13 @@ pub const Window = struct {
     /// The `xdg_toplevel` resize-edge bitmask for a pointer at canvas `(sx,sy)`: an 8px
     /// band around the panel border, corners combining two edges. NONE in the interior.
     fn resizeEdgeAt(self: *const Window, sx: f32, sy: f32) u32 {
-        const m: f32 = @floatFromInt(self.opts.style.margin);
-        const px = sx - m;
-        const py = sy - m;
-        const w: f32 = @floatFromInt(self.panel_w);
-        const h: f32 = @floatFromInt(self.panel_h);
+        const p = self.physPanel();
+        const px = sx - p.m;
+        const py = sy - p.m;
+        const w = p.w;
+        const h = p.h;
         if (px < 0 or py < 0 or px >= w or py >= h) return wl.RESIZE_EDGE_NONE;
-        const band: f32 = 8.0;
+        const band: f32 = self.physPxF(8.0);
         var edge: u32 = 0;
         if (py < band) edge |= wl.RESIZE_EDGE_TOP;
         if (py >= h - band) edge |= wl.RESIZE_EDGE_BOTTOM;
@@ -687,11 +811,14 @@ pub const Window = struct {
 
     fn hostInfo(ptr: *anyopaque) plugin.Info {
         const self: *Window = @ptrCast(@alignCast(ptr));
+        // Physical pixels throughout — consistent with the canvas panels draw on and
+        // with the pointer coordinates they hit-test against.
+        const p = self.physPanel();
         return .{
             .content = self.contentRect(),
-            .panel_w = self.panel_w,
-            .panel_h = self.panel_h,
-            .margin = self.opts.style.margin,
+            .panel_w = @intFromFloat(p.w),
+            .panel_h = @intFromFloat(p.h),
+            .margin = @intFromFloat(p.m),
             .maximized = self.maximized,
             .fullscreen = self.fullscreen,
         };
@@ -807,6 +934,11 @@ pub const Window = struct {
         surface.commit();
         self.configured = false;
         surface.commit();
+        // Un frame callback in volo era legato alla surface mappata: dopo l'unmap
+        // potrebbe non arrivare mai. Sbloccando il flag, il primo redraw dopo il
+        // re-map ne richiede uno nuovo; se il vecchio arriva comunque, gestirne
+        // due è innocuo (ogni `done` distrugge solo il proprio wl_callback).
+        self.frame_cb_pending = false;
         self.needs_redraw = true;
     }
 
@@ -837,6 +969,55 @@ pub const Window = struct {
         return 4 * self.opts.style.margin;
     }
 
+    // --- HiDPI helpers -------------------------------------------------------------------
+    // The cut: everything that PAINTS (buffer, canvas, panels, pointer coords, app
+    // content rect) is in physical pixels; everything the COMPOSITOR sees (window
+    // geometry, input/blur regions, configure sizes, viewport destination) stays logical.
+
+    /// The surface's preferred scale (1.0 on non-scaled outputs or without protocol support).
+    pub fn scaleFactor(self: *const Window) f32 {
+        return @as(f32, @floatFromInt(self.scale120)) / 120.0;
+    }
+
+    /// Logical → physical pixels, rounded.
+    fn physPx(self: *const Window, v: u32) u32 {
+        return @intCast((@as(u64, v) * self.scale120 + 60) / 120);
+    }
+
+    fn physPxF(self: *const Window, v: f32) f32 {
+        return v * @as(f32, @floatFromInt(self.scale120)) / 120.0;
+    }
+
+    /// Panel geometry in buffer (physical) pixels — the space pointer coords live in.
+    /// Width/height are derived as `total − 2·margin` so they always complement the
+    /// buffer dimensions exactly (no independent-rounding drift).
+    fn physPanel(self: *const Window) struct { m: f32, w: f32, h: f32 } {
+        const m = self.opts.style.margin;
+        const bw = self.physPx(self.panel_w + 2 * m);
+        const bh = self.physPx(self.panel_h + 2 * m);
+        const mp = self.physPx(m);
+        return .{
+            .m = @floatFromInt(mp),
+            .w = @floatFromInt(bw - 2 * mp),
+            .h = @floatFromInt(bh - 2 * mp),
+        };
+    }
+
+    /// The chrome style in buffer (physical) pixels — geometry fields only, colors and
+    /// alphas untouched. Compositor-facing users (regions, geometry) keep `opts.style`.
+    fn paintStyle(self: *const Window) Style {
+        var s = self.opts.style;
+        s.margin = self.physPx(s.margin);
+        s.corner_radius = self.physPxF(s.corner_radius);
+        s.shadow_blur = self.physPxF(s.shadow_blur);
+        s.shadow_offset_y = self.physPxF(s.shadow_offset_y);
+        s.glass_fade_width = self.physPxF(s.glass_fade_width);
+        s.content_radius = self.physPxF(s.content_radius);
+        s.content_fade_width = self.physPxF(s.content_fade_width);
+        s.border_anim_width = self.physPxF(s.border_anim_width);
+        return s;
+    }
+
     /// Height the title bar steals from the top of the content (0 when disabled or in
     /// fullscreen, where the chrome is hidden).
     fn titlebarHeight(self: *const Window) u32 {
@@ -845,9 +1026,13 @@ pub const Window = struct {
     }
 
     fn contentRect(self: *Window) Rect {
-        const m = self.opts.style.margin;
+        // Physical (buffer) pixels — the canvas/panel/pointer space. The title-bar
+        // height stays unscaled on purpose: the controls panel draws its bar with its
+        // own (unscaled) metrics, and the content must start exactly beneath it.
+        const p = self.physPanel();
+        const m: u32 = @intFromFloat(p.m);
         const tb = self.titlebarHeight();
-        return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
+        return .{ .x = m, .y = m + tb, .w = @intFromFloat(p.w), .h = @as(u32, @intFromFloat(p.h)) - tb };
     }
 
     /// Composite one full window frame into `pixels` (an ARGB8888 buffer sized
@@ -862,7 +1047,7 @@ pub const Window = struct {
         @memcpy(pixels, self.decor);
         var canvas = paint.Canvas.init(pixels, bw, bh);
         chrome.swapFront(&self.mutex, &self.staged, &self.front);
-        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.opts.style, &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Wayland present path: size the shm buffers, acquire a free slot, compose
@@ -871,8 +1056,8 @@ pub const Window = struct {
     /// commit are Wayland-specific.
     fn redraw(self: *Window) !void {
         const m = self.opts.style.margin;
-        const bw = self.panel_w + 2 * m;
-        const bh = self.panel_h + 2 * m;
+        const bw = self.physPx(self.panel_w + 2 * m);
+        const bh = self.physPx(self.panel_h + 2 * m);
         if (bw != self.buf_w or bh != self.buf_h) try self.resizeBuffers(bw, bh);
 
         const slot = self.freeSlot() orelse return; // both busy: retry on next wake
@@ -881,6 +1066,15 @@ pub const Window = struct {
         const surface = self.surface.?;
         surface.attach(slot.buffer, 0, 0);
         surface.damageBuffer(0, 0, @intCast(bw), @intCast(bh));
+        // Vsync: chiedi un frame callback per QUESTO commit (la richiesta `frame`
+        // è stato double-buffered, va emessa prima del commit), se non ce n'è già
+        // uno in volo. Niente commit → niente callback → i waiter di `waitFrame`
+        // scadono col loro timeout (coalescenza: video in pausa non blocca).
+        if (!self.frame_cb_pending) {
+            const fcb = surface.frame();
+            fcb.setListener(&frame_done_listener, self);
+            self.frame_cb_pending = true;
+        }
         surface.commit();
         slot.busy = true;
         self.needs_redraw = false;
@@ -960,7 +1154,7 @@ pub const Window = struct {
             self.decor = try self.gpa.alloc(u32, len);
         }
         var canvas = paint.Canvas.init(self.decor, bw, bh);
-        canvas.drawChrome(self.opts.style);
+        canvas.drawChrome(self.paintStyle());
     }
 
     /// Window geometry, input region and blur region all describe the *panel*, not the
@@ -990,6 +1184,11 @@ pub const Window = struct {
                 addRoundedRegion(region, 0, self.panel_w, self.panel_h, self.opts.style.corner_radius);
             }
             blur.setBlurRegion(region);
+        }
+
+        // HiDPI: present the physically-sized buffer at the logical window size.
+        if (self.viewport) |vp| {
+            vp.setDestination(pw + 2 * m, ph + 2 * m);
         }
     }
 
@@ -1023,6 +1222,10 @@ pub const Window = struct {
             self.blur_manager = @ptrCast(registry.bind(name, &wl.ext_background_effect_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
             self.cursor_shapes = @ptrCast(registry.bind(name, &wl.wp_cursor_shape_manager_v1_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, "wp_viewporter")) {
+            self.viewporter = @ptrCast(registry.bind(name, &wl.wp_viewporter_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, "wp_fractional_scale_manager_v1")) {
+            self.fractional_manager = @ptrCast(registry.bind(name, &wl.wp_fractional_scale_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, appmenu_mod.manager_global)) {
             self.appmenu_manager = @ptrCast(registry.bind(name, appmenu_mod.manager_interface, 1).?);
         }
@@ -1090,11 +1293,16 @@ pub const Window = struct {
                 self.saved_panel_h = self.panel_h;
                 self.saved_margin = self.opts.style.margin;
                 self.saved_radius = self.opts.style.corner_radius;
+                self.saved_content_radius = self.opts.style.content_radius;
                 self.opts.style.margin = 0;
                 self.opts.style.corner_radius = 0;
+                // Anche il contenuto senza angoli tondi: a schermo intero niente
+                // cornice/bordo, il contenuto riempe da bordo a bordo.
+                self.opts.style.content_radius = 0;
             } else {
                 self.opts.style.margin = self.saved_margin;
                 self.opts.style.corner_radius = self.saved_radius;
+                self.opts.style.content_radius = self.saved_content_radius;
                 // Se il compositore non suggerisce una dimensione (0), torna a
                 // quella pre-fullscreen.
                 if (width <= 0) self.panel_w = self.saved_panel_w;
@@ -1154,6 +1362,11 @@ pub const Window = struct {
             keyboard.setListener(&keyboard_listener, self);
             self.keyboard = keyboard;
         }
+        if (caps & wl.SEAT_CAPABILITY_TOUCH != 0 and self.touch == null) {
+            const touch = seat.getTouch();
+            touch.setListener(&touch_listener, self);
+            self.touch = touch;
+        }
     }
 
     fn onSeatName(_: ?*anyopaque, _: *wl.Seat, _: [*:0]const u8) callconv(.c) void {}
@@ -1187,6 +1400,67 @@ pub const Window = struct {
     fn onKeyModifiers(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
     fn onKeyRepeatInfo(_: ?*anyopaque, _: *wl.Keyboard, _: i32, _: i32) callconv(.c) void {}
 
+    // --- touch: il dito primario è sintetizzato come pointer (down→press, motion, up→release),
+    //     così ogni app zrame è usabile al tocco senza modifiche. Il multi-touch (pinch) potrà
+    //     esporre un callback dedicato più avanti.
+    const touch_listener = wl.Touch.Listener{
+        .down = onTouchDown,
+        .up = onTouchUp,
+        .motion = onTouchMotion,
+        .frame = onTouchFrame,
+        .cancel = onTouchCancel,
+        .shape = onTouchShape,
+        .orientation = onTouchOrientation,
+    };
+
+    fn touchEmitMotion(self: *Window, fx: f32, fy: f32) void {
+        self.pointer_x = fx;
+        self.pointer_y = fy;
+        if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
+        // Mouse in coordinate CANVAS (come il pointer e on_draw), non content-local.
+        if (self.opts.on_mouse) |cb| _ = cb(self, .{ .motion = .{ .x = fx, .y = fy } }, self.opts.user);
+    }
+
+    fn touchEmitButton(self: *Window, pressed: bool) void {
+        const state: u32 = if (pressed) wl.POINTER_BUTTON_STATE_PRESSED else 0;
+        if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = wl.BTN_LEFT, .pressed = pressed } })) return;
+        if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = wl.BTN_LEFT, .state = state } }, self.opts.user);
+    }
+
+    fn onTouchDown(data: ?*anyopaque, _: *wl.Touch, _: u32, _: u32, _: ?*wl.Surface, id: i32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (self.touch_id != -1) return; // un solo dito primario alla volta
+        self.touch_id = id;
+        const s = self.scaleFactor();
+        self.touchEmitMotion(wl.fixedToF32(x) * s, wl.fixedToF32(y) * s);
+        self.touchEmitButton(true);
+    }
+
+    fn onTouchMotion(data: ?*anyopaque, _: *wl.Touch, _: u32, id: i32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (id != self.touch_id) return;
+        const s = self.scaleFactor();
+        self.touchEmitMotion(wl.fixedToF32(x) * s, wl.fixedToF32(y) * s);
+    }
+
+    fn onTouchUp(data: ?*anyopaque, _: *wl.Touch, _: u32, _: u32, id: i32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (id != self.touch_id) return;
+        self.touchEmitButton(false);
+        self.touch_id = -1;
+    }
+
+    fn onTouchCancel(data: ?*anyopaque, _: *wl.Touch) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (self.touch_id == -1) return;
+        self.touchEmitButton(false);
+        self.touch_id = -1;
+    }
+
+    fn onTouchFrame(_: ?*anyopaque, _: *wl.Touch) callconv(.c) void {}
+    fn onTouchShape(_: ?*anyopaque, _: *wl.Touch, _: i32, _: wl.Fixed, _: wl.Fixed) callconv(.c) void {}
+    fn onTouchOrientation(_: ?*anyopaque, _: *wl.Touch, _: i32, _: wl.Fixed) callconv(.c) void {}
+
     const pointer_listener = wl.Pointer.Listener{
         .enter = onPointerEnter,
         .leave = onPointerLeave,
@@ -1218,20 +1492,19 @@ pub const Window = struct {
     }
     fn onPointerMotion(data: ?*anyopaque, _: *wl.Pointer, _: u32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        const fx = wl.fixedToF32(x);
-        const fy = wl.fixedToF32(y);
+        // Pointer events arrive in logical surface coords; everything client-side
+        // (canvas, panels, app) lives in physical buffer pixels.
+        const s = self.scaleFactor();
+        const fx = wl.fixedToF32(x) * s;
+        const fy = wl.fixedToF32(y) * s;
         self.pointer_x = fx;
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
         if (self.opts.on_mouse) |cb| {
-            // The app draws in content-local space (its presented frame sits at the
-            // content rect), so hand it content-local pointer coords — top-left of the
-            // content is (0,0). Panels above still get buffer-space via routeInput.
-            const c = self.contentRect();
-            const consumed = cb(self, .{ .motion = .{
-                .x = fx - @as(f32, @floatFromInt(c.x)),
-                .y = fy - @as(f32, @floatFromInt(c.y)),
-            } }, self.opts.user);
+            // Mouse in coordinate CANVAS: lo stesso spazio del `content` rect passato a
+            // `on_draw` e dei pannelli (routeInput usa fx,fy). Così l'app usa content.x/y
+            // come origine per disegno E hit-test in modo coerente (niente offset titlebar).
+            const consumed = cb(self, .{ .motion = .{ .x = fx, .y = fy } }, self.opts.user);
             if (consumed) {
                 // The app owns this motion (e.g. hovering/dragging its own scrollbar):
                 // keep the normal cursor, don't flash the resize arrows over its widget.
@@ -1264,12 +1537,13 @@ pub const Window = struct {
             } else if (!self.opts.titlebar) {
                 // No title bar to grab: keep the panel draggable from near its edge, as
                 // before. With a title bar, dragging is the bar's job (see controls.zig).
-                const m = @as(f32, @floatFromInt(self.opts.style.margin));
-                const px = self.pointer_x - m;
-                const py = self.pointer_y - m;
-                const w = @as(f32, @floatFromInt(self.panel_w));
-                const h = @as(f32, @floatFromInt(self.panel_h));
-                if (px < 30.0 or py < 30.0 or px > w - 30.0 or py > h - 30.0) {
+                const p = self.physPanel();
+                const px = self.pointer_x - p.m;
+                const py = self.pointer_y - p.m;
+                const w = p.w;
+                const h = p.h;
+                const grab = self.physPxF(30.0);
+                if (px < grab or py < grab or px > w - grab or py > h - grab) {
                     if (self.seat) |seat| self.toplevel.?.move(seat, serial);
                 }
             }
@@ -1281,6 +1555,17 @@ pub const Window = struct {
         if (self.routeInput(.{ .axis = .{ .x = self.pointer_x, .y = self.pointer_y, .axis = axis, .value = wl.fixedToF32(value), .line = true } })) return;
         if (self.opts.on_scroll) |cb| cb(self, axis, value, self.opts.user);
     }
+    const fractional_listener = wl.FractionalScale.Listener{ .preferred_scale = onPreferredScale };
+
+    fn onPreferredScale(data: ?*anyopaque, _: *wl.FractionalScale, scale: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (scale == 0 or scale == self.scale120) return;
+        self.scale120 = scale;
+        // Buffer dimensions derive from the scale: the next redraw resizes, repaints
+        // the decor and re-applies the viewport destination.
+        self.needs_redraw = true;
+    }
+
     fn onPointerFrame(_: ?*anyopaque, _: *wl.Pointer) callconv(.c) void {}
     fn onPointerAxisSource(_: ?*anyopaque, _: *wl.Pointer, _: u32) callconv(.c) void {}
     fn onPointerAxisStop(_: ?*anyopaque, _: *wl.Pointer, _: u32, _: u32) callconv(.c) void {}
