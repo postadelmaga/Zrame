@@ -82,6 +82,13 @@ pub const Options = struct {
     /// Optional key handler (evdev keycode, key state: 1 pressed / 0 released). Win32
     /// translates VK codes to the same evdev codes so handlers are cross-platform.
     on_key: ?*const fn (window: *Window, key: u32, state: u32, user: ?*anyopaque) void = null,
+    /// Optional text-input handler, additive to `on_key` (which keeps firing unchanged):
+    /// on every key press that produces printable text under the ACTIVE keyboard layout
+    /// (xkbcommon on Wayland, `WM_CHAR` on Win32), `bytes[0..len]` carries one UTF-8
+    /// encoded codepoint (1..4 bytes). Control characters and DEL never fire. When layout
+    /// translation is unavailable (no keymap) it simply never fires — apps fall back to
+    /// their own `on_key` mapping.
+    on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
     /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
     /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates

@@ -26,6 +26,7 @@ const Demo = struct {
     channels: i64 = 32,
     name: std.ArrayList(u8) = .empty,
     notes: std.ArrayList(u8) = .empty,
+    memo: std.ArrayList(u8) = .empty,
     mic: usize = 0,
     pattern: usize = 0,
     selected_row: usize = 0,
@@ -113,6 +114,8 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
             ui.labelDim("Every frame the UI is rebuilt from state;");
             ui.labelDim("the Store keeps hot/active/focus and offsets.");
             ui.endCard();
+            ui.labelDim("A multi-line editor (Enter = newline, ctrl+C/V via the OS):");
+            _ = ui.textArea("memo", &demo.memo, 140);
         },
     }
 
@@ -156,6 +159,23 @@ fn onKey(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
     win.host().do(.request_redraw);
 }
 
+fn onText(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void {
+    const demo: *Demo = @ptrCast(@alignCast(user.?));
+    demo.queue.push(.{ .text = .{ .bytes = bytes, .len = len } });
+    win.host().do(.request_redraw);
+}
+
+// Store ↔ window bridge: copies land on the system clipboard, pastes prefer it.
+fn clipSet(ctx: ?*anyopaque, s: []const u8) void {
+    const win: *zrame.Window = @ptrCast(@alignCast(ctx.?));
+    win.clipboardSet(s);
+}
+
+fn clipGet(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 {
+    const win: *zrame.Window = @ptrCast(@alignCast(ctx.?));
+    return win.clipboardGet(gpa);
+}
+
 fn onScroll(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) void {
     const demo: *Demo = @ptrCast(@alignCast(user.?));
     demo.queue.push(.{ .scroll = .{ .axis = axis, .px = @as(f32, @floatFromInt(value)) / 256.0 } });
@@ -171,6 +191,7 @@ pub fn main() !void {
     defer demo.store.deinit();
     defer demo.name.deinit(gpa);
     defer demo.notes.deinit(gpa);
+    defer demo.memo.deinit(gpa);
 
     const win = try zrame.Window.init(gpa, .{
         .title = "zrame — widgets",
@@ -182,11 +203,13 @@ pub fn main() !void {
         .on_draw = onDraw,
         .on_mouse = onMouse,
         .on_key = onKey,
+        .on_text = onText,
         .on_scroll = onScroll,
         .user = &demo,
     });
     defer win.deinit();
     demo.window = win;
+    demo.store.os_clipboard = .{ .ctx = win, .set = clipSet, .get = clipGet };
 
     try win.run();
 }

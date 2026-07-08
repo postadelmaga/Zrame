@@ -208,6 +208,15 @@ pub const Window = struct {
         }
     }
 
+    /// System clipboard is not wired on Cocoa yet: API-parity no-op (see the Wayland /
+    /// Win32 backends for the real implementations).
+    pub fn clipboardSet(_: *Window, _: []const u8) void {}
+
+    /// System clipboard is not wired on Cocoa yet: always null (no selection).
+    pub fn clipboardGet(_: *Window, _: Allocator) ?[]u8 {
+        return null;
+    }
+
     // --- host seam (panels reach back into the window) --------------------------------
 
     pub fn host(self: *Window) Host {

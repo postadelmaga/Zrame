@@ -44,6 +44,9 @@ pub fn build(b: *std.Build) void {
     // Linux stack for a Linux target; on Windows link the Win32 GUI libraries instead.
     if (target.result.os.tag == .linux) {
         zrame.linkSystemLibrary("wayland-client", .{});
+        // Keyboard layout translation (evdev code + compositor keymap → UTF-8 text for
+        // `on_text`). FFI is hand-declared in src/xkb.zig, so only the library is linked.
+        zrame.linkSystemLibrary("xkbcommon", .{});
         // Tray icon (StatusNotifierItem) talks to the session bus through sd-bus. We
         // hand-declare the FFI, so no headers are needed — just link libsystemd.
         zrame.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });

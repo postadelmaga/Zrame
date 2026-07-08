@@ -177,6 +177,20 @@ extern "gdi32" fn DeleteDC(HDC) callconv(.winapi) i32;
 // fast blit, so 3D/video stay fluid while testing. The layered glass is the default.
 extern "gdi32" fn SetDIBitsToDevice(HDC, i32, i32, u32, u32, i32, i32, u32, u32, ?*const anyopaque, *const BITMAPINFO, u32) callconv(.winapi) i32;
 extern fn getenv([*:0]const u8) ?[*:0]const u8;
+// System clipboard (CF_UNICODETEXT): the handle passed to SetClipboardData must be
+// GMEM_MOVEABLE global memory, whose ownership transfers to the system on success.
+extern "user32" fn OpenClipboard(HWND) callconv(.winapi) i32;
+extern "user32" fn CloseClipboard() callconv(.winapi) i32;
+extern "user32" fn EmptyClipboard() callconv(.winapi) i32;
+extern "user32" fn SetClipboardData(u32, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn GetClipboardData(u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalLock(?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GlobalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
+
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
 
 const SIZE = extern struct { cx: i32, cy: i32 };
 const BLENDFUNCTION = extern struct { BlendOp: u8, BlendFlags: u8, SourceConstantAlpha: u8, AlphaFormat: u8 };
@@ -215,6 +229,7 @@ const WM_CLOSE: u32 = 0x0010;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
+const WM_CHAR: u32 = 0x0102;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -295,6 +310,9 @@ pub const Window = struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     tracking_leave: bool = false,
+    /// WM_CHAR delivers astral-plane text as a surrogate pair split over two messages;
+    /// the high half parks here until its low half arrives (0 = none pending).
+    high_surrogate: u16 = 0,
 
     panels: plugin.Registry,
     scrollbars: scroll.Scroll = .{ .follow_content = true },
@@ -857,6 +875,70 @@ pub const Window = struct {
         if (!active) self.disarmTimer();
     }
 
+    /// WM_CHAR → `on_text`: TranslateMessage already ran the active keyboard layout, so
+    /// `cu` is layout-correct UTF-16. Surrogate pairs (two WM_CHARs) are joined; control
+    /// characters and DEL are skipped — mirroring the Wayland xkb path exactly.
+    fn onChar(self: *Window, cu: u16) void {
+        const cb = self.opts.on_text orelse return;
+        var cp: u21 = cu;
+        if (cu >= 0xD800 and cu <= 0xDBFF) { // high half: park it, wait for the low one
+            self.high_surrogate = cu;
+            return;
+        }
+        if (cu >= 0xDC00 and cu <= 0xDFFF) {
+            const hi = self.high_surrogate;
+            self.high_surrogate = 0;
+            if (hi == 0) return; // stray low surrogate
+            cp = 0x10000 + ((@as(u21, hi - 0xD800) << 10) | (cu - 0xDC00));
+        } else {
+            self.high_surrogate = 0;
+        }
+        if (cp < 0x20 or cp == 0x7f) return;
+        var bytes: [4]u8 = .{ 0, 0, 0, 0 };
+        const len: u8 = std.unicode.utf8Encode(cp, &bytes) catch return;
+        cb(self, bytes, len, self.opts.user);
+    }
+
+    // --- clipboard ----------------------------------------------------------------------
+
+    /// Put UTF-8 `bytes` on the system clipboard as CF_UNICODETEXT. Same signature and
+    /// thread contract as the Wayland backend (call from the window/UI thread); failures
+    /// are silently dropped.
+    pub fn clipboardSet(self: *Window, bytes: []const u8) void {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(self.gpa, bytes) catch return;
+        defer self.gpa.free(wide);
+        const size = (wide.len + 1) * 2; // include the NUL terminator
+        const handle = GlobalAlloc(GMEM_MOVEABLE, size) orelse return;
+        const mem = GlobalLock(handle) orelse {
+            _ = GlobalFree(handle);
+            return;
+        };
+        @memcpy(@as([*]u8, @ptrCast(mem))[0..size], @as([*]const u8, @ptrCast(wide.ptr))[0..size]);
+        _ = GlobalUnlock(handle);
+        if (OpenClipboard(self.hwnd) == 0) {
+            _ = GlobalFree(handle);
+            return;
+        }
+        defer _ = CloseClipboard();
+        _ = EmptyClipboard();
+        // On success the system owns the handle; only free it when the hand-off failed.
+        if (SetClipboardData(CF_UNICODETEXT, handle) == null) _ = GlobalFree(handle);
+    }
+
+    /// Read the system clipboard as UTF-8 text (CF_UNICODETEXT, converted). Returns null
+    /// when the clipboard has no text or on any failure; the caller frees the bytes.
+    pub fn clipboardGet(self: *Window, gpa: Allocator) ?[]u8 {
+        if (OpenClipboard(self.hwnd) == 0) return null;
+        defer _ = CloseClipboard();
+        const handle = GetClipboardData(CF_UNICODETEXT) orelse return null;
+        const mem = GlobalLock(handle) orelse return null;
+        defer _ = GlobalUnlock(handle);
+        const wide: [*:0]const u16 = @ptrCast(@alignCast(mem));
+        const span = std.mem.span(wide);
+        if (span.len == 0) return null;
+        return std.unicode.utf16LeToUtf8Alloc(gpa, span) catch null;
+    }
+
     fn refreshMaximized(self: *Window) void {
         const h = self.hwnd orelse return;
         var wp = WINDOWPLACEMENT{};
@@ -943,6 +1025,10 @@ pub const Window = struct {
                     if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed == 1 } })) return 0;
                     if (self.opts.on_key) |cb| cb(self, key, pressed, self.opts.user);
                 }
+                return 0;
+            },
+            WM_CHAR => {
+                self.onChar(@truncate(wparam));
                 return 0;
             },
             WM_MOUSEMOVE => {

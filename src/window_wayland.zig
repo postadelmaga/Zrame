@@ -17,6 +17,7 @@ const linux = std.os.linux;
 
 const zicro = @import("zicro");
 const wl = zicro.wl;
+const xkb = @import("xkb.zig");
 const paint = zicro.paint;
 const text = zicro.text;
 const anim = zicro.anim;
@@ -62,6 +63,23 @@ const StagedDma = struct {
 /// simpler than threading an `Io` through the window.
 const SpinLock = chrome.SpinLock;
 
+/// Best text flavor a clipboard offer advertises, in ascending preference (utf8 wins).
+const TextMime = enum(u8) {
+    none = 0,
+    plain = 1,
+    utf8_string = 2,
+    utf8 = 3,
+
+    fn mime(self: TextMime) [*:0]const u8 {
+        return switch (self) {
+            .utf8 => "text/plain;charset=utf-8",
+            .utf8_string => "UTF8_STRING",
+            .plain => "text/plain",
+            .none => unreachable,
+        };
+    }
+};
+
 const BufferSlot = struct {
     buffer: ?*wl.Buffer = null,
     pixels: []u32 = &.{},
@@ -84,6 +102,7 @@ pub const Window = struct {
     cursor_shapes: ?*wl.CursorShapeManager = null,
     viewporter: ?*wl.Viewporter = null,
     fractional_manager: ?*wl.FractionalScaleManager = null,
+    data_device_manager: ?*wl.DataDeviceManager = null,
 
     surface: ?*wl.Surface = null,
     xdg_surface: ?*wl.XdgSurface = null,
@@ -143,6 +162,32 @@ pub const Window = struct {
     // Stato massimizzato, come per il fullscreen: rilevato dagli stati del configure,
     // pilota l'icona massimizza/ripristina dei controlli.
     maximized: bool = false,
+
+    // --- keyboard layout translation (xkbcommon) --------------------------------------
+    // Built from the compositor's `wl_keyboard.keymap` fd; a new keymap (layout switch)
+    // replaces all three. Null when setup failed → `on_text` simply never fires.
+    xkb_context: ?*xkb.Context = null,
+    xkb_keymap: ?*xkb.Keymap = null,
+    xkb_state: ?*xkb.State = null,
+
+    // --- clipboard (wl_data_device selection) -----------------------------------------
+    /// Latest keyboard/pointer-button input serial: `set_selection` must be
+    /// authenticated against a recent input event, exactly like move/resize.
+    input_serial: u32 = 0,
+    data_device: ?*wl.DataDevice = null,
+    /// Our outstanding selection source; non-null == WE own the clipboard. Cleared by
+    /// the `cancelled` event when another client takes the selection over.
+    data_source: ?*wl.DataSource = null,
+    /// Window-owned copy of the text behind `data_source` (served in `send`).
+    clip_text: []u8 = &.{},
+    /// Offer introduced by the last `data_offer` event, still collecting mime types;
+    /// `selection` (or a DnD `enter` we ignore) will designate it.
+    pending_offer: ?*wl.DataOffer = null,
+    pending_mime: TextMime = .none,
+    /// The current clipboard content offer (null = empty clipboard), and the best text
+    /// mime it advertised.
+    selection_offer: ?*wl.DataOffer = null,
+    selection_mime: TextMime = .none,
 
     // Panels (title-bar controls, context menu, scrollbars, dlopen plugins) draw over the
     // content, receive input before the app callbacks, and animate off a shared clock.
@@ -266,6 +311,17 @@ pub const Window = struct {
 
         self.wm_base.?.setListener(&wm_base_listener, self);
 
+        // Clipboard endpoint: needs both the manager and the seat from the same
+        // registry burst. Absent either (bare compositor), clipboardSet/Get degrade
+        // to no-ops/null.
+        if (self.data_device_manager) |ddm| {
+            if (self.seat) |seat| {
+                const dev = ddm.getDataDevice(seat);
+                dev.setListener(&data_device_listener, self);
+                self.data_device = dev;
+            }
+        }
+
         const surface = self.compositor.?.createSurface();
         self.surface = surface;
         const xdg_surface = self.wm_base.?.getXdgSurface(surface);
@@ -336,6 +392,16 @@ pub const Window = struct {
         }
         if (self.video_subsurface) |ss| ss.destroy();
         if (self.video_surface) |vs| vs.destroy();
+        if (self.data_source) |s| s.destroy();
+        if (self.pending_offer) |o| {
+            if (o != self.selection_offer) o.destroy();
+        }
+        if (self.selection_offer) |o| o.destroy();
+        if (self.data_device) |d| d.release();
+        if (self.clip_text.len > 0) self.gpa.free(self.clip_text);
+        if (self.xkb_state) |st| xkb.xkb_state_unref(st);
+        if (self.xkb_keymap) |km| xkb.xkb_keymap_unref(km);
+        if (self.xkb_context) |ctx| xkb.xkb_context_unref(ctx);
         if (self.fractional) |f| wl.wl_proxy_destroy(@ptrCast(f));
         if (self.viewport) |v| wl.wl_proxy_destroy(@ptrCast(v));
         if (self.blur) |b| wl.wl_proxy_destroy(@ptrCast(b));
@@ -962,6 +1028,194 @@ pub const Window = struct {
         try f.loadFace(.regular, path);
     }
 
+    // --- clipboard --------------------------------------------------------------------
+
+    /// Take ownership of the system selection (the ctrl+C side): copies `bytes` into a
+    /// window-owned buffer (replacing any previous copy) and offers it as plain UTF-8
+    /// text. Ownership needs a recent input serial, so call it in response to input.
+    /// Window thread only (talks to Wayland objects) — call from an input callback.
+    pub fn clipboardSet(self: *Window, bytes: []const u8) void {
+        const mgr = self.data_device_manager orelse return;
+        const dev = self.data_device orelse return;
+        const copy = self.gpa.dupe(u8, bytes) catch return;
+        if (self.clip_text.len > 0) self.gpa.free(self.clip_text);
+        self.clip_text = copy;
+        // Replace any previous source of ours; the compositor would cancel it anyway
+        // the moment the new one takes the selection.
+        if (self.data_source) |old| {
+            old.destroy();
+            self.data_source = null;
+        }
+        const src = mgr.createDataSource();
+        src.setListener(&data_source_listener, self);
+        src.offer("text/plain;charset=utf-8");
+        src.offer("text/plain");
+        dev.setSelection(src, self.input_serial);
+        self.data_source = src;
+        _ = wl.wl_display_flush(self.display);
+    }
+
+    /// Read the system selection as UTF-8 text (the ctrl+V side). Returns null when the
+    /// clipboard is empty or offers no text, when WE own the selection (use the copy you
+    /// passed to `clipboardSet` — it is byte-identical), or on any I/O failure. The
+    /// caller frees the returned bytes with `gpa`.
+    ///
+    /// Window thread only: it performs a nested roundtrip on the display (fine — the
+    /// same thread owns it, and our own `send` handler can service another client's
+    /// concurrent request during it) and reads the pipe under a ~250 ms poll budget,
+    /// capped at 1 MiB.
+    pub fn clipboardGet(self: *Window, gpa: Allocator) ?[]u8 {
+        if (self.data_source != null) return null; // self-paste: caller's copy is fresher
+        const offer = self.selection_offer orelse return null;
+        if (self.selection_mime == .none) return null;
+        const pipe_fds = posix.pipe2(.{ .CLOEXEC = true }) catch return null;
+        offer.receive(self.selection_mime.mime(), pipe_fds[1]);
+        // Close our write end NOW: the source client holds the only other copy, so its
+        // close after writing is what turns into our EOF.
+        _ = linux.close(pipe_fds[1]);
+        // Push the receive out and give the source a chance to answer immediately.
+        _ = wl.wl_display_flush(self.display);
+        _ = wl.wl_display_roundtrip(self.display);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        const deadline = monotonicNs() + 250 * 1_000_000;
+        var buf: [4096]u8 = undefined;
+        while (out.items.len < 1024 * 1024) {
+            const left_ns = deadline - monotonicNs();
+            if (left_ns <= 0) break; // budget exhausted: slow/stuck source
+            var pfd = [_]posix.pollfd{.{ .fd = pipe_fds[0], .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&pfd, @intCast(@divTrunc(left_ns, 1_000_000) + 1)) catch break;
+            if (ready == 0) break; // timeout
+            const n = posix.read(pipe_fds[0], &buf) catch break;
+            if (n == 0) break; // EOF: transfer complete
+            out.appendSlice(gpa, buf[0..n]) catch {
+                _ = linux.close(pipe_fds[0]);
+                return null;
+            };
+        }
+        _ = linux.close(pipe_fds[0]);
+        if (out.items.len == 0) return null;
+        return out.toOwnedSlice(gpa) catch null;
+    }
+
+    const data_device_listener = wl.DataDevice.Listener{
+        .data_offer = onDataOffer,
+        .enter = onDndEnter,
+        .leave = onDndLeave,
+        .motion = onDndMotion,
+        .drop = onDndDrop,
+        .selection = onSelection,
+    };
+
+    fn onDataOffer(data: ?*anyopaque, _: *wl.DataDevice, offer: *wl.DataOffer) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        // A previously introduced offer that never became the selection (e.g. a DnD
+        // offer we ignored) is dead weight by now — each event introduces a fresh one.
+        if (self.pending_offer) |old| {
+            if (old != self.selection_offer) old.destroy();
+        }
+        self.pending_offer = offer;
+        self.pending_mime = .none;
+        offer.setListener(&data_offer_listener, self);
+    }
+
+    // DnD is out of scope: we never accept drags, so enter/leave/motion/drop stay no-ops
+    // (an unused DnD offer is reaped by the next data_offer/deinit, see onDataOffer).
+    fn onDndEnter(_: ?*anyopaque, _: *wl.DataDevice, _: u32, _: ?*wl.Surface, _: wl.Fixed, _: wl.Fixed, _: ?*wl.DataOffer) callconv(.c) void {}
+    fn onDndLeave(_: ?*anyopaque, _: *wl.DataDevice) callconv(.c) void {}
+    fn onDndMotion(_: ?*anyopaque, _: *wl.DataDevice, _: u32, _: wl.Fixed, _: wl.Fixed) callconv(.c) void {}
+    fn onDndDrop(_: ?*anyopaque, _: *wl.DataDevice) callconv(.c) void {}
+
+    fn onSelection(data: ?*anyopaque, _: *wl.DataDevice, offer: ?*wl.DataOffer) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        // The previous selection offer is superseded — the protocol obliges us to
+        // destroy it. Null = the clipboard was cleared (its owner quit).
+        if (self.selection_offer) |old| {
+            if (old != offer) old.destroy();
+        }
+        self.selection_offer = offer;
+        self.selection_mime = .none;
+        if (offer != null and offer == self.pending_offer) {
+            self.selection_mime = self.pending_mime;
+            self.pending_offer = null;
+            self.pending_mime = .none;
+        }
+    }
+
+    const data_offer_listener = wl.DataOffer.Listener{
+        .offer = onOfferMime,
+        .source_actions = onOfferSourceActions,
+        .action = onOfferAction,
+    };
+
+    fn onOfferMime(data: ?*anyopaque, offer: *wl.DataOffer, mime: [*:0]const u8) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (offer != self.pending_offer) return;
+        const m = std.mem.span(mime);
+        const rank: TextMime = if (std.mem.eql(u8, m, "text/plain;charset=utf-8"))
+            .utf8
+        else if (std.mem.eql(u8, m, "UTF8_STRING"))
+            .utf8_string
+        else if (std.mem.eql(u8, m, "text/plain"))
+            .plain
+        else
+            .none;
+        if (@intFromEnum(rank) > @intFromEnum(self.pending_mime)) self.pending_mime = rank;
+    }
+
+    fn onOfferSourceActions(_: ?*anyopaque, _: *wl.DataOffer, _: u32) callconv(.c) void {}
+    fn onOfferAction(_: ?*anyopaque, _: *wl.DataOffer, _: u32) callconv(.c) void {}
+
+    const data_source_listener = wl.DataSource.Listener{
+        .target = onSourceTarget,
+        .send = onSourceSend,
+        .cancelled = onSourceCancelled,
+        .dnd_drop_performed = onSourceDndDrop,
+        .dnd_finished = onSourceDndFinished,
+        .action = onSourceAction,
+    };
+
+    /// A client wants our selection (possibly DURING a `clipboardGet` roundtrip of ours
+    /// — fine, this needs no reentrancy into Wayland): write the owned text into the
+    /// pipe, looping short writes, then close the fd. A stalled reader is abandoned
+    /// after ~1s so a hostile client can't wedge the window thread.
+    fn onSourceSend(data: ?*anyopaque, _: *wl.DataSource, _: [*:0]const u8, fd: i32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        defer _ = linux.close(fd);
+        const deadline = monotonicNs() + 1_000_000_000;
+        var off: usize = 0;
+        while (off < self.clip_text.len) {
+            const n = posix.write(fd, self.clip_text[off..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    // The receiver made its pipe end non-blocking and it's full: wait
+                    // for drain, bounded.
+                    if (monotonicNs() >= deadline) return;
+                    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                    const ready = posix.poll(&pfd, 100) catch return;
+                    if (ready == 0 and monotonicNs() >= deadline) return;
+                    continue;
+                },
+                else => return, // reader vanished (EPIPE et al.): nothing left to do
+            };
+            if (n == 0) return;
+            off += n;
+        }
+    }
+
+    fn onSourceCancelled(data: ?*anyopaque, source: *wl.DataSource) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        // Another client took the selection over: drop ownership. `clip_text` stays —
+        // it backs nothing anymore but may be mid-`send` on a concurrent transfer.
+        source.destroy();
+        if (self.data_source == source) self.data_source = null;
+    }
+
+    fn onSourceTarget(_: ?*anyopaque, _: *wl.DataSource, _: ?[*:0]const u8) callconv(.c) void {}
+    fn onSourceDndDrop(_: ?*anyopaque, _: *wl.DataSource) callconv(.c) void {}
+    fn onSourceDndFinished(_: ?*anyopaque, _: *wl.DataSource) callconv(.c) void {}
+    fn onSourceAction(_: ?*anyopaque, _: *wl.DataSource, _: u32) callconv(.c) void {}
+
     // --- drawing --------------------------------------------------------------------
 
     /// Smallest panel the chrome stays legible at; also what we advertise as min size.
@@ -1218,6 +1472,9 @@ pub const Window = struct {
             const seat: *wl.Seat = @ptrCast(registry.bind(name, &wl.wl_seat_interface, @min(ver, 5)).?);
             seat.setListener(&seat_listener, self);
             self.seat = seat;
+        } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+            // v3 is current; v1 still covers the selection path we use.
+            self.data_device_manager = @ptrCast(registry.bind(name, &wl.wl_data_device_manager_interface, @min(ver, 3)).?);
         } else if (std.mem.eql(u8, iface, "ext_background_effect_manager_v1")) {
             self.blur_manager = @ptrCast(registry.bind(name, &wl.ext_background_effect_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
@@ -1380,24 +1637,64 @@ pub const Window = struct {
         .repeat_info = onKeyRepeatInfo,
     };
 
-    fn onKeymap(_: ?*anyopaque, _: *wl.Keyboard, _: u32, fd: i32, _: u32) callconv(.c) void {
-        // Keys arrive as raw evdev codes, which is all we need; the xkb keymap fd
-        // would leak if we didn't close it.
-        _ = linux.close(fd);
+    fn onKeymap(data: ?*anyopaque, _: *wl.Keyboard, format: u32, fd: i32, size: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        defer _ = linux.close(fd);
+        // Keys keep flowing to `on_key` as raw evdev codes regardless; the keymap only
+        // feeds the layout-correct `on_text` translation. Any failure below just leaves
+        // `xkb_state` null → on_text never fires (apps fall back to their own mapping).
+        if (format != wl.KEYBOARD_KEYMAP_FORMAT_XKB_V1 or size == 0) return;
+        const map = posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch return;
+        defer posix.munmap(map);
+        if (self.xkb_context == null) self.xkb_context = xkb.xkb_context_new(xkb.CONTEXT_NO_FLAGS);
+        const ctx = self.xkb_context orelse return;
+        // The blob is NUL-terminated per protocol (`size` includes the terminator).
+        const keymap = xkb.xkb_keymap_new_from_string(ctx, @ptrCast(map.ptr), xkb.KEYMAP_FORMAT_TEXT_V1, xkb.KEYMAP_COMPILE_NO_FLAGS) orelse return;
+        const state = xkb.xkb_state_new(keymap) orelse {
+            xkb.xkb_keymap_unref(keymap);
+            return;
+        };
+        // A new keymap (layout switch, keyboard hotplug) replaces the old one wholesale.
+        if (self.xkb_state) |st| xkb.xkb_state_unref(st);
+        if (self.xkb_keymap) |km| xkb.xkb_keymap_unref(km);
+        self.xkb_keymap = keymap;
+        self.xkb_state = state;
     }
 
     fn onKeyEnter(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface, _: ?*anyopaque) callconv(.c) void {}
     fn onKeyLeave(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface) callconv(.c) void {}
 
-    fn onKey(data: ?*anyopaque, _: *wl.Keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
+    fn onKey(data: ?*anyopaque, _: *wl.Keyboard, serial: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
+        self.input_serial = serial;
         const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
         if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
         if (key == wl.KEY_ESC and pressed) self.closed = true;
         if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
+        if (pressed) self.emitText(key);
     }
 
-    fn onKeyModifiers(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+    /// Layout-correct text for a pressed evdev key, additive to `on_key`: 1..4 UTF-8
+    /// bytes via xkbcommon (keycode = evdev + 8), control chars and DEL skipped.
+    fn emitText(self: *Window, key: u32) void {
+        const cb = self.opts.on_text orelse return;
+        const st = self.xkb_state orelse return;
+        var buf: [8]u8 = undefined;
+        const n = xkb.xkb_state_key_get_utf8(st, key + 8, &buf, buf.len);
+        if (n < 1 or n > 4) return; // no text, or beyond one codepoint
+        const len: u8 = @intCast(n);
+        if (len == 1 and (buf[0] < 0x20 or buf[0] == 0x7f)) return;
+        var bytes: [4]u8 = .{ 0, 0, 0, 0 };
+        @memcpy(bytes[0..len], buf[0..len]);
+        cb(self, bytes, len, self.opts.user);
+    }
+
+    fn onKeyModifiers(data: ?*anyopaque, _: *wl.Keyboard, _: u32, depressed: u32, latched: u32, locked: u32, group: u32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        // Feed the compositor-authoritative masks straight into xkb, so shifted/altgr
+        // text comes out right. `group` is the effective layout index.
+        if (self.xkb_state) |st| _ = xkb.xkb_state_update_mask(st, depressed, latched, locked, 0, 0, group);
+    }
     fn onKeyRepeatInfo(_: ?*anyopaque, _: *wl.Keyboard, _: i32, _: i32) callconv(.c) void {}
 
     // --- touch: il dito primario è sintetizzato come pointer (down→press, motion, up→release),
@@ -1523,6 +1820,7 @@ pub const Window = struct {
     fn onPointerButton(data: ?*anyopaque, _: *wl.Pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.pointer_serial = serial;
+        self.input_serial = serial;
         const pressed = state == wl.POINTER_BUTTON_STATE_PRESSED;
         if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = button, .pressed = pressed } })) return;
         if (self.opts.on_mouse) |cb| {
