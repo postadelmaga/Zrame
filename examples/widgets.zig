@@ -25,6 +25,7 @@ const Demo = struct {
     gain: f32 = 42,
     channels: i64 = 32,
     name: std.ArrayList(u8) = .empty,
+    notes: std.ArrayList(u8) = .empty,
     mic: usize = 0,
     pattern: usize = 0,
     selected_row: usize = 0,
@@ -73,7 +74,10 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
             _ = ui.checkbox("Phantom +48V", &demo.phantom);
             _ = ui.slider("Gain", &demo.gain, 0, 100);
             _ = ui.stepper("Input channels", &demo.channels, 8, 128);
+            // Two fields: Tab/Shift+Tab traverses them, shift+arrows select,
+            // ctrl+A/C/X/V share the store clipboard.
             _ = ui.textField("name", &demo.name);
+            _ = ui.textField("notes", &demo.notes);
             _ = ui.dropdown("mic", &mics, &demo.mic);
 
             ui.beginRow();
@@ -166,6 +170,7 @@ pub fn main() !void {
     var demo = Demo{ .gpa = gpa, .store = widget.Store.init(gpa) };
     defer demo.store.deinit();
     defer demo.name.deinit(gpa);
+    defer demo.notes.deinit(gpa);
 
     const win = try zrame.Window.init(gpa, .{
         .title = "zrame — widgets",
