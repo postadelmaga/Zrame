@@ -27,8 +27,10 @@ pub const sdbus = @import("sdbus.zig");
 pub const tray = @import("tray.zig");
 pub const dbusmenu = @import("dbusmenu.zig");
 pub const appmenu = @import("appmenu.zig");
-pub const widget = @import("widget.zig");
-pub const keymap = @import("keymap.zig");
+// The immediate-mode toolkit lives in zicro (it only needs paint/text/anim and the
+// normalized input events); re-exported so zrame apps keep their spelling.
+pub const widget = zicro.widget;
+pub const keymap = zicro.keymap;
 
 pub const Window = window.Window;
 pub const Options = window.Options;

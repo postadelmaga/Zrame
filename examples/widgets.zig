@@ -1,8 +1,8 @@
 //! `zig build run-widgets`
 //!
 //! The widget-toolkit showcase: one glass window whose content is rebuilt every frame
-//! with `zrame.widget` — tabs, buttons, toggles, slider, stepper, text field, dropdown,
-//! a scrollable list, and a modal dialog. This is also the reference wiring for apps:
+//! with `zrame.widget` — tabs, buttons, toggles, radios, slider, stepper, text field,
+//! dropdown, progress bar, spinner, tooltip, a scrollable list, and a modal dialog. This is also the reference wiring for apps:
 //! window callbacks push into an [`widget.InputQueue`]; `on_draw` runs `Ui.begin` →
 //! widgets → `Ui.end`, and requests a repaint while anything animates.
 
@@ -26,9 +26,12 @@ const Demo = struct {
     channels: i64 = 32,
     name: std.ArrayList(u8) = .empty,
     mic: usize = 0,
+    pattern: usize = 0,
     selected_row: usize = 0,
     clicks: u32 = 0,
 };
+
+const patterns = [_][]const u8{ "Cardioid", "Omni", "Figure-8" };
 
 const mics = [_][]const u8{ "SM58", "SM57", "MD421", "e906", "Beta 52A", "C414" };
 const tabs = [_][]const u8{ "Controls", "List", "About" };
@@ -66,11 +69,26 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
             ui.endRow();
 
             _ = ui.toggle("Power", &demo.power);
+            ui.tooltip("Main output power");
             _ = ui.checkbox("Phantom +48V", &demo.phantom);
             _ = ui.slider("Gain", &demo.gain, 0, 100);
             _ = ui.stepper("Input channels", &demo.channels, 8, 128);
             _ = ui.textField("name", &demo.name);
             _ = ui.dropdown("mic", &mics, &demo.mic);
+
+            ui.beginRow();
+            var i: usize = 0;
+            while (i < patterns.len) : (i += 1) _ = ui.radio(patterns[i], &demo.pattern, i);
+            ui.endRow();
+
+            // gain doubles as a progress source; spinner+sweep only while "busy"
+            ui.progressBar(demo.gain / 100);
+            if (demo.power) {
+                ui.beginRow();
+                ui.spinner();
+                ui.endRow();
+                ui.progressIndeterminate();
+            }
         },
         1 => {
             ui.labelDim("A scrollable list (mouse wheel):");
@@ -153,7 +171,7 @@ pub fn main() !void {
         .title = "zrame — widgets",
         .app_id = "dev.zrame.widgets",
         .width = 560,
-        .height = 480,
+        .height = 600,
         .style = zrame.Style.macos(),
         .titlebar = true,
         .on_draw = onDraw,
