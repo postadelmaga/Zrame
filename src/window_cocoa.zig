@@ -232,9 +232,8 @@ pub const Window = struct {
             .toggle_maximize => {}, // native zoom button owns this
             .toggle_fullscreen => self.toggleFullscreen(),
             .close => self.close(),
-            // The native frame handles interactive move/resize and the cursor.
-            .begin_move => {},
-            .begin_resize => {},
+            .begin_move => self.inner.beginMove(),
+            .begin_resize => |edge| self.inner.beginResize(edge),
             .set_cursor => {},
             // The zicro loop repaints every frame; nothing to poke.
             .request_redraw => {},
