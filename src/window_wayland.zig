@@ -1669,7 +1669,7 @@ pub const Window = struct {
         self.input_serial = serial;
         const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
         if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
-        if (key == wl.KEY_ESC and pressed) self.closed = true;
+        if (key == wl.KEY_ESC and pressed and self.opts.close_on_esc) self.closed = true;
         if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
         if (pressed) self.emitText(key);
     }

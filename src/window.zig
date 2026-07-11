@@ -76,6 +76,9 @@ pub const Options = struct {
     titlebar_style: TitlebarStyle = .macos,
     /// Client-drawn right-click window menu (Minimize/Maximize/Full Screen/Close).
     context_menu: bool = true,
+    /// Close the window on ESC (handy for demo/tool windows). Apps that use ESC
+    /// themselves (dialogs, editors) turn this off and decide in `on_key`.
+    close_on_esc: bool = true,
     /// Optional painter invoked after the chrome, before any staged frame:
     /// draws app content directly on the canvas (window thread).
     on_draw: ?*const fn (canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void = null,
