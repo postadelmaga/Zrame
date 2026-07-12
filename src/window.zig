@@ -42,6 +42,8 @@ pub const Window = switch (builtin.os.tag) {
     // into a browser <canvas>. (freestanding wasm falls here, not the Wayland else.)
     else => if (builtin.cpu.arch.isWasm())
         @import("window_web.zig").Window
+    else if (builtin.abi == .android or builtin.abi == .androideabi)
+        @import("window_android.zig").Window
     else
         @import("window_wayland.zig").Window,
 };

@@ -164,4 +164,26 @@ pub fn build(b: *std.Build) void {
         web_step.dependOn(&install_wasm.step);
         web_step.dependOn(&copy_html.step);
     }
+
+    // `zig build android` — compile-check the Android backend (issue #11) for
+    // aarch64-linux-android. A build-obj against a fresh zicro android module: it verifies
+    // window_android.zig type-checks and codegens; the .so link + APK is zicro's #10.
+    {
+        const android_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android });
+        const zicro_android = b.createModule(.{
+            .root_source_file = zicro.path("src/android_root.zig"),
+            .target = android_target,
+            .optimize = .ReleaseSmall,
+        });
+        zicro_android.addIncludePath(zicro.path("vendor/stb")); // stb_truetype.h for text.zig's cImport
+        const check_mod = b.createModule(.{
+            .root_source_file = b.path("src/android_check.zig"),
+            .target = android_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zicro", .module = zicro_android }},
+        });
+        const and_obj = b.addObject(.{ .name = "zrame-android", .root_module = check_mod });
+        const android_step = b.step("android", "Compile-check the Android backend for aarch64-linux-android");
+        android_step.dependOn(&and_obj.step);
+    }
 }
