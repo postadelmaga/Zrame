@@ -108,11 +108,14 @@ pub fn appOrigin(content: Rect, front: *const Staged) struct { x: f32, y: f32 } 
 }
 
 /// Composite the app content into a canvas whose background the backend has already filled:
-/// the `on_draw` overlay, then the newest `front` frame centered in `content`, then the
-/// panel stack on top. No windowing-system call and no lock happens here.
+/// the `on_draw` overlay (over the whole `content`), then the newest `front` frame centered
+/// in `frame_area` — the content minus any gutter the app reserved for its own overlay, so
+/// a side panel doesn't push the frame off-center — then the panel stack on top. No
+/// windowing-system call and no lock happens here.
 pub fn composeContent(
     canvas: *paint.Canvas,
     content: Rect,
+    frame_area: Rect,
     front: *const Staged,
     style: paint.Style,
     panels: *plugin.Registry,
@@ -123,9 +126,9 @@ pub fn composeContent(
     if (on_draw) |draw| draw(canvas, content, user);
 
     if (front.width > 0) {
-        const fw = @min(front.width, content.w);
-        const fh = @min(front.height, content.h);
-        const origin = frameOrigin(content, front.width, front.height);
+        const fw = @min(front.width, frame_area.w);
+        const fh = @min(front.height, frame_area.h);
+        const origin = frameOrigin(frame_area, front.width, front.height);
         const dx = origin.x;
         const dy = origin.y;
         if (fw == front.width) {

@@ -155,6 +155,15 @@ pub const Window = struct {
     // `dirty_full`. Con entrambi vince il full. Consumati da `redraw`.
     dirty_full: bool = false,
     dirty_staged: bool = false,
+    /// Gutter on the RIGHT of the content that the app keeps for its own overlay
+    /// (a side panel drawn in `on_draw`): the frame centers in what is left, so
+    /// opening the panel doesn't leave the same width of dead glass on the other
+    /// side. See `reserveGutter`.
+    gutter_right: std.atomic.Value(u32) = .init(0),
+    /// `invalidate` from another thread: the app's `on_draw` overlay changed
+    /// outside the frame rect, so the next redraw must be a FULL recompose (a
+    /// staged frame alone only damages the frame's own rect).
+    overlay_dirty: std.atomic.Value(bool) = .init(false),
     /// Regione sporca dichiarata dai panel (union dei loro `dirtyBounds` sui
     /// tick di animazione), in pixel buffer. Consumata da `redraw`.
     dirty_rect: ?Rect = null,
@@ -484,6 +493,32 @@ pub const Window = struct {
         }
     }
 
+    /// Keep `px` pixels on the right of the content for the app's own overlay:
+    /// the staged frame then centers in the rest instead of in the full content.
+    /// Safe from any thread; forces a full recompose.
+    pub fn reserveGutter(self: *Window, px: u32) void {
+        self.gutter_right.store(px, .release);
+        self.invalidate();
+    }
+
+    /// The rect a staged frame centers in: the content minus the app's gutter.
+    fn frameArea(self: *Window) Rect {
+        const c = self.contentRect();
+        const g = @min(self.gutter_right.load(.acquire), c.w);
+        return .{ .x = c.x, .y = c.y, .w = c.w - g, .h = c.h };
+    }
+
+    /// Mark the `on_draw` overlay dirty: the next redraw recomposes the whole
+    /// panel instead of just the app frame's rect. Safe from any thread — an
+    /// app whose HUD lives OUTSIDE the frame (status lines, a side panel) must
+    /// call this when that text changes, or the overlay stays frozen on its
+    /// last full paint while the frame keeps moving.
+    pub fn invalidate(self: *Window) void {
+        self.overlay_dirty.store(true, .release);
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
     /// Richiede un resize della finestra da un thread qualsiasi. Deposita il
     /// target e sveglia il run loop, che eseguirà `animateResize` sul thread
     /// finestra: le operazioni sulla surface Wayland (attach/commit) non sono
@@ -553,11 +588,26 @@ pub const Window = struct {
         }
         // The content rect is physical (canvas space); everything handed to the
         // compositor — subsurface position, viewport destination — is logical.
-        const content = self.contentRect();
-        const vw = @min(req.width, content.w);
-        const vh = @min(req.height, content.h);
-        const dx = content.x + (content.w - vw) / 2;
-        const dy = content.y + (content.h - vh) / 2;
+        //
+        // The frame FILLS the content area. Its pixel size is a quality knob (the
+        // resolution tier, dynamic-res, FSR) and has nothing to do with how big
+        // the window is: wp_viewport scales the buffer up to the content rect on
+        // the compositor's scanout path, for free. Presenting the buffer at its
+        // native size instead — which is what we used to do — left a fat border
+        // of empty glass around anything rendered below the window's size.
+        const content = self.frameArea();
+        var vw = content.w;
+        var vh = content.h;
+        var dx = content.x;
+        var dy = content.y;
+        if (self.video_viewport == null) {
+            // No wp_viewporter: we cannot scale, so fall back to the old centred,
+            // cropped placement — the frame is shown 1:1 wherever it fits.
+            vw = @min(req.width, content.w);
+            vh = @min(req.height, content.h);
+            dx = content.x + (content.w - vw) / 2;
+            dy = content.y + (content.h - vh) / 2;
+        }
         self.video_rect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
         self.video_subsurface.?.setPosition(@intCast(self.logiPx(dx)), @intCast(self.logiPx(dy)));
         if (self.video_viewport) |vp| {
@@ -792,6 +842,11 @@ pub const Window = struct {
             self.pending_resize = null;
             self.mutex.unlock();
             if (rr) |wh| self.animateResize(wh[0], wh[1]);
+
+            if (self.overlay_dirty.swap(false, .acquire)) {
+                self.dirty_full = true;
+                self.needs_redraw = true;
+            }
 
             if (self.configured and self.needs_redraw) try self.redraw();
         }
@@ -1435,12 +1490,12 @@ pub const Window = struct {
                     @memcpy(pixels[off .. off + r.w], self.decor[off .. off + r.w]);
                 }
                 _ = canvas.setClip(r.x, r.y, r.w, r.h);
-                chrome.composeContent(&canvas, self.contentRect(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+                chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
             }
             return;
         }
         @memcpy(pixels, self.decor);
-        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Wayland present path: size the shm buffers, acquire a free slot, compose
@@ -1469,7 +1524,7 @@ pub const Window = struct {
         var full = self.dirty_full;
         var partial: ?Rect = null;
         if (self.front.width > 0) {
-            const r = chrome.frameRect(self.contentRect(), self.front.width, self.front.height);
+            const r = chrome.frameRect(self.frameArea(), self.front.width, self.front.height);
             if (self.dirty_staged) {
                 // Primo frame (nessun rect precedente) → full.
                 if (self.last_front_rect) |prev| partial = plugin.unionOf(prev, r) else full = true;
@@ -1929,7 +1984,7 @@ pub const Window = struct {
     fn appOriginPx(self: *Window) struct { x: f32, y: f32 } {
         if (self.video_rect) |r|
             return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y) };
-        const o = chrome.appOrigin(self.contentRect(), &self.front);
+        const o = chrome.appOrigin(self.frameArea(), &self.front);
         return .{ .x = o.x, .y = o.y };
     }
 

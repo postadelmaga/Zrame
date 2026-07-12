@@ -291,7 +291,7 @@ pub const Window = struct {
         // Panels animate on the frame clock (the zicro loop is a steady ~60 Hz).
         _ = self.panels.tick(0.016, self.host());
         chrome.swapFront(&self.lock, &self.staged, &self.front);
-        chrome.composeContent(canvas, self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {

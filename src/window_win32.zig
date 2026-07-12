@@ -807,7 +807,7 @@ pub const Window = struct {
         if (self.opaque_mode) @memset(self.frame, 0xFF141414) else @memcpy(self.frame, self.decor);
         var canvas = paint.Canvas.init(self.frame, bw, bh);
         chrome.swapFront(&self.lock, &self.staged, &self.front);
-        chrome.composeContent(&canvas, self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(&canvas, self.contentRect(), self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Compose and push the whole window. Glass (default): per-pixel alpha via
