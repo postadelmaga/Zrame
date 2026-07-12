@@ -319,4 +319,18 @@ pub const Controls = struct {
         self.reveal = nr;
         return active;
     }
+
+    /// Damage hint: le animazioni della barra (hover/reveal) vivono tutte nella
+    /// banda del titolo — il present parziale ricompone solo quella.
+    pub fn dirtyBounds(self: *Controls, host: plugin.Host) ?plugin.Rect {
+        const info = host.info();
+        if (info.fullscreen) return null;
+        const b = self.bar(info);
+        return .{
+            .x = @intFromFloat(@max(0.0, b.x)),
+            .y = @intFromFloat(@max(0.0, b.y)),
+            .w = @intFromFloat(@ceil(@max(0.0, b.w))),
+            .h = @intFromFloat(@ceil(@max(0.0, b.h + 1.0))), // +1: separatore sotto la barra
+        };
+    }
 };

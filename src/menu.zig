@@ -218,6 +218,19 @@ pub const Menu = struct {
         return moved;
     }
 
+    /// Damage hint: il popup (con lo slide verticale di apertura e il ring 1px),
+    /// o nulla quando è chiuso e la dissolvenza è finita.
+    pub fn dirtyBounds(self: *Menu, host: plugin.Host) ?plugin.Rect {
+        if (!self.open and self.anim <= 0.001) return null;
+        const b = self.box(host, host.info());
+        return .{
+            .x = @intFromFloat(@max(0.0, b.x - 2.0)),
+            .y = @intFromFloat(@max(0.0, b.y - 8.0)), // slide di 6px verso l'alto + ring
+            .w = @intFromFloat(@ceil(b.w + 4.0)),
+            .h = @intFromFloat(@ceil(b.h + 10.0)),
+        };
+    }
+
     // --- helpers -----------------------------------------------------------------------
 
     fn shouldOpenAt(self: *Menu, info: plugin.Info, x: f32, y: f32) bool {

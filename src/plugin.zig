@@ -23,6 +23,15 @@ const text = zicro.text;
 /// the [`paint.Canvas`] and the pointer events (surface-local == buffer-local here).
 pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
 
+/// Bounding box dell'unione di due rect (per l'accumulo del damage).
+pub fn unionOf(a: Rect, b: Rect) Rect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    const x1 = @max(a.x + a.w, b.x + b.w);
+    const y1 = @max(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
 /// An input event delivered to panels. Coordinates are canvas pixels (include the shadow
 /// gutter margin), matching what a panel sees when it draws. Richer than zicro's
 /// `input.InputEvent`: buttons/axes carry a position, scroll carries a real axis and a
@@ -110,7 +119,16 @@ pub const Panel = struct {
         tick: *const fn (ptr: *anyopaque, dt: f32, host: Host) bool,
         /// Release resources. `null` for borrowed (caller-owned) panels.
         deinit: ?*const fn (ptr: *anyopaque, gpa: Allocator) void,
+        /// Optional damage hint: the canvas rect this panel's animations may touch
+        /// (superset of anything it drew or just stopped drawing), or null when it
+        /// currently draws nothing. Panels WITHOUT this fn force a full redraw on
+        /// every animation tick (safe default).
+        dirty_bounds: ?*const fn (ptr: *anyopaque, host: Host) ?Rect,
     };
+
+    /// Damage hint of a panel: `unknown` (no `dirtyBounds` — caller must repaint
+    /// everything), `none` (draws nothing right now), or a canvas rect.
+    pub const Dirty = union(enum) { unknown, none, rect: Rect };
 
     /// Build a `Panel` from `*T`, deriving the vtable from `T`'s methods. `T.draw` and
     /// `T.onInput` are required; `T.tick` and `T.deinit` are optional.
@@ -129,11 +147,15 @@ pub const Panel = struct {
             fn deinitFn(ptr: *anyopaque, gpa: Allocator) void {
                 T.deinit(@ptrCast(@alignCast(ptr)), gpa);
             }
+            fn dirtyFn(ptr: *anyopaque, host: Host) ?Rect {
+                return T.dirtyBounds(@ptrCast(@alignCast(ptr)), host);
+            }
             const vtable = VTable{
                 .draw = drawFn,
                 .on_input = inputFn,
                 .tick = tickFn,
                 .deinit = if (@hasDecl(T, "deinit")) deinitFn else null,
+                .dirty_bounds = if (@hasDecl(T, "dirtyBounds")) dirtyFn else null,
             };
         };
         return .{ .ptr = instance, .vtable = &gen.vtable };
@@ -147,6 +169,11 @@ pub const Panel = struct {
     }
     pub inline fn tick(self: Panel, dt: f32, host: Host) bool {
         return self.vtable.tick(self.ptr, dt, host);
+    }
+
+    pub inline fn dirty(self: Panel, host: Host) Dirty {
+        const f = self.vtable.dirty_bounds orelse return .unknown;
+        return if (f(self.ptr, host)) |r| .{ .rect = r } else .none;
     }
 };
 
@@ -210,6 +237,24 @@ pub const Registry = struct {
         return active;
     }
 
+    /// Bounding box di ciò che i panel possono aver toccato (union dei
+    /// `dirtyBounds`): `.rect` per il damage parziale, `.none` se nessun panel
+    /// disegna nulla, `.unknown` se ALMENO un panel non sa dichiararlo — il
+    /// chiamante allora ridisegna tutto (default conservativo).
+    pub fn dirtyBounds(self: *Registry, host: Host) Panel.Dirty {
+        var acc: Panel.Dirty = .none;
+        for (self.panels.items) |e| switch (e.panel.dirty(host)) {
+            .unknown => return .unknown,
+            .none => {},
+            .rect => |r| acc = switch (acc) {
+                .none => .{ .rect = r },
+                .rect => |cur| .{ .rect = unionOf(cur, r) },
+                .unknown => unreachable,
+            },
+        };
+        return acc;
+    }
+
     pub fn deinit(self: *Registry) void {
         for (self.panels.items) |e| {
             if (e.owned) if (e.panel.vtable.deinit) |d| d(e.panel.ptr, self.gpa);
@@ -261,6 +306,8 @@ const TestPanel = struct {
         _ = host;
         self.draws += 1;
     }
+    // Note: no `dirtyBounds` — so a bare TestPanel reports `.unknown` (forces a
+    // full redraw). The damage-declaring variant is `DirtyPanel` below.
     fn onInput(self: *TestPanel, event: Event, host: Host) bool {
         _ = event;
         _ = host;
@@ -349,4 +396,61 @@ test "owned panels are deinited, borrowed ones are not" {
 
     try std.testing.expect(owned_deinited);
     try std.testing.expect(!borrowed_deinited);
+}
+
+/// A panel that declares a damage rect (or none), used to exercise `dirtyBounds`.
+const DirtyPanel = struct {
+    bounds: ?Rect,
+    fn draw(_: *DirtyPanel, _: *paint.Canvas, _: Host) void {}
+    fn onInput(_: *DirtyPanel, _: Event, _: Host) bool {
+        return false;
+    }
+    fn dirtyBounds(self: *DirtyPanel, _: Host) ?Rect {
+        return self.bounds;
+    }
+};
+
+test "registry dirtyBounds: one panel without the hook forces unknown (full redraw)" {
+    const gpa = std.testing.allocator;
+    var d = false;
+    var declares = DirtyPanel{ .bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 } };
+    var opaque_panel = TestPanel{ .deinited = &d }; // no dirtyBounds → unknown
+
+    var reg = Registry.init(gpa);
+    defer reg.deinit();
+    try reg.add(Panel.of(DirtyPanel, &declares), false);
+    try reg.add(Panel.of(TestPanel, &opaque_panel), false);
+
+    try std.testing.expect(reg.dirtyBounds(nullHost()) == .unknown);
+}
+
+test "registry dirtyBounds: unions declared rects, ignores none" {
+    const gpa = std.testing.allocator;
+    var a = DirtyPanel{ .bounds = .{ .x = 10, .y = 10, .w = 20, .h = 20 } }; // → (10,10)-(30,30)
+    var b = DirtyPanel{ .bounds = null }; // draws nothing → none
+    var c = DirtyPanel{ .bounds = .{ .x = 40, .y = 5, .w = 10, .h = 10 } }; // → (40,5)-(50,15)
+
+    var reg = Registry.init(gpa);
+    defer reg.deinit();
+    try reg.add(Panel.of(DirtyPanel, &a), false);
+    try reg.add(Panel.of(DirtyPanel, &b), false);
+    try reg.add(Panel.of(DirtyPanel, &c), false);
+
+    const d = reg.dirtyBounds(nullHost());
+    try std.testing.expect(d == .rect);
+    // Union: x0=10,y0=5, x1=50,y1=30 → {10,5,40,25}
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 5, .w = 40, .h = 25 }, d.rect);
+}
+
+test "registry dirtyBounds: all-none reports none" {
+    const gpa = std.testing.allocator;
+    var a = DirtyPanel{ .bounds = null };
+    var b = DirtyPanel{ .bounds = null };
+
+    var reg = Registry.init(gpa);
+    defer reg.deinit();
+    try reg.add(Panel.of(DirtyPanel, &a), false);
+    try reg.add(Panel.of(DirtyPanel, &b), false);
+
+    try std.testing.expect(reg.dirtyBounds(nullHost()) == .none);
 }

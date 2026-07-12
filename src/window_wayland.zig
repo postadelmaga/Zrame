@@ -104,17 +104,9 @@ const SlotDamage = struct {
             return;
         }
         if (self.full) return;
-        if (rect) |r| self.rect = if (self.rect) |cur| unionRect(cur, r) else r;
+        if (rect) |r| self.rect = if (self.rect) |cur| plugin.unionOf(cur, r) else r;
     }
 };
-
-fn unionRect(a: Rect, b: Rect) Rect {
-    const x0 = @min(a.x, b.x);
-    const y0 = @min(a.y, b.y);
-    const x1 = @max(a.x + a.w, b.x + b.w);
-    const y1 = @max(a.y + a.h, b.y + b.h);
-    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
-}
 
 pub const Window = struct {
     gpa: Allocator,
@@ -163,6 +155,9 @@ pub const Window = struct {
     // `dirty_full`. Con entrambi vince il full. Consumati da `redraw`.
     dirty_full: bool = false,
     dirty_staged: bool = false,
+    /// Regione sporca dichiarata dai panel (union dei loro `dirtyBounds` sui
+    /// tick di animazione), in pixel buffer. Consumata da `redraw`.
+    dirty_rect: ?Rect = null,
     /// Rect canvas dell'ultimo frame app composto: quando il frame cambia
     /// dimensione/posizione la regione damage è l'UNIONE di vecchio e nuovo
     /// (altrimenti il bordo del frame vecchio resterebbe come ghost).
@@ -287,6 +282,10 @@ pub const Window = struct {
     // wl_buffers are created once per slot and reused every frame.
     video_surface: ?*wl.Surface = null,
     video_subsurface: ?*wl.Subsurface = null,
+    /// Maps the physically-sized video buffer to its logical on-screen size on
+    /// fractionally scaled outputs — without it the compositor would present
+    /// the buffer 1:1 in logical units, i.e. oversized by the scale factor.
+    video_viewport: ?*wl.Viewport = null,
     // 8 slots: enough for a few resolution tiers × double buffering.
     video_buffers: [8]?*wl.Buffer = @splat(null),
     staged_dma: ?StagedDma = null,
@@ -295,6 +294,19 @@ pub const Window = struct {
     /// `videoBusy` to pace themselves to the refresh rate instead of
     /// free-running (mailbox semantics: staging while busy replaces).
     video_pending: std.atomic.Value(bool) = .init(false),
+    /// Physical rect the dmabuf frame occupies (window thread only): the app
+    /// origin for pointer coordinates while the video plane is live, mirroring
+    /// what `chrome.appOrigin` does for staged RGBA frames.
+    video_rect: ?Rect = null,
+    /// Size each cached slot wl_buffer was created at — a present at a
+    /// different size recreates the buffer, so producers may change resolution
+    /// (window resize) without exhausting slots.
+    video_buf_sizes: [8][2]u32 = @splat(.{ 0, 0 }),
+    /// LIFO of dismissable layers: ESC pops the topmost before `close_on_esc`
+    /// gets a say (menus still handle their own ESC first, via routeInput).
+    /// Window-thread only; apps push from callbacks or before `run`.
+    dismissables: [8]Dismissable = undefined,
+    n_dismissables: usize = 0,
 
     // --- attesa vsync (`waitFrame`) -----------------------------------------------
     // Contatore dei frame callback del compositor sulla surface principale: il
@@ -429,6 +441,7 @@ pub const Window = struct {
         for (self.video_buffers) |vb| {
             if (vb) |b| b.destroy();
         }
+        if (self.video_viewport) |v| wl.wl_proxy_destroy(@ptrCast(v));
         if (self.video_subsurface) |ss| ss.destroy();
         if (self.video_surface) |vs| vs.destroy();
         if (self.data_source) |s| s.destroy();
@@ -532,15 +545,36 @@ pub const Window = struct {
             ss.setDesync();
             self.video_surface = vs;
             self.video_subsurface = ss;
+            // Fractional HiDPI: the frame is rendered in physical pixels; the
+            // viewport presents it at logical size (identity on scale-1).
+            if (self.viewporter) |vpr| self.video_viewport = vpr.getViewport(vs);
             // Mapping and position are parent state: one chrome commit seals them.
             self.redrawAll();
         }
+        // The content rect is physical (canvas space); everything handed to the
+        // compositor — subsurface position, viewport destination — is logical.
         const content = self.contentRect();
-        const dx = content.x + (content.w -| @min(req.width, content.w)) / 2;
-        const dy = content.y + (content.h -| @min(req.height, content.h)) / 2;
-        self.video_subsurface.?.setPosition(@intCast(dx), @intCast(dy));
+        const vw = @min(req.width, content.w);
+        const vh = @min(req.height, content.h);
+        const dx = content.x + (content.w - vw) / 2;
+        const dy = content.y + (content.h - vh) / 2;
+        self.video_rect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
+        self.video_subsurface.?.setPosition(@intCast(self.logiPx(dx)), @intCast(self.logiPx(dy)));
+        if (self.video_viewport) |vp| {
+            vp.setDestination(@intCast(@max(self.logiPx(vw), 1)), @intCast(@max(self.logiPx(vh), 1)));
+        }
 
+        // A slot re-presented at a new size (producer resized) gets a fresh
+        // wl_buffer; the compositor keeps the old one alive until released.
+        if (self.video_buffers[req.slot]) |b| {
+            const sz = self.video_buf_sizes[req.slot];
+            if (sz[0] != req.width or sz[1] != req.height) {
+                b.destroy();
+                self.video_buffers[req.slot] = null;
+            }
+        }
         if (self.video_buffers[req.slot] == null) {
+            self.video_buf_sizes[req.slot] = .{ req.width, req.height };
             const params = self.dmabuf.?.createParams();
             params.add(req.fd, 0, 0, req.stride, req.modifier);
             self.video_buffers[req.slot] = params.createImmed(
@@ -810,7 +844,16 @@ pub const Window = struct {
             0.016;
         self.last_tick_ns = now;
         const panels_active = self.panels.tick(dt, self.host());
-        self.redrawAll();
+        // Damage parziale se OGNI panel sa dichiarare la propria area; basta un
+        // panel senza `dirtyBounds` per ricadere nel full conservativo.
+        switch (self.panels.dirtyBounds(self.host())) {
+            .rect => |r| {
+                self.needs_redraw = true;
+                self.dirty_rect = if (self.dirty_rect) |cur| plugin.unionOf(cur, r) else r;
+            },
+            .unknown => self.redrawAll(),
+            .none => if (panels_active) self.redrawAll(),
+        }
         if (!panels_active) self.disarmTimer();
     }
 
@@ -1288,6 +1331,12 @@ pub const Window = struct {
         return @intCast((@as(u64, v) * self.scale120 + 60) / 120);
     }
 
+    /// Physical → logical pixels, rounded — for values handed to the
+    /// compositor (subsurface positions, viewport destinations).
+    fn logiPx(self: *const Window, v: u32) u32 {
+        return @intCast((@as(u64, v) * 120 + self.scale120 / 2) / self.scale120);
+    }
+
     fn physPxF(self: *const Window, v: f32) f32 {
         return v * @as(f32, @floatFromInt(self.scale120)) / 120.0;
     }
@@ -1411,16 +1460,26 @@ pub const Window = struct {
         // contiene i pixel di due commit fa e al suo turno dovrà ricomporre anche
         // ciò che è cambiato nel frattempo.
         chrome.swapFront(&self.mutex, &self.staged, &self.front);
-        var frame_rect: ?Rect = null;
+        var full = self.dirty_full;
+        var partial: ?Rect = null;
         if (self.front.width > 0) {
             const r = chrome.frameRect(self.contentRect(), self.front.width, self.front.height);
-            if (self.dirty_staged) frame_rect = if (self.last_front_rect) |prev| unionRect(prev, r) else null;
+            if (self.dirty_staged) {
+                // Primo frame (nessun rect precedente) → full.
+                if (self.last_front_rect) |prev| partial = plugin.unionOf(prev, r) else full = true;
+            }
             self.last_front_rect = r;
+        } else if (self.dirty_staged) {
+            full = true;
         }
-        const full = self.dirty_full or frame_rect == null;
+        // Regione dichiarata dai panel (animazioni con `dirtyBounds`).
+        if (self.dirty_rect) |dr| partial = if (partial) |p| plugin.unionOf(p, dr) else dr;
+        // Redraw senza alcuna informazione di regione → conservativo.
+        if (partial == null) full = true;
         self.dirty_full = false;
         self.dirty_staged = false;
-        for (&self.slots) |*s| s.pending.add(full, frame_rect);
+        self.dirty_rect = null;
+        for (&self.slots) |*s| s.pending.add(full, partial);
 
         const region: ?Rect = if (slot.pending.full) null else slot.pending.rect;
         slot.pending = .{ .full = false, .rect = null };
@@ -1782,7 +1841,14 @@ pub const Window = struct {
         self.input_serial = serial;
         const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
         if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
-        if (key == wl.KEY_ESC and pressed and self.opts.close_on_esc) self.closed = true;
+        if (key == wl.KEY_ESC and pressed) {
+            // Layered dismissal: the topmost registered layer eats this ESC.
+            if (self.n_dismissables > 0) {
+                self.n_dismissables -= 1;
+                const d = self.dismissables[self.n_dismissables];
+                d.dismiss(d.ctx);
+            } else if (self.opts.close_on_esc) self.closed = true;
+        }
         if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
         if (pressed) self.emitText(key);
     }
@@ -1823,13 +1889,51 @@ pub const Window = struct {
         .orientation = onTouchOrientation,
     };
 
+    pub const Dismissable = struct {
+        ctx: ?*anyopaque,
+        dismiss: *const fn (ctx: ?*anyopaque) void,
+    };
+
+    /// Register a dismissable layer (popup, panel, overlay): the next ESC
+    /// closes it instead of the window. LIFO — the last pushed goes first.
+    /// Window-thread only; push from callbacks or before `run`.
+    pub fn pushDismissable(self: *Window, ctx: ?*anyopaque, dismiss: *const fn (ctx: ?*anyopaque) void) void {
+        if (self.n_dismissables == self.dismissables.len) return;
+        self.dismissables[self.n_dismissables] = .{ .ctx = ctx, .dismiss = dismiss };
+        self.n_dismissables += 1;
+    }
+
+    /// Remove a layer that dismissed itself by other means (click-away, key).
+    pub fn removeDismissable(self: *Window, ctx: ?*anyopaque) void {
+        var i: usize = 0;
+        while (i < self.n_dismissables) {
+            if (self.dismissables[i].ctx == ctx) {
+                std.mem.copyForwards(
+                    Dismissable,
+                    self.dismissables[i .. self.n_dismissables - 1],
+                    self.dismissables[i + 1 .. self.n_dismissables],
+                );
+                self.n_dismissables -= 1;
+            } else i += 1;
+        }
+    }
+
+    /// App origin for pointer coordinates: the live dmabuf frame's rect when
+    /// the video plane is up, else the staged-frame math of `chrome.appOrigin`.
+    fn appOriginPx(self: *Window) struct { x: f32, y: f32 } {
+        if (self.video_rect) |r|
+            return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y) };
+        const o = chrome.appOrigin(self.contentRect(), &self.front);
+        return .{ .x = o.x, .y = o.y };
+    }
+
     fn touchEmitMotion(self: *Window, fx: f32, fy: f32) void {
         self.pointer_x = fx;
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
         // Mouse in coordinate APP, come il percorso pointer (vedi `MouseEvent`).
         if (self.opts.on_mouse) |cb| {
-            const o = chrome.appOrigin(self.contentRect(), &self.front);
+            const o = self.appOriginPx();
             _ = cb(self, .{ .motion = .{ .x = fx - o.x, .y = fy - o.y } }, self.opts.user);
         }
     }
@@ -1915,9 +2019,9 @@ pub const Window = struct {
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
         if (self.opts.on_mouse) |cb| {
             // Mouse in coordinate APP (vedi `MouseEvent`): canvas meno l'origine del frame
-            // staged (o del content rect), così l'app fa hit-test nello stesso spazio in
-            // cui ha disegnato — pannelli e resize band restano in coordinate canvas.
-            const o = chrome.appOrigin(self.contentRect(), &self.front);
+            // staged/video (o del content rect), così l'app fa hit-test nello stesso
+            // spazio in cui ha disegnato — pannelli e resize band restano in canvas.
+            const o = self.appOriginPx();
             const consumed = cb(self, .{ .motion = .{ .x = fx - o.x, .y = fy - o.y } }, self.opts.user);
             if (consumed) {
                 // The app owns this motion (e.g. hovering/dragging its own scrollbar):

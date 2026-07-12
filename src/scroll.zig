@@ -96,7 +96,35 @@ pub const Scroll = struct {
         self.syncViewport(host);
         return self.inner.tick(dt);
     }
+
+    /// Damage hint: solo le bande dei bar i cui assi sono visibili o in fade —
+    /// di norma una striscia sottile lungo il bordo destro (o inferiore), così il
+    /// fade della scrollbar non ricompone l'intero contenuto.
+    pub fn dirtyBounds(self: *Scroll, host: plugin.Host) ?plugin.Rect {
+        self.syncViewport(host);
+        const vp = self.inner.viewport;
+        // expanded_width (10) + lead-in di grab (8) + margine di sicurezza.
+        const band: f32 = 20.0;
+        var acc: ?plugin.Rect = null;
+        if (self.inner.show[1] > 0.001 or self.inner.bar_hover[1] > 0.001) {
+            acc = bandRect(vp.x + vp.w - band, vp.y, band, vp.h);
+        }
+        if (self.inner.show[0] > 0.001 or self.inner.bar_hover[0] > 0.001) {
+            const r = bandRect(vp.x, vp.y + vp.h - band, vp.w, band);
+            acc = if (acc) |a| plugin.unionOf(a, r) else r;
+        }
+        return acc;
+    }
 };
+
+fn bandRect(x: f32, y: f32, w: f32, h: f32) plugin.Rect {
+    return .{
+        .x = @intFromFloat(@max(0.0, x)),
+        .y = @intFromFloat(@max(0.0, y)),
+        .w = @intFromFloat(@ceil(@max(0.0, w))),
+        .h = @intFromFloat(@ceil(@max(0.0, h))),
+    };
+}
 
 // --- tests ---------------------------------------------------------------------------
 // The scroll behavior itself is covered in `zicro.scroll`; here we just check the panel
