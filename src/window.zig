@@ -38,7 +38,12 @@ pub const Rect = plugin.Rect;
 pub const Window = switch (builtin.os.tag) {
     .windows => @import("window_win32.zig").Window,
     .macos => @import("window_cocoa.zig").Window,
-    else => @import("window_wayland.zig").Window,
+    // WebAssembly: a thin adapter over zicro's web window that paints the glass chrome
+    // into a browser <canvas>. (freestanding wasm falls here, not the Wayland else.)
+    else => if (builtin.cpu.arch.isWasm())
+        @import("window_web.zig").Window
+    else
+        @import("window_wayland.zig").Window,
 };
 
 /// Mouse events delivered to the app's `on_mouse` callback.

@@ -127,4 +127,41 @@ pub fn build(b: *std.Build) void {
     const host_step = b.step("run-plugin", "Run the dlopen plugin host example");
     host_step.dependOn(&host_run.step);
     }
+
+    // `zig build web` — the WebAssembly glass window in a browser tab. wasm32-freestanding,
+    // no libc/Wayland/sd-bus: a fresh zicro module rooted at zicro's web_root (paint + text
+    // + the web Window backend) and a zrame module rooted at its web_root (chrome + panels).
+    {
+        const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+        const zicro_web = b.createModule(.{
+            .root_source_file = zicro.path("src/web_root.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        });
+        zicro_web.addIncludePath(zicro.path("vendor/stb"));
+        zicro_web.addCSourceFile(.{
+            .file = zicro.path("vendor/stb/stb_truetype_web.c"),
+            .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+        });
+        const zrame_web = b.createModule(.{
+            .root_source_file = b.path("src/web_root.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zicro", .module = zicro_web }},
+        });
+        const web_mod = b.createModule(.{
+            .root_source_file = b.path("examples/web.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zrame", .module = zrame_web }},
+        });
+        const web_exe = b.addExecutable(.{ .name = "zrame", .root_module = web_mod });
+        web_exe.entry = .disabled;
+        web_exe.rdynamic = true;
+        const install_wasm = b.addInstallArtifact(web_exe, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+        const copy_html = b.addInstallFileWithDir(b.path("web/index.html"), .{ .custom = "web" }, "index.html");
+        const web_step = b.step("web", "Build the WebAssembly glass-window demo into zig-out/web");
+        web_step.dependOn(&install_wasm.step);
+        web_step.dependOn(&copy_html.step);
+    }
 }
