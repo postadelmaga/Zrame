@@ -265,6 +265,12 @@ pub const Window = struct {
         return .{ .x = 0, .y = 0, .w = self.panel_w, .h = self.panel_h };
     }
 
+    /// Physical size of the content rect — mirrors the other backends' `contentPx`.
+    pub fn contentPx(self: *Window) struct { w: u32, h: u32 } {
+        const r = self.contentRect();
+        return .{ .w = r.w, .h = r.h };
+    }
+
     /// The style used for content compositing: every mask/fade field zeroed so
     /// `blitRgba` takes its trivial fast path — a square opaque window doesn't want
     /// rounded/faded content clipping.
@@ -301,7 +307,12 @@ pub const Window = struct {
                 self.pointer_x = event.x;
                 self.pointer_y = event.y;
                 if (self.panels.route(.{ .motion = .{ .x = event.x, .y = event.y } }, self.host())) return;
-                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .motion = .{ .x = event.x, .y = event.y } }, self.opts.user);
+                // App-space mouse (see `MouseEvent`): canvas minus the staged-frame/content
+                // origin — panels and the resize band stay in canvas coordinates.
+                if (self.opts.on_mouse) |cb| {
+                    const o = chrome.appOrigin(self.contentRect(), &self.front);
+                    _ = cb(self, .{ .motion = .{ .x = event.x - o.x, .y = event.y - o.y } }, self.opts.user);
+                }
             },
             .press, .release => {
                 const pressed = event.kind == .press;

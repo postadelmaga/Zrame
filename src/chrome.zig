@@ -75,6 +75,38 @@ pub fn swapFront(lock: *SpinLock, staged: *Staged, front: *Staged) void {
     }
 }
 
+/// Top-left, in canvas/pointer pixels, where a staged frame of size `fw`×`fh` lands when
+/// centered in `content` — the same math `composeContent` uses for the blit. Apps map
+/// pointer coordinates into frame-local space by subtracting this origin, so draw and
+/// hit-test stay in the same space.
+pub fn frameOrigin(content: Rect, fw: u32, fh: u32) struct { x: u32, y: u32 } {
+    const w = @min(fw, content.w);
+    const h = @min(fh, content.h);
+    return .{ .x = content.x + (content.w - w) / 2, .y = content.y + (content.h - h) / 2 };
+}
+
+/// Canvas-space rectangle a staged frame of `fw`×`fh` occupies when composed:
+/// `frameOrigin` plus the clamped blit size. Used by the backend damage tracking
+/// to recompose only what the frame actually covers.
+pub fn frameRect(content: Rect, fw: u32, fh: u32) Rect {
+    const o = frameOrigin(content, fw, fh);
+    return .{ .x = o.x, .y = o.y, .w = @min(fw, content.w), .h = @min(fh, content.h) };
+}
+
+/// Origin of the app's presentation space in canvas pixels: where its staged frame lands
+/// (or the bare content origin before any frame is staged). Backends subtract this from
+/// pointer coordinates before calling `on_mouse` — the client-coordinates contract of
+/// mainstream toolkits (Win32 client area, Cocoa view coords, SDL logical presentation) —
+/// so an app hit-tests in the very space it drew. Reading `front` here is safe: both
+/// input dispatch and `swapFront` run on the window thread.
+pub fn appOrigin(content: Rect, front: *const Staged) struct { x: f32, y: f32 } {
+    if (front.width > 0) {
+        const o = frameOrigin(content, front.width, front.height);
+        return .{ .x = @floatFromInt(o.x), .y = @floatFromInt(o.y) };
+    }
+    return .{ .x = @floatFromInt(content.x), .y = @floatFromInt(content.y) };
+}
+
 /// Composite the app content into a canvas whose background the backend has already filled:
 /// the `on_draw` overlay, then the newest `front` frame centered in `content`, then the
 /// panel stack on top. No windowing-system call and no lock happens here.
@@ -93,8 +125,9 @@ pub fn composeContent(
     if (front.width > 0) {
         const fw = @min(front.width, content.w);
         const fh = @min(front.height, content.h);
-        const dx = content.x + (content.w - fw) / 2;
-        const dy = content.y + (content.h - fh) / 2;
+        const origin = frameOrigin(content, front.width, front.height);
+        const dx = origin.x;
+        const dy = origin.y;
         if (fw == front.width) {
             // Le righe sorgenti sono contigue: per un frame più alto del contenuto
             // (frame stantio durante uno shrink-resize) basta troncare l'altezza,

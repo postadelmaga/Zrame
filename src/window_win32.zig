@@ -661,6 +661,13 @@ pub const Window = struct {
         return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
     }
 
+    /// Physical size of the content rect — mirrors the Wayland backend's `contentPx`
+    /// (here 1 buffer px = 1 panel px, so it's just the panel minus the title bar).
+    pub fn contentPx(self: *Window) struct { w: u32, h: u32 } {
+        const r = self.contentRect();
+        return .{ .w = r.w, .h = r.h };
+    }
+
     /// Which resize border the buffer point (sx,sy) is over (8px band around the panel), or
     /// `.none`. Coords are buffer-space (include the margin), so shift into panel space first
     /// — matching the Wayland `resizeEdgeAt`.
@@ -1041,9 +1048,12 @@ pub const Window = struct {
                     self.tracking_leave = true;
                 }
                 if (self.routeInput(.{ .motion = .{ .x = p.x, .y = p.y } })) return 0;
-                // Mouse in coordinate CANVAS (come on_draw e i pannelli via routeInput):
-                // l'app usa content.x/y come origine per disegno e hit-test in modo coerente.
-                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .motion = .{ .x = p.x, .y = p.y } }, self.opts.user);
+                // Mouse in coordinate APP (vedi `MouseEvent`): canvas meno l'origine del
+                // frame staged/content rect — pannelli e resize band restano in canvas.
+                if (self.opts.on_mouse) |cb| {
+                    const o = chrome.appOrigin(self.contentRect(), &self.front);
+                    _ = cb(self, .{ .motion = .{ .x = p.x - o.x, .y = p.y - o.y } }, self.opts.user);
+                }
                 return 0;
             },
             WM_MOUSELEAVE => {

@@ -84,7 +84,37 @@ const BufferSlot = struct {
     buffer: ?*wl.Buffer = null,
     pixels: []u32 = &.{},
     busy: bool = false,
+    /// Damage accumulato da quando questo slot è stato composto l'ultima volta
+    /// (il back buffer contiene i pixel di due commit fa): al suo turno ricompone
+    /// l'unione di tutto ciò che è cambiato nel frattempo. Parte `full` così il
+    /// primo compose copre l'intero buffer.
+    pending: SlotDamage = .{},
 };
+
+/// Regione sporca accumulata per uno slot: `full` copre tutto, altrimenti il
+/// bounding box dell'unione dei rect ricevuti (in pixel buffer).
+const SlotDamage = struct {
+    full: bool = true,
+    rect: ?Rect = null,
+
+    fn add(self: *SlotDamage, full: bool, rect: ?Rect) void {
+        if (full) {
+            self.full = true;
+            self.rect = null;
+            return;
+        }
+        if (self.full) return;
+        if (rect) |r| self.rect = if (self.rect) |cur| unionRect(cur, r) else r;
+    }
+};
+
+fn unionRect(a: Rect, b: Rect) Rect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    const x1 = @max(a.x + a.w, b.x + b.w);
+    const y1 = @max(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
 
 pub const Window = struct {
     gpa: Allocator,
@@ -128,6 +158,15 @@ pub const Window = struct {
     panel_h: u32,
     configured: bool = false,
     needs_redraw: bool = false,
+    // Damage del prossimo redraw: `dirty_staged` = c'è un nuovo frame app (regione
+    // = rect del frame); qualunque altro trigger (input/panel/stile/resize) marca
+    // `dirty_full`. Con entrambi vince il full. Consumati da `redraw`.
+    dirty_full: bool = false,
+    dirty_staged: bool = false,
+    /// Rect canvas dell'ultimo frame app composto: quando il frame cambia
+    /// dimensione/posizione la regione damage è l'UNIONE di vecchio e nuovo
+    /// (altrimenti il bordo del frame vecchio resterebbe come ghost).
+    last_front_rect: ?Rect = null,
     // Resize richiesto da un altro thread (protetto da `mutex`): le operazioni
     // sulla surface Wayland NON sono thread-safe, quindi `requestResize` deposita
     // solo il target e il run loop chiama `animateResize` sul thread finestra.
@@ -494,7 +533,7 @@ pub const Window = struct {
             self.video_surface = vs;
             self.video_subsurface = ss;
             // Mapping and position are parent state: one chrome commit seals them.
-            self.needs_redraw = true;
+            self.redrawAll();
         }
         const content = self.contentRect();
         const dx = content.x + (content.w -| @min(req.width, content.w)) / 2;
@@ -684,7 +723,10 @@ pub const Window = struct {
                 const has_frame = self.staged.fresh;
                 self.mutex.unlock();
                 if (has_frame) {
+                    // Nuovo frame app: damage = rect del frame (non full) — la
+                    // regione esatta viene derivata in `redraw` dopo lo swap.
                     self.needs_redraw = true;
+                    self.dirty_staged = true;
                 } else if (had_video and self.opts.on_draw != null) {
                     // Cap the overlay repaint at ~15 Hz. Repainting the whole parent
                     // at video rate saturates this thread — which also dispatches
@@ -695,7 +737,7 @@ pub const Window = struct {
                     const now_ms: i64 = @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
                     if (now_ms - self.last_overlay_ms >= 66) {
                         self.last_overlay_ms = now_ms;
-                        self.needs_redraw = true;
+                        self.redrawAll();
                     }
                 }
             }
@@ -768,8 +810,16 @@ pub const Window = struct {
             0.016;
         self.last_tick_ns = now;
         const panels_active = self.panels.tick(dt, self.host());
-        self.needs_redraw = true;
+        self.redrawAll();
         if (!panels_active) self.disarmTimer();
+    }
+
+    /// Arma un redraw COMPLETO: qualunque trigger che non sia "e' arrivato un nuovo
+    /// frame app" (input, panel, stile, resize, configure) ridisegna tutto — la
+    /// granularita' fine per i panel (bbox) e' un'estensione futura del seam.
+    inline fn redrawAll(self: *Window) void {
+        self.needs_redraw = true;
+        self.dirty_full = true;
     }
 
     fn monotonicNs() i64 {
@@ -782,13 +832,13 @@ pub const Window = struct {
     /// callbacks. `owned` = the registry runs its `deinit` at teardown. Window thread only.
     pub fn addPanel(self: *Window, panel: Panel, owned: bool) !void {
         try self.panels.add(panel, owned);
-        self.needs_redraw = true;
+        self.redrawAll();
     }
 
     /// Remove a previously added panel by its instance pointer (runs `deinit` if owned).
     pub fn removePanel(self: *Window, ptr: *anyopaque) void {
         self.panels.remove(ptr);
-        self.needs_redraw = true;
+        self.redrawAll();
     }
 
     /// Load a single plugin `.so` and let it register its panels (see `plugin.loadPlugin`).
@@ -796,7 +846,7 @@ pub const Window = struct {
     pub fn loadPlugin(self: *Window, path: []const u8) !void {
         const lib = try plugin.loadPlugin(&self.panels, path);
         try self.plugin_libs.append(self.gpa, lib);
-        self.needs_redraw = true;
+        self.redrawAll();
     }
 
     /// Load every `*.so` in `dir_path`. Missing directory is a no-op; a plugin that fails
@@ -836,7 +886,7 @@ pub const Window = struct {
                 if (self.seat) |s| t.resize(s, self.pointer_serial, edge);
             },
             .set_cursor => |shape| self.setCursorShape(shape),
-            .request_redraw => self.needs_redraw = true,
+            .request_redraw => self.redrawAll(),
         }
     }
 
@@ -900,7 +950,7 @@ pub const Window = struct {
     /// self-disarms on the first tick that reports nothing left to animate.
     fn routeInput(self: *Window, event: plugin.Event) bool {
         const consumed = self.panels.route(event, self.host());
-        if (consumed) self.needs_redraw = true;
+        if (consumed) self.redrawAll();
         self.armTimer();
         return consumed;
     }
@@ -937,7 +987,7 @@ pub const Window = struct {
         const m = style.margin;
         try self.repaintDecor(self.panel_w + 2 * m, self.panel_h + 2 * m);
         self.applySurfaceMetrics();
-        self.needs_redraw = true;
+        self.redrawAll();
     }
 
     /// Alterna la modalità a schermo intero. Si limita a chiedere/rilasciare il
@@ -986,7 +1036,7 @@ pub const Window = struct {
         // Non ancora mappata (init, prima del primo map): imposta soltanto — il primo
         // map la centrerà da sé.
         if (!self.configured or self.surface == null) {
-            self.needs_redraw = true;
+            self.redrawAll();
             return;
         }
         // Smappa e rimappa così il compositore rifà il placement e ri-centra la finestra
@@ -1005,7 +1055,7 @@ pub const Window = struct {
         // re-map ne richiede uno nuovo; se il vecchio arriva comunque, gestirne
         // due è innocuo (ogni `done` distrugge solo il proprio wl_callback).
         self.frame_cb_pending = false;
-        self.needs_redraw = true;
+        self.redrawAll();
     }
 
     /// Motore di testo della finestra, creato pigramente col font di default
@@ -1289,6 +1339,15 @@ pub const Window = struct {
         return .{ .x = m, .y = m + tb, .w = @intFromFloat(p.w), .h = @as(u32, @intFromFloat(p.h)) - tb };
     }
 
+    /// Physical (buffer-pixel) size of the content rect — the exact area staged
+    /// frames are composed into. Apps that render and `presentRgba` at THIS size
+    /// fill the panel edge to edge (no centering gutter on scaled outputs) and
+    /// stay 1:1 with the pointer coordinates delivered to `on_mouse`.
+    pub fn contentPx(self: *Window) struct { w: u32, h: u32 } {
+        const r = self.contentRect();
+        return .{ .w = r.w, .h = r.h };
+    }
+
     /// Composite one full window frame into `pixels` (an ARGB8888 buffer sized
     /// `bw`×`bh`). Pure CPU: no windowing-system call happens here. It paints the
     /// chrome decoration, the app `on_draw` overlay, the newest staged content
@@ -1297,10 +1356,35 @@ pub const Window = struct {
     /// This is the platform seam for presentation: every backend — the Wayland
     /// shm path below, or a future Cocoa/Metal path — acquires a writable pixel
     /// buffer its own way, calls this to fill it, then presents it however it can.
-    fn composeFrame(self: *Window, pixels: []u32, bw: u32, bh: u32) void {
-        @memcpy(pixels, self.decor);
+    /// `region == null` → ricomposizione completa (comportamento storico).
+    /// Con una regione: il decor viene ricopiato solo nelle sue righe e
+    /// contenuto+panels vengono ridisegnati col clip del canvas su di essa —
+    /// i pixel fuori regione restano quelli già presenti nello slot (validi
+    /// per costruzione: vedi `SlotDamage`). Lo swap del front è del chiamante
+    /// (`redraw`), che dal frame appena arrivato deriva la regione stessa.
+    /// Nota contratto `on_draw`: il suo output deve cambiare solo a fronte di
+    /// `request_redraw` (full) — un overlay che cambia "da solo" durante un
+    /// redraw parziale resterebbe stantio fuori regione.
+    fn composeFrame(self: *Window, pixels: []u32, bw: u32, bh: u32, region: ?Rect) void {
         var canvas = paint.Canvas.init(pixels, bw, bh);
-        chrome.swapFront(&self.mutex, &self.staged, &self.front);
+        if (region) |r0| {
+            // Clamp difensivo al buffer (regione calcolata da geometrie che un
+            // resize concorrente può aver superato).
+            const x1 = @min(bw, r0.x +| r0.w);
+            const y1 = @min(bh, r0.y +| r0.h);
+            if (r0.x < x1 and r0.y < y1) {
+                const r = Rect{ .x = r0.x, .y = r0.y, .w = x1 - r0.x, .h = y1 - r0.y };
+                var y: u32 = r.y;
+                while (y < r.y + r.h) : (y += 1) {
+                    const off = @as(usize, y) * bw + r.x;
+                    @memcpy(pixels[off .. off + r.w], self.decor[off .. off + r.w]);
+                }
+                _ = canvas.setClip(r.x, r.y, r.w, r.h);
+                chrome.composeContent(&canvas, self.contentRect(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+            }
+            return;
+        }
+        @memcpy(pixels, self.decor);
         chrome.composeContent(&canvas, self.contentRect(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
@@ -1312,14 +1396,43 @@ pub const Window = struct {
         const m = self.opts.style.margin;
         const bw = self.physPx(self.panel_w + 2 * m);
         const bh = self.physPx(self.panel_h + 2 * m);
-        if (bw != self.buf_w or bh != self.buf_h) try self.resizeBuffers(bw, bh);
+        if (bw != self.buf_w or bh != self.buf_h) {
+            try self.resizeBuffers(bw, bh);
+            // Buffer nuovi: coordinate del vecchio frame prive di senso.
+            self.last_front_rect = null;
+            self.dirty_full = true;
+        }
 
         const slot = self.freeSlot() orelse return; // both busy: retry on next wake
-        self.composeFrame(slot.pixels, bw, bh);
+
+        // Danno di QUESTO frame: nuovo frame app → unione del rect vecchio/nuovo
+        // (un frame che si restringe deve ripulire il bordo che scopre); qualunque
+        // altro trigger → full. Accumulato su ENTRAMBI gli slot: il back buffer
+        // contiene i pixel di due commit fa e al suo turno dovrà ricomporre anche
+        // ciò che è cambiato nel frattempo.
+        chrome.swapFront(&self.mutex, &self.staged, &self.front);
+        var frame_rect: ?Rect = null;
+        if (self.front.width > 0) {
+            const r = chrome.frameRect(self.contentRect(), self.front.width, self.front.height);
+            if (self.dirty_staged) frame_rect = if (self.last_front_rect) |prev| unionRect(prev, r) else null;
+            self.last_front_rect = r;
+        }
+        const full = self.dirty_full or frame_rect == null;
+        self.dirty_full = false;
+        self.dirty_staged = false;
+        for (&self.slots) |*s| s.pending.add(full, frame_rect);
+
+        const region: ?Rect = if (slot.pending.full) null else slot.pending.rect;
+        slot.pending = .{ .full = false, .rect = null };
+        self.composeFrame(slot.pixels, bw, bh, region);
 
         const surface = self.surface.?;
         surface.attach(slot.buffer, 0, 0);
-        surface.damageBuffer(0, 0, @intCast(bw), @intCast(bh));
+        if (region) |r| {
+            surface.damageBuffer(@intCast(r.x), @intCast(r.y), @intCast(@min(bw -| r.x, r.w)), @intCast(@min(bh -| r.y, r.h)));
+        } else {
+            surface.damageBuffer(0, 0, @intCast(bw), @intCast(bh));
+        }
         // Vsync: chiedi un frame callback per QUESTO commit (la richiesta `frame`
         // è stato double-buffered, va emessa prima del commit), se non ce n'è già
         // uno in volo. Niente commit → niente callback → i waiter di `waitFrame`
@@ -1503,7 +1616,7 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         xdg_surface.ackConfigure(serial);
         self.configured = true;
-        self.needs_redraw = true;
+        self.redrawAll();
         // Before the loop is pumping (init roundtrips) draw right here so the window maps.
         // Once running, only flag it: the loop paints once per iteration, so a burst of
         // resize configures collapses into a single redraw instead of one apiece.
@@ -1714,8 +1827,11 @@ pub const Window = struct {
         self.pointer_x = fx;
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
-        // Mouse in coordinate CANVAS (come il pointer e on_draw), non content-local.
-        if (self.opts.on_mouse) |cb| _ = cb(self, .{ .motion = .{ .x = fx, .y = fy } }, self.opts.user);
+        // Mouse in coordinate APP, come il percorso pointer (vedi `MouseEvent`).
+        if (self.opts.on_mouse) |cb| {
+            const o = chrome.appOrigin(self.contentRect(), &self.front);
+            _ = cb(self, .{ .motion = .{ .x = fx - o.x, .y = fy - o.y } }, self.opts.user);
+        }
     }
 
     fn touchEmitButton(self: *Window, pressed: bool) void {
@@ -1798,10 +1914,11 @@ pub const Window = struct {
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
         if (self.opts.on_mouse) |cb| {
-            // Mouse in coordinate CANVAS: lo stesso spazio del `content` rect passato a
-            // `on_draw` e dei pannelli (routeInput usa fx,fy). Così l'app usa content.x/y
-            // come origine per disegno E hit-test in modo coerente (niente offset titlebar).
-            const consumed = cb(self, .{ .motion = .{ .x = fx, .y = fy } }, self.opts.user);
+            // Mouse in coordinate APP (vedi `MouseEvent`): canvas meno l'origine del frame
+            // staged (o del content rect), così l'app fa hit-test nello stesso spazio in
+            // cui ha disegnato — pannelli e resize band restano in coordinate canvas.
+            const o = chrome.appOrigin(self.contentRect(), &self.front);
+            const consumed = cb(self, .{ .motion = .{ .x = fx - o.x, .y = fy - o.y } }, self.opts.user);
             if (consumed) {
                 // The app owns this motion (e.g. hovering/dragging its own scrollbar):
                 // keep the normal cursor, don't flash the resize arrows over its widget.
@@ -1861,7 +1978,7 @@ pub const Window = struct {
         self.scale120 = scale;
         // Buffer dimensions derive from the scale: the next redraw resizes, repaints
         // the decor and re-applies the viewport destination.
-        self.needs_redraw = true;
+        self.redrawAll();
     }
 
     fn onPointerFrame(_: ?*anyopaque, _: *wl.Pointer) callconv(.c) void {}
