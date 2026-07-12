@@ -63,6 +63,12 @@ pub const Window = struct {
     /// Premultiplied-ARGB scratch the chrome + content compose into, before the
     /// premul→straight conversion into zicro's straight-RGBA canvas.
     decor: []u32 = &.{},
+    /// The painted chrome (shadow + glass panel + border), cached in premul and memcpy'd
+    /// into `decor` each frame instead of re-running the SDF — the Wayland backend's trick.
+    /// Rebuilt only when the size changes. -1 forces the first build.
+    chrome_cache: []u32 = &.{},
+    cache_w: u32 = 0,
+    cache_h: u32 = 0,
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const self = try gpa.create(Window);
@@ -107,6 +113,7 @@ pub const Window = struct {
         self.staged.pixels.deinit(self.gpa);
         self.front.pixels.deinit(self.gpa);
         if (self.decor.len > 0) self.gpa.free(self.decor);
+        if (self.chrome_cache.len > 0) self.gpa.free(self.chrome_cache);
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -229,10 +236,23 @@ pub const Window = struct {
 
     // --- composition / input (zicro callbacks) -----------------------------------------
 
-    fn ensureDecor(self: *Window, n: usize) void {
-        if (self.decor.len >= n) return;
-        if (self.decor.len > 0) self.gpa.free(self.decor);
-        self.decor = self.gpa.alloc(u32, n) catch &.{};
+    fn ensure(self: *Window, buf: *[]u32, n: usize) void {
+        if (buf.len >= n) return;
+        if (buf.len > 0) self.gpa.free(buf.*);
+        buf.* = self.gpa.alloc(u32, n) catch &.{};
+    }
+
+    /// (Re)paint the chrome into the cache only when the window size changed — the SDF is
+    /// the costliest per-pixel work and the panel/shadow are static between resizes.
+    fn refreshChrome(self: *Window, n: usize) void {
+        if (self.cache_w == self.win_w and self.cache_h == self.win_h and self.chrome_cache.len >= n) return;
+        self.ensure(&self.chrome_cache, n);
+        if (self.chrome_cache.len < n) return;
+        @memset(self.chrome_cache[0..n], 0);
+        var cc = paint.Canvas.init(self.chrome_cache[0..n], self.win_w, self.win_h);
+        cc.drawChrome(self.paintStyle());
+        self.cache_w = self.win_w;
+        self.cache_h = self.win_h;
     }
 
     fn innerDraw(canvas: *paint.Canvas, content: zicro.window.Rect, user: ?*anyopaque) void {
@@ -240,20 +260,22 @@ pub const Window = struct {
         self.win_w = @intCast(@max(content.w, 1));
         self.win_h = @intCast(@max(content.h, 1));
         const n = @as(usize, self.win_w) * self.win_h;
-        self.ensureDecor(n);
+        self.ensure(&self.decor, n);
         if (self.decor.len < n or canvas.pixels.len < n) return;
 
-        // Compose the whole window (chrome + content + panels) in PREMULTIPLIED ARGB…
-        @memset(self.decor[0..n], 0);
+        // Cached chrome → decor (a memcpy, not a per-pixel SDF), then compose content +
+        // panels on top, all in PREMULTIPLIED ARGB…
+        self.refreshChrome(n);
+        if (self.chrome_cache.len < n) return;
+        @memcpy(self.decor[0..n], self.chrome_cache[0..n]);
         var pc = paint.Canvas.init(self.decor[0..n], self.win_w, self.win_h);
-        pc.drawChrome(self.paintStyle());
         _ = self.panels.tick(0.016, self.host());
         chrome.swapFront(&self.lock, &self.staged, &self.front);
         const cr = self.contentRect();
         chrome.composeContent(&pc, cr, cr, &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
 
-        // …then convert premul→straight into zicro's browser canvas.
-        premulToStraight(self.decor[0..n], canvas.pixels[0..n]);
+        // …then convert premul→straight into zicro's browser canvas (shared LUT converter).
+        paint.premulToStraightRgba(self.decor[0..n], canvas.pixels[0..n]);
     }
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {
@@ -296,22 +318,3 @@ pub const Window = struct {
     }
 };
 
-/// Premultiplied ARGB8888 (`0xAARRGGBB`) → straight RGBA8888 bytes (`R,G,B,A`), the layout
-/// a browser `ImageData` wants. Un-multiplies by alpha; alpha 0 → a fully transparent px.
-fn premulToStraight(src: []const u32, dst: []u32) void {
-    for (src, dst) |p, *o| {
-        const a: u32 = (p >> 24) & 0xff;
-        if (a == 0) {
-            o.* = 0;
-            continue;
-        }
-        const r: u32 = (p >> 16) & 0xff;
-        const g: u32 = (p >> 8) & 0xff;
-        const b: u32 = p & 0xff;
-        // straight = premul * 255 / a, clamped.
-        const sr: u32 = @min(@as(u32, 255), r * 255 / a);
-        const sg: u32 = @min(@as(u32, 255), g * 255 / a);
-        const sb: u32 = @min(@as(u32, 255), b * 255 / a);
-        o.* = (a << @as(u5, 24)) | (sb << @as(u5, 16)) | (sg << @as(u5, 8)) | sr;
-    }
-}
