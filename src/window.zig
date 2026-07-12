@@ -41,6 +41,15 @@ pub const Window = switch (builtin.os.tag) {
     else => @import("window_wayland.zig").Window,
 };
 
+/// Mouse events delivered to the app's `on_mouse` callback.
+///
+/// Motion coordinates are in the app's PRESENTATION space, not canvas space: the origin
+/// is the top-left of the frame the app last staged with `presentRgba` (zrame centers it
+/// in the content rect), or the content rect itself before any frame is staged. So an
+/// app hit-tests with the same coordinates it drew with, and never sees the shadow
+/// gutter, title bar, or frame-centering offsets — the client-coordinates contract of
+/// mainstream toolkits (Win32 client area, Cocoa view coords, SDL logical presentation).
+/// Chrome-space input (panels, resize bands) stays inside zrame in canvas coordinates.
 pub const MouseEvent = union(enum) {
     motion: struct { x: f32, y: f32 },
     button: struct { button: u32, state: u32 },

@@ -122,9 +122,8 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
     // status footer
     var sbuf: [160]u8 = undefined;
     const status = std.fmt.bufPrint(&sbuf, "clicks {d}   gain {d:.0}   ch {d}   mic {s}   row {d}   name \"{s}\"", .{
-        demo.clicks,          demo.gain, demo.channels,
-        mics[demo.mic],       demo.selected_row + 1,
-        demo.name.items,
+        demo.clicks,    demo.gain,             demo.channels,
+        mics[demo.mic], demo.selected_row + 1, demo.name.items,
     }) catch "";
     ui.gap(8);
     ui.labelDim(status);
@@ -144,8 +143,14 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
 
 fn onMouse(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) bool {
     const demo: *Demo = @ptrCast(@alignCast(user.?));
+    // `on_mouse` arriva in coordinate contenuto (questa app non stagia frame), ma la Ui
+    // disegna sul canvas grezzo con viewport a content.x/y: riporta il mouse in canvas.
+    const c = win.host().info().content;
     switch (event) {
-        .motion => |m| demo.queue.push(.{ .motion = .{ .x = m.x, .y = m.y } }),
+        .motion => |m| demo.queue.push(.{ .motion = .{
+            .x = m.x + @as(f32, @floatFromInt(c.x)),
+            .y = m.y + @as(f32, @floatFromInt(c.y)),
+        } }),
         .button => |b| demo.queue.push(.{ .button = .{ .button = b.button, .pressed = b.state == 1 } }),
         .leave => demo.queue.push(.{ .motion = .{ .x = -1e9, .y = -1e9 } }),
     }
