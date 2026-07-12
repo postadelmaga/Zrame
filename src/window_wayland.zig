@@ -1161,7 +1161,10 @@ pub const Window = struct {
         if (self.data_source != null) return null; // self-paste: caller's copy is fresher
         const offer = self.selection_offer orelse return null;
         if (self.selection_mime == .none) return null;
-        const pipe_fds = posix.pipe2(.{ .CLOEXEC = true }) catch return null;
+        // std.posix.pipe2 non esiste in questa toolchain: syscall raw come il resto
+        // del file (linux.write/close/eventfd).
+        var pipe_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) != .SUCCESS) return null;
         offer.receive(self.selection_mime.mime(), pipe_fds[1]);
         // Close our write end NOW: the source client holds the only other copy, so its
         // close after writing is what turns into our EOF.
@@ -1279,8 +1282,11 @@ pub const Window = struct {
         const deadline = monotonicNs() + 1_000_000_000;
         var off: usize = 0;
         while (off < self.clip_text.len) {
-            const n = posix.write(fd, self.clip_text[off..]) catch |err| switch (err) {
-                error.WouldBlock => {
+            // std.posix.write assente in questa toolchain: syscall raw + decode errno.
+            const rc = linux.write(fd, self.clip_text.ptr + off, self.clip_text.len - off);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .AGAIN => {
                     // The receiver made its pipe end non-blocking and it's full: wait
                     // for drain, bounded.
                     if (monotonicNs() >= deadline) return;
@@ -1290,9 +1296,9 @@ pub const Window = struct {
                     continue;
                 },
                 else => return, // reader vanished (EPIPE et al.): nothing left to do
-            };
-            if (n == 0) return;
-            off += n;
+            }
+            if (rc == 0) return;
+            off += rc;
         }
     }
 
