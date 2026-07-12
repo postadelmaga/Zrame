@@ -595,14 +595,17 @@ pub const Window = struct {
         // the compositor's scanout path, for free. Presenting the buffer at its
         // native size instead — which is what we used to do — left a fat border
         // of empty glass around anything rendered below the window's size.
+        //
+        // Unless the window says otherwise: `video_fit = .native` is for a render
+        // that is a PANEL inside a larger card (the rest of the content rect is
+        // `on_draw`'s text), where filling would paint over it. Without a
+        // viewporter we cannot scale at all, so that is the only thing we can do.
         const content = self.frameArea();
         var vw = content.w;
         var vh = content.h;
         var dx = content.x;
         var dy = content.y;
-        if (self.video_viewport == null) {
-            // No wp_viewporter: we cannot scale, so fall back to the old centred,
-            // cropped placement — the frame is shown 1:1 wherever it fits.
+        if (self.video_viewport == null or self.opts.video_fit == .native) {
             vw = @min(req.width, content.w);
             vh = @min(req.height, content.h);
             dx = content.x + (content.w - vw) / 2;

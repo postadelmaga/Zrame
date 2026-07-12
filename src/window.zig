@@ -68,6 +68,20 @@ pub const TrayConfig = struct {
     on_activate: ?*const fn (window: *Window, user: ?*anyopaque) void = null,
 };
 
+/// How a presented GPU frame (`presentDmabuf`) is placed in the content rect.
+pub const VideoFit = enum {
+    /// The frame FILLS the content rect (wp_viewport scales it on the scanout
+    /// path, for free). Its pixel size is then a quality knob — the resolution
+    /// tier, dynamic-res, FSR — and not a statement about how big the window is.
+    /// This is what a window whose whole content IS the render wants; anything
+    /// else leaves a border of empty glass around it.
+    fill,
+    /// The frame is presented at its native size, centered. For a window whose
+    /// render is a PANEL inside a larger card — the rest of the content rect
+    /// belongs to `on_draw` (text, chrome) and must not be painted over.
+    native,
+};
+
 pub const Options = struct {
     title: [:0]const u8 = "zrame",
     app_id: [:0]const u8 = "dev.zrame.window",
@@ -83,6 +97,8 @@ pub const Options = struct {
     titlebar_height: u32 = 38,
     /// Traffic-lights (macOS) or right-aligned buttons (Material). Default macOS.
     titlebar_style: TitlebarStyle = .macos,
+    /// Where a staged GPU frame lands in the content rect (see [`VideoFit`]).
+    video_fit: VideoFit = .fill,
     /// Client-drawn right-click window menu (Minimize/Maximize/Full Screen/Close).
     context_menu: bool = true,
     /// Close the window on ESC (handy for demo/tool windows). Apps that use ESC
