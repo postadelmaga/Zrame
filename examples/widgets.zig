@@ -12,11 +12,6 @@ const widget = zrame.widget;
 
 const Demo = struct {
     gpa: std.mem.Allocator,
-    window: ?*zrame.Window = null,
-    queue: widget.InputQueue = .{},
-    store: widget.Store,
-    // The macos() glass is light — pair the light theme (dark() suits darker styles).
-    theme: widget.Theme = widget.Theme.light(),
 
     // app state driven by the widgets
     tab: usize = 0,
@@ -38,25 +33,11 @@ const patterns = [_][]const u8{ "Cardioid", "Omni", "Figure-8" };
 const mics = [_][]const u8{ "SM58", "SM57", "MD421", "e906", "Beta 52A", "C414" };
 const tabs = [_][]const u8{ "Controls", "List", "About" };
 
-fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
+// The whole app is this one function: `zrame.Widgets` runs `Ui.begin → build →
+// Ui.end`, wires the callbacks, the input queue and the clipboard, and repaints
+// only while something animates. No app thread, no framebuffer.
+fn build(ui: *widget.Ui, user: ?*anyopaque) void {
     const demo: *Demo = @ptrCast(@alignCast(user.?));
-    const win = demo.window orelse return;
-    const font = win.textFont() catch return;
-
-    var ui = widget.Ui.begin(
-        &demo.store,
-        canvas,
-        font,
-        demo.theme.scaled(win.scaleFactor()),
-        .{
-            .x = @floatFromInt(content.x),
-            .y = @floatFromInt(content.y),
-            .w = @floatFromInt(content.w),
-            .h = @floatFromInt(content.h),
-        },
-        widget.nowMs(),
-        demo.queue.take(),
-    );
 
     ui.heading("zrame widgets");
     _ = ui.tabBar("tabs", &tabs, &demo.tab);
@@ -136,55 +117,6 @@ fn onDraw(canvas: *zrame.Canvas, content: zrame.Rect, user: ?*anyopaque) void {
         if (ui.buttonPrimary("Done")) ui.closeDialog();
         ui.endDialog();
     }
-
-    const report = ui.end();
-    if (report.needs_repaint) win.host().do(.request_redraw);
-}
-
-fn onMouse(win: *zrame.Window, event: zrame.MouseEvent, user: ?*anyopaque) bool {
-    const demo: *Demo = @ptrCast(@alignCast(user.?));
-    // `on_mouse` arriva in coordinate contenuto (questa app non stagia frame), ma la Ui
-    // disegna sul canvas grezzo con viewport a content.x/y: riporta il mouse in canvas.
-    const c = win.host().info().content;
-    switch (event) {
-        .motion => |m| demo.queue.push(.{ .motion = .{
-            .x = m.x + @as(f32, @floatFromInt(c.x)),
-            .y = m.y + @as(f32, @floatFromInt(c.y)),
-        } }),
-        .button => |b| demo.queue.push(.{ .button = .{ .button = b.button, .pressed = b.state == 1 } }),
-        .leave => demo.queue.push(.{ .motion = .{ .x = -1e9, .y = -1e9 } }),
-    }
-    win.host().do(.request_redraw);
-    return false;
-}
-
-fn onKey(win: *zrame.Window, key: u32, state: u32, user: ?*anyopaque) void {
-    const demo: *Demo = @ptrCast(@alignCast(user.?));
-    demo.queue.push(.{ .key = .{ .code = key, .pressed = state == 1 } });
-    win.host().do(.request_redraw);
-}
-
-fn onText(win: *zrame.Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void {
-    const demo: *Demo = @ptrCast(@alignCast(user.?));
-    demo.queue.push(.{ .text = .{ .bytes = bytes, .len = len } });
-    win.host().do(.request_redraw);
-}
-
-// Store ↔ window bridge: copies land on the system clipboard, pastes prefer it.
-fn clipSet(ctx: ?*anyopaque, s: []const u8) void {
-    const win: *zrame.Window = @ptrCast(@alignCast(ctx.?));
-    win.clipboardSet(s);
-}
-
-fn clipGet(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?[]u8 {
-    const win: *zrame.Window = @ptrCast(@alignCast(ctx.?));
-    return win.clipboardGet(gpa);
-}
-
-fn onScroll(win: *zrame.Window, axis: u32, value: i32, user: ?*anyopaque) void {
-    const demo: *Demo = @ptrCast(@alignCast(user.?));
-    demo.queue.push(.{ .scroll = .{ .axis = axis, .px = @as(f32, @floatFromInt(value)) / 256.0 } });
-    win.host().do(.request_redraw);
 }
 
 pub fn main() !void {
@@ -192,29 +124,25 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    var demo = Demo{ .gpa = gpa, .store = widget.Store.init(gpa) };
-    defer demo.store.deinit();
+    var demo = Demo{ .gpa = gpa };
     defer demo.name.deinit(gpa);
     defer demo.notes.deinit(gpa);
     defer demo.memo.deinit(gpa);
 
-    const win = try zrame.Window.init(gpa, .{
+    // The no-thread path: one build function, everything else wired by `Widgets`.
+    var w = zrame.Widgets.init(gpa, widget.Theme.light(), build, &demo);
+    defer w.deinit();
+
+    const win = try zrame.Window.init(gpa, w.options(.{
         .title = "zrame — widgets",
         .app_id = "dev.zrame.widgets",
         .width = 560,
         .height = 600,
         .style = zrame.Style.macos(),
         .titlebar = true,
-        .on_draw = onDraw,
-        .on_mouse = onMouse,
-        .on_key = onKey,
-        .on_text = onText,
-        .on_scroll = onScroll,
-        .user = &demo,
-    });
+    }));
     defer win.deinit();
-    demo.window = win;
-    demo.store.os_clipboard = .{ .ctx = win, .set = clipSet, .get = clipGet };
+    w.attach(win);
 
     try win.run();
 }

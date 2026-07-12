@@ -31,6 +31,7 @@ pub const appmenu = @import("appmenu.zig");
 // normalized input events); re-exported so zrame apps keep their spelling.
 pub const widget = zicro.widget;
 pub const keymap = zicro.keymap;
+pub const widgets = @import("widgets.zig");
 
 pub const Window = window.Window;
 pub const Options = window.Options;
@@ -50,6 +51,7 @@ pub const Registry = plugin.Registry;
 pub const Event = plugin.Event;
 pub const Action = plugin.Action;
 pub const Info = plugin.Info;
+pub const Widgets = widgets.Widgets;
 
 test {
     @import("std").testing.refAllDecls(@This());
