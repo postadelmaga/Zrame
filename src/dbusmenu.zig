@@ -1,31 +1,73 @@
 //! # zrame.dbusmenu — a `com.canonical.dbusmenu` menu, over DBus
 //!
-//! This is the model behind KDE's **Global Menu** (and any `dbusmenu` consumer): the app
-//! exports its menu bar as a DBus object; the host (the Plasma Global Menu applet, the
-//! window-decoration menu button, …) walks it with `GetLayout` and calls back through
-//! `Event` when the user picks something. `window.zig` publishes the object's address to
-//! KWin over the `org_kde_kwin_appmenu` Wayland protocol (see `appmenu.zig`).
+//! The `com.canonical.dbusmenu` model has two consumers, both served by the same object:
+//!  * **KDE Global Menu** — the app exports its menu bar; `window.zig` publishes the object
+//!    address to KWin over `org_kde_kwin_appmenu` (see `appmenu.zig`). This is [`Server`],
+//!    which owns its own bus connection.
+//!  * **A tray icon's context menu** — the `StatusNotifierItem`'s `Menu` property points a
+//!    panel at a `dbusmenu` object *on the tray's own connection*. This is [`Menu`], which
+//!    **attaches to a caller-provided bus** so `tray.zig` can host it beside the SNI object.
 //!
-//! The app describes a static tree of [`Item`]s; we flatten it into integer-id nodes (id 0
-//! is the synthetic root container) and serve the `dbusmenu` interface off sd-bus. The one
-//! fiddly part is `GetLayout`, whose reply is the recursive `(ia{sv}av)` — an id, a
-//! property dict, and an array of variant children, each a nested `(ia{sv}av)`.
+//! [`Server`] is a thin wrapper that opens a bus and attaches one [`Menu`] to it. The app
+//! describes a static tree of [`Item`]s; we flatten it into integer-id nodes (id 0 is the
+//! synthetic root container) and serve the interface. The fiddly part is `GetLayout`, whose
+//! reply is the recursive `(ia{sv}av)` — an id, a property dict, and an array of variant
+//! children, each a nested `(ia{sv}av)`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bus = @import("sdbus.zig");
 
 /// One entry in the menu tree. A plain container (submenu) has `children`; a leaf has an
-/// `on_click`; a rule is `separator = true`. The tree is borrowed for the server's
-/// lifetime — keep it alive (a `const` array literal is fine).
+/// `on_click`; a rule is `separator = true`. A **checkbox** item sets `toggle = true` and
+/// (optionally) a `checked` provider queried live so the panel draws the current state. The
+/// tree is borrowed for the object's lifetime — keep it alive (a `const` array literal is fine).
+///
+/// A checkbox is a *pull*: the app owns the state, `checked` reports it, and `on_click` flips
+/// it. Writing those two callbacks by hand for every toggle is boilerplate — point the item's
+/// `ctx` at a [`Toggle`] and use `Toggle.checkedFn` / `Toggle.clickFn` instead, and clicking
+/// the item flips the checkmark with no app code. Several toggles that share one menu each get
+/// their own `ctx`, so "Denoise ✓ / EQ ✓" is two `Toggle`s and zero callbacks.
 pub const Item = struct {
     label: [:0]const u8 = "",
     enabled: bool = true,
     visible: bool = true,
     separator: bool = false,
+    /// Render as a checkmark item (`toggle-type = checkmark`).
+    toggle: bool = false,
+    /// Live checkmark state, queried each time the panel reads properties. `null` ⇒ off.
+    checked: ?*const fn (ctx: ?*anyopaque) bool = null,
     children: []const Item = &.{},
     /// Invoked when the host reports this item "clicked" (on the window thread).
     on_click: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Per-item context for this item's `checked` / `on_click`, overriding the menu-wide
+    /// `ctx` when set. Lets each toggle carry its own state (e.g. its own [`Toggle`]) while
+    /// still sharing one menu. `null` ⇒ fall back to the menu `ctx`.
+    ctx: ?*anyopaque = null,
+};
+
+/// A boolean menu-checkbox state with ready-made [`Item`] callbacks. Embed one per toggle,
+/// set the item's `toggle = true`, `ctx = &my_toggle`, `checked = Toggle.checkedFn`, and
+/// `on_click = Toggle.clickFn` — clicking then flips `on` and the panel redraws the mark.
+pub const Toggle = struct {
+    on: bool = false,
+
+    /// Flip the state from app code (e.g. to reflect an external change).
+    pub fn flip(self: *Toggle) void {
+        self.on = !self.on;
+    }
+
+    /// Plug into `Item.checked`: reads `on` from an item/menu `ctx` that is a `*Toggle`.
+    pub fn checkedFn(ctx: ?*anyopaque) bool {
+        const self: *const Toggle = @ptrCast(@alignCast(ctx.?));
+        return self.on;
+    }
+
+    /// Plug into `Item.on_click`: flips the `*Toggle` behind the item/menu `ctx`.
+    pub fn clickFn(ctx: ?*anyopaque) void {
+        const self: *Toggle = @ptrCast(@alignCast(ctx.?));
+        self.on = !self.on;
+    }
 };
 
 pub const Config = struct {
@@ -33,7 +75,7 @@ pub const Config = struct {
     items: []const Item,
     /// Object path to export the menu at; must match what we hand KWin.
     object_path: [:0]const u8 = "/MenuBar",
-    /// Opaque context handed to every `on_click`.
+    /// Opaque context handed to every `on_click` / `checked`.
     ctx: ?*anyopaque = null,
 };
 
@@ -42,9 +84,12 @@ const Node = struct {
     children: []i32,
 };
 
-pub const Server = struct {
+/// A `com.canonical.dbusmenu` object attached to a **borrowed** bus connection. Register it
+/// with [`attach`] and drop it with [`detach`]; it never opens or closes the bus itself, so
+/// several objects (an SNI item + its menu) can share one connection and one poll fd.
+pub const Menu = struct {
     gpa: Allocator,
-    bus: ?*bus.Bus = null,
+    bus: ?*bus.Bus, // borrowed — owned by the caller
     slot: ?*bus.Slot = null,
     vtable: [10]bus.Vtable = undefined,
     nodes: []Node = &.{},
@@ -54,52 +99,37 @@ pub const Server = struct {
 
     const iface = "com.canonical.dbusmenu";
 
-    pub fn init(gpa: Allocator, cfg: Config) !*Server {
-        const self = try gpa.create(Server);
+    /// Build the tree and register the `dbusmenu` interface on `b` at `object_path`.
+    pub fn attach(gpa: Allocator, b: *bus.Bus, items: []const Item, object_path: [:0]const u8, ctx: ?*anyopaque) !*Menu {
+        const self = try gpa.create(Menu);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .ctx = cfg.ctx };
-        copyz(&self.path_buf, cfg.object_path);
+        self.* = .{ .gpa = gpa, .bus = b, .ctx = ctx };
+        copyz(&self.path_buf, object_path);
 
-        try self.buildTree(cfg.items);
+        try self.buildTree(items);
         errdefer self.freeTree();
-
-        if (bus.sd_bus_open_user(&self.bus) < 0) return error.MenuBusOpen;
-        errdefer _ = bus.sd_bus_unref(self.bus);
 
         self.buildVtable();
         if (bus.sd_bus_add_object_vtable(self.bus, &self.slot, &self.path_buf, iface, &self.vtable, self) < 0)
             return error.MenuVtable;
-
         return self;
     }
 
-    pub fn deinit(self: *Server) void {
+    /// Unregister and free. Does NOT touch the borrowed bus.
+    pub fn detach(self: *Menu) void {
         _ = bus.sd_bus_slot_unref(self.slot);
-        _ = bus.sd_bus_unref(self.bus);
         self.freeTree();
         self.gpa.destroy(self);
     }
 
-    pub fn fd(self: *Server) i32 {
-        return bus.sd_bus_get_fd(self.bus);
-    }
-    pub fn flush(self: *Server) void {
-        _ = bus.sd_bus_flush(self.bus);
-    }
-    pub fn process(self: *Server) void {
-        while (bus.sd_bus_process(self.bus, null) > 0) {}
-    }
-
-    /// The connection's unique name (":1.NN") — the "service name" KWin needs to find us.
-    pub fn uniqueName(self: *Server) ?[*:0]const u8 {
-        var name: ?[*:0]const u8 = null;
-        if (bus.sd_bus_get_unique_name(self.bus, &name) < 0) return null;
-        return name;
+    /// The object path this menu is exported at (for the SNI `Menu` property).
+    pub fn objectPath(self: *Menu) [*:0]const u8 {
+        return &self.path_buf;
     }
 
     // ── tree flattening ───────────────────────────────────────────────────────
 
-    fn buildTree(self: *Server, items: []const Item) !void {
+    fn buildTree(self: *Menu, items: []const Item) !void {
         var list: std.ArrayList(Node) = .empty;
         errdefer list.deinit(self.gpa);
         _ = try self.addNode(&list, null, items);
@@ -107,7 +137,7 @@ pub const Server = struct {
     }
 
     /// Append a node for `item` (its drop-down being `kids`), recurse, return its id.
-    fn addNode(self: *Server, list: *std.ArrayList(Node), item: ?*const Item, kids: []const Item) !i32 {
+    fn addNode(self: *Menu, list: *std.ArrayList(Node), item: ?*const Item, kids: []const Item) !i32 {
         const id: i32 = @intCast(list.items.len);
         try list.append(self.gpa, .{ .item = item, .children = &.{} });
         const ids = try self.gpa.alloc(i32, kids.len);
@@ -117,7 +147,7 @@ pub const Server = struct {
         return id;
     }
 
-    fn freeTree(self: *Server) void {
+    fn freeTree(self: *Menu) void {
         for (self.nodes) |n| if (n.children.len > 0) self.gpa.free(n.children);
         if (self.nodes.len > 0) self.gpa.free(self.nodes);
         self.nodes = &.{};
@@ -125,7 +155,7 @@ pub const Server = struct {
 
     // ── vtable ────────────────────────────────────────────────────────────────
 
-    fn buildVtable(self: *Server) void {
+    fn buildVtable(self: *Menu) void {
         self.vtable = std.mem.zeroes([10]bus.Vtable);
         self.vtable[0] = bus.startEntry();
         self.vtable[1] = bus.propEntry("Version", "u", getProp);
@@ -148,12 +178,12 @@ pub const Server = struct {
 
     // ── layout serialization ──────────────────────────────────────────────────
 
-    fn valid(self: *Server, id: i32) bool {
+    fn valid(self: *Menu, id: i32) bool {
         return id >= 0 and id < self.nodes.len;
     }
 
     /// Emit one item's `a{sv}` property dict.
-    fn appendProps(self: *Server, reply: ?*bus.Message, id: i32) void {
+    fn appendProps(self: *Menu, reply: ?*bus.Message, id: i32) void {
         _ = bus.sd_bus_message_open_container(reply, bus.TYPE_ARRAY, "{sv}");
         const node = self.nodes[@intCast(id)];
         if (node.item) |it| {
@@ -162,6 +192,11 @@ pub const Server = struct {
             _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "visible"), @as([*:0]const u8, "b"), @as(c_int, @intFromBool(it.visible)));
             if (it.separator)
                 _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "type"), @as([*:0]const u8, "s"), @as([*:0]const u8, "separator"));
+            if (it.toggle) {
+                _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "toggle-type"), @as([*:0]const u8, "s"), @as([*:0]const u8, "checkmark"));
+                const on = if (it.checked) |c| c(if (it.ctx != null) it.ctx else self.ctx) else false;
+                _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "toggle-state"), @as([*:0]const u8, "i"), @as(c_int, @intFromBool(on)));
+            }
         }
         if (node.children.len > 0)
             _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "children-display"), @as([*:0]const u8, "s"), @as([*:0]const u8, "submenu"));
@@ -170,7 +205,7 @@ pub const Server = struct {
 
     /// Emit the recursive `(ia{sv}av)` layout for `id`, descending `depth` levels
     /// (-1 = unlimited).
-    fn appendLayout(self: *Server, reply: ?*bus.Message, id: i32, depth: i32) void {
+    fn appendLayout(self: *Menu, reply: ?*bus.Message, id: i32, depth: i32) void {
         _ = bus.sd_bus_message_open_container(reply, bus.TYPE_STRUCT, "ia{sv}av");
         _ = bus.sd_bus_message_append(reply, "i", @as(c_int, id));
         self.appendProps(reply, id);
@@ -189,7 +224,7 @@ pub const Server = struct {
     // ── method handlers ───────────────────────────────────────────────────────
 
     fn onGetLayout(m: ?*bus.Message, userdata: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {
-        const self: *Server = @ptrCast(@alignCast(userdata.?));
+        const self: *Menu = @ptrCast(@alignCast(userdata.?));
         var parent: i32 = 0;
         var depth: i32 = -1;
         _ = bus.sd_bus_message_read(m, "ii", &parent, &depth);
@@ -204,7 +239,7 @@ pub const Server = struct {
     }
 
     fn onGetGroupProperties(m: ?*bus.Message, userdata: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {
-        const self: *Server = @ptrCast(@alignCast(userdata.?));
+        const self: *Menu = @ptrCast(@alignCast(userdata.?));
         var ids: [512]i32 = undefined;
         var n: usize = 0;
         _ = bus.sd_bus_message_enter_container(m, bus.TYPE_ARRAY, "i");
@@ -231,7 +266,7 @@ pub const Server = struct {
         return bus.sd_bus_send(self.bus, reply, null);
     }
 
-    fn appendGroupEntry(self: *Server, reply: ?*bus.Message, id: i32) void {
+    fn appendGroupEntry(self: *Menu, reply: ?*bus.Message, id: i32) void {
         _ = bus.sd_bus_message_open_container(reply, bus.TYPE_STRUCT, "ia{sv}");
         _ = bus.sd_bus_message_append(reply, "i", @as(c_int, id));
         self.appendProps(reply, id);
@@ -239,7 +274,7 @@ pub const Server = struct {
     }
 
     fn onGetProperty(m: ?*bus.Message, userdata: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {
-        const self: *Server = @ptrCast(@alignCast(userdata.?));
+        const self: *Menu = @ptrCast(@alignCast(userdata.?));
         var id: i32 = 0;
         var name: ?[*:0]const u8 = null;
         _ = bus.sd_bus_message_read(m, "is", &id, &name);
@@ -253,6 +288,9 @@ pub const Server = struct {
             _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "s"), @as([*:0]const u8, it.?.label));
         } else if (it != null and std.mem.eql(u8, key, "enabled")) {
             _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "b"), @as(c_int, @intFromBool(it.?.enabled)));
+        } else if (it != null and it.?.toggle and std.mem.eql(u8, key, "toggle-state")) {
+            const on = if (it.?.checked) |c| c(if (it.?.ctx != null) it.?.ctx else self.ctx) else false;
+            _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "i"), @as(c_int, @intFromBool(on)));
         } else {
             _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "s"), @as([*:0]const u8, ""));
         }
@@ -260,22 +298,66 @@ pub const Server = struct {
     }
 
     fn onEvent(m: ?*bus.Message, userdata: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {
-        const self: *Server = @ptrCast(@alignCast(userdata.?));
+        const self: *Menu = @ptrCast(@alignCast(userdata.?));
         var id: i32 = 0;
         var event: ?[*:0]const u8 = null;
         _ = bus.sd_bus_message_read(m, "is", &id, &event);
         const name = if (event) |e| std.mem.span(e) else "";
         if (std.mem.eql(u8, name, "clicked") and self.valid(id)) {
             if (self.nodes[@intCast(id)].item) |it| {
-                if (it.on_click) |cb| cb(self.ctx);
+                if (it.on_click) |cb| cb(if (it.ctx != null) it.ctx else self.ctx);
             }
         }
         return bus.sd_bus_reply_method_return(m, "");
     }
 
     fn onAboutToShow(m: ?*bus.Message, _: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {
-        // Static menu: nothing to rebuild, so no update is needed.
+        // Static tree: layout never changes. Toggle-states are re-read via GetGroupProperties
+        // when the panel opens, so we report "no layout update needed".
         return bus.sd_bus_reply_method_return(m, "b", @as(c_int, 0));
+    }
+};
+
+/// A standalone `dbusmenu` service on its own connection — the KDE Global Menu path. Owns a
+/// bus and one attached [`Menu`]; publish `uniqueName()` to KWin via `appmenu.zig`.
+pub const Server = struct {
+    gpa: Allocator,
+    bus: ?*bus.Bus = null,
+    menu: *Menu = undefined,
+
+    pub fn init(gpa: Allocator, cfg: Config) !*Server {
+        const self = try gpa.create(Server);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa };
+
+        if (bus.sd_bus_open_user(&self.bus) < 0) return error.MenuBusOpen;
+        errdefer _ = bus.sd_bus_unref(self.bus);
+
+        self.menu = try Menu.attach(gpa, self.bus.?, cfg.items, cfg.object_path, cfg.ctx);
+        return self;
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.menu.detach();
+        _ = bus.sd_bus_unref(self.bus);
+        self.gpa.destroy(self);
+    }
+
+    pub fn fd(self: *Server) i32 {
+        return bus.sd_bus_get_fd(self.bus);
+    }
+    pub fn flush(self: *Server) void {
+        _ = bus.sd_bus_flush(self.bus);
+    }
+    pub fn process(self: *Server) void {
+        while (bus.sd_bus_process(self.bus, null) > 0) {}
+    }
+
+    /// The connection's unique name (":1.NN") — the "service name" KWin needs to find us.
+    pub fn uniqueName(self: *Server) ?[*:0]const u8 {
+        var name: ?[*:0]const u8 = null;
+        if (bus.sd_bus_get_unique_name(self.bus, &name) < 0) return null;
+        return name;
     }
 };
 
@@ -295,8 +377,30 @@ test "tree flattens with contiguous DFS ids" {
     const s = try Server.init(std.testing.allocator, .{ .items = &items });
     defer s.deinit();
     // root + File + Open + Quit + Help + About = 6 nodes
-    try std.testing.expectEqual(@as(usize, 6), s.nodes.len);
-    try std.testing.expectEqual(@as(usize, 2), s.nodes[0].children.len); // root: File, Help
-    try std.testing.expect(s.nodes[1].item != null);
-    try std.testing.expectEqualStrings("File", std.mem.span(s.nodes[1].item.?.label.ptr));
+    try std.testing.expectEqual(@as(usize, 6), s.menu.nodes.len);
+    try std.testing.expectEqual(@as(usize, 2), s.menu.nodes[0].children.len); // root: File, Help
+    try std.testing.expect(s.menu.nodes[1].item != null);
+    try std.testing.expectEqualStrings("File", std.mem.span(s.menu.nodes[1].item.?.label.ptr));
+}
+
+test "Toggle callbacks read and flip per-item state" {
+    var denoise = Toggle{ .on = true };
+    var eq = Toggle{ .on = false };
+
+    // Two toggles share one menu but carry their own ctx — checkedFn reads each independently.
+    const items = [_]Item{
+        .{ .label = "Denoise", .toggle = true, .ctx = &denoise, .checked = Toggle.checkedFn, .on_click = Toggle.clickFn },
+        .{ .label = "EQ", .toggle = true, .ctx = &eq, .checked = Toggle.checkedFn, .on_click = Toggle.clickFn },
+    };
+
+    try std.testing.expect(items[0].checked.?(items[0].ctx));
+    try std.testing.expect(!items[1].checked.?(items[1].ctx));
+
+    // A "click" flips only that item's state.
+    items[1].on_click.?(items[1].ctx);
+    try std.testing.expect(items[1].checked.?(items[1].ctx));
+    try std.testing.expect(items[0].checked.?(items[0].ctx)); // unchanged
+
+    denoise.flip();
+    try std.testing.expect(!items[0].checked.?(items[0].ctx));
 }

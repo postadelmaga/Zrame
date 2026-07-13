@@ -15,6 +15,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const bus = @import("sdbus.zig");
+const dbusmenu = @import("dbusmenu.zig");
 
 pub const Config = struct {
     /// Stable application id (SNI `Id`).
@@ -28,13 +29,20 @@ pub const Config = struct {
     /// Invoked on left-click (SNI `Activate`), on the window thread.
     on_activate: ?*const fn (ctx: ?*anyopaque) void = null,
     ctx: ?*anyopaque = null,
+    /// Optional right-click context menu. When set, a `com.canonical.dbusmenu` object is
+    /// hosted on the tray's own connection and advertised via the SNI `Menu` property, so a
+    /// panel draws the menu on right-click. The item tree is borrowed — keep it alive.
+    menu: ?[]const dbusmenu.Item = null,
+    /// Opaque context handed to every menu `on_click` / `checked` (often the same as `ctx`).
+    menu_ctx: ?*anyopaque = null,
 };
 
 pub const Tray = struct {
     gpa: Allocator,
     bus: ?*bus.Bus = null,
     slot: ?*bus.Slot = null,
-    vtable: [12]bus.Vtable = undefined,
+    vtable: [13]bus.Vtable = undefined,
+    menu: ?*dbusmenu.Menu = null,
 
     on_activate: ?*const fn (ctx: ?*anyopaque) void = null,
     ctx: ?*anyopaque = null,
@@ -49,6 +57,7 @@ pub const Tray = struct {
     const status = "Active";
     const item_path = "/StatusNotifierItem";
     const item_iface = "org.kde.StatusNotifierItem";
+    const menu_path = "/StatusNotifierItem/menu";
 
     pub fn init(gpa: Allocator, cfg: Config) !*Tray {
         const self = try gpa.create(Tray);
@@ -72,6 +81,12 @@ pub const Tray = struct {
 
         if (bus.sd_bus_request_name(self.bus, &self.name_buf, 0) < 0) return error.TrayName;
 
+        // Optional right-click menu, hosted on this same connection so it shares the poll fd.
+        if (cfg.menu) |items| {
+            self.menu = dbusmenu.Menu.attach(gpa, self.bus.?, items, menu_path, cfg.menu_ctx) catch null;
+        }
+        errdefer if (self.menu) |m| m.detach();
+
         var err: bus.BusError = .{};
         defer bus.sd_bus_error_free(&err);
         const r = bus.sd_bus_call_method(
@@ -91,6 +106,7 @@ pub const Tray = struct {
     }
 
     pub fn deinit(self: *Tray) void {
+        if (self.menu) |m| m.detach();
         _ = bus.sd_bus_slot_unref(self.slot);
         _ = bus.sd_bus_unref(self.bus);
         self.gpa.destroy(self);
@@ -111,9 +127,9 @@ pub const Tray = struct {
         while (bus.sd_bus_process(self.bus, null) > 0) {}
     }
 
-    /// The full vtable: START, the six SNI properties, the four SNI methods, END.
+    /// The full vtable: START, the SNI properties (incl. `Menu`), the four SNI methods, END.
     fn buildVtable(self: *Tray) void {
-        self.vtable = std.mem.zeroes([12]bus.Vtable);
+        self.vtable = std.mem.zeroes([13]bus.Vtable);
         self.vtable[0] = bus.startEntry();
         self.vtable[1] = bus.propEntry("Category", "s", getProp);
         self.vtable[2] = bus.propEntry("Id", "s", getProp);
@@ -121,11 +137,13 @@ pub const Tray = struct {
         self.vtable[4] = bus.propEntry("Status", "s", getProp);
         self.vtable[5] = bus.propEntry("IconName", "s", getProp);
         self.vtable[6] = bus.propEntry("ItemIsMenu", "b", getProp);
-        self.vtable[7] = bus.methodEntry("Activate", "ii", "", onActivate);
-        self.vtable[8] = bus.methodEntry("SecondaryActivate", "ii", "", onNoop);
-        self.vtable[9] = bus.methodEntry("ContextMenu", "ii", "", onNoop);
-        self.vtable[10] = bus.methodEntry("Scroll", "is", "", onNoop);
-        self.vtable[11] = bus.endEntry();
+        // `Menu` is the object path of our `com.canonical.dbusmenu` object (or "/" if none).
+        self.vtable[7] = bus.propEntry("Menu", "o", getProp);
+        self.vtable[8] = bus.methodEntry("Activate", "ii", "", onActivate);
+        self.vtable[9] = bus.methodEntry("SecondaryActivate", "ii", "", onNoop);
+        self.vtable[10] = bus.methodEntry("ContextMenu", "ii", "", onNoop);
+        self.vtable[11] = bus.methodEntry("Scroll", "is", "", onNoop);
+        self.vtable[12] = bus.endEntry();
     }
 
     fn getProp(_: ?*bus.Bus, _: [*:0]const u8, _: [*:0]const u8, property: [*:0]const u8, reply: ?*bus.Message, userdata: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {
@@ -137,6 +155,7 @@ pub const Tray = struct {
         if (std.mem.eql(u8, p, "Status")) return bus.sd_bus_message_append(reply, "s", @as([*:0]const u8, status));
         if (std.mem.eql(u8, p, "IconName")) return bus.sd_bus_message_append(reply, "s", @as([*:0]const u8, &self.icon_buf));
         if (std.mem.eql(u8, p, "ItemIsMenu")) return bus.sd_bus_message_append(reply, "b", @as(c_int, 0));
+        if (std.mem.eql(u8, p, "Menu")) return bus.sd_bus_message_append(reply, "o", @as([*:0]const u8, if (self.menu != null) menu_path else "/"));
         return bus.sd_bus_message_append(reply, "s", @as([*:0]const u8, ""));
     }
 
