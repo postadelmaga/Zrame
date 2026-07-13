@@ -97,9 +97,9 @@ pub const Scroll = struct {
         return self.inner.tick(dt);
     }
 
-    /// Damage hint: solo le bande dei bar i cui assi sono visibili o in fade —
-    /// di norma una striscia sottile lungo il bordo destro (o inferiore), così il
-    /// fade della scrollbar non ricompone l'intero contenuto.
+    /// Damage hint: only the bands of the bars whose axes are visible or fading —
+    /// typically a thin strip along the right (or bottom) edge, so the
+    /// scrollbar fade does not recompose the entire content.
     pub fn dirtyBounds(self: *Scroll, host: plugin.Host) ?plugin.Rect {
         self.syncViewport(host);
         const vp = self.inner.viewport;

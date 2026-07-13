@@ -191,7 +191,7 @@ pub const Controls = struct {
             .minimize => mac_min,
             .maximize => mac_max,
         };
-        // Schiarisce leggermente il disco al passaggio diretto (stile macOS).
+        // Lighten the disc slightly on direct hover (macOS style).
         const lift = 0.18 * hf;
         col.r += (1.0 - col.r) * lift;
         col.g += (1.0 - col.g) * lift;
@@ -320,8 +320,8 @@ pub const Controls = struct {
         return active;
     }
 
-    /// Damage hint: le animazioni della barra (hover/reveal) vivono tutte nella
-    /// banda del titolo — il present parziale ricompone solo quella.
+    /// Damage hint: the bar's animations (hover/reveal) all live in the title
+    /// band — the partial present recomposes only that.
     pub fn dirtyBounds(self: *Controls, host: plugin.Host) ?plugin.Rect {
         const info = host.info();
         if (info.fullscreen) return null;
@@ -330,7 +330,7 @@ pub const Controls = struct {
             .x = @intFromFloat(@max(0.0, b.x)),
             .y = @intFromFloat(@max(0.0, b.y)),
             .w = @intFromFloat(@ceil(@max(0.0, b.w))),
-            .h = @intFromFloat(@ceil(@max(0.0, b.h + 1.0))), // +1: separatore sotto la barra
+            .h = @intFromFloat(@ceil(@max(0.0, b.h + 1.0))), // +1: separator under the bar
         };
     }
 };

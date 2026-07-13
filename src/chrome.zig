@@ -132,15 +132,15 @@ pub fn composeContent(
         const dx = origin.x;
         const dy = origin.y;
         if (fw == front.width) {
-            // Le righe sorgenti sono contigue: per un frame più alto del contenuto
-            // (frame stantio durante uno shrink-resize) basta troncare l'altezza,
-            // così non si sborda mai sotto il content rect.
+            // Source rows are contiguous: for a frame taller than the content
+            // (a stale frame during a shrink-resize) it's enough to truncate the height,
+            // so it never spills below the content rect.
             canvas.blitRgba(dx, dy, front.pixels.items[0 .. @as(usize, fw) * fh * 4], fw, fh, style);
         } else {
-            // Frame più largo del contenuto: `blitRgba` usa src_w anche come stride,
-            // quindi il ritaglio in larghezza va fatto riga per riga (senza toccare
-            // zicro). Il raggio del contenuto si perde per quei pochi frame stantii:
-            // meglio che sbordare sul chrome.
+            // Frame wider than the content: `blitRgba` uses src_w as the stride too,
+            // so the width clip has to be done row by row (without touching
+            // zicro). The content radius is lost for those few stale frames:
+            // better than spilling onto the chrome.
             var row_style = style;
             row_style.content_radius = 0;
             row_style.content_fade_width = 0;

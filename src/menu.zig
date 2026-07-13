@@ -218,14 +218,14 @@ pub const Menu = struct {
         return moved;
     }
 
-    /// Damage hint: il popup (con lo slide verticale di apertura e il ring 1px),
-    /// o nulla quando è chiuso e la dissolvenza è finita.
+    /// Damage hint: the popup (with the vertical open slide and the 1px ring),
+    /// or nothing when it is closed and the fade has finished.
     pub fn dirtyBounds(self: *Menu, host: plugin.Host) ?plugin.Rect {
         if (!self.open and self.anim <= 0.001) return null;
         const b = self.box(host, host.info());
         return .{
             .x = @intFromFloat(@max(0.0, b.x - 2.0)),
-            .y = @intFromFloat(@max(0.0, b.y - 8.0)), // slide di 6px verso l'alto + ring
+            .y = @intFromFloat(@max(0.0, b.y - 8.0)), // 6px slide upward + ring
             .w = @intFromFloat(@ceil(b.w + 4.0)),
             .h = @intFromFloat(@ceil(b.h + 10.0)),
         };

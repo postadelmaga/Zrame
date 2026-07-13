@@ -74,11 +74,11 @@ pub const Window = struct {
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
 
-        // Web default: NO glass frame — sul web il tab del browser È la finestra, quindi il
-        // contenuto riempie il <canvas> edge-to-edge (come il backend Android). A meno che
-        // l'app non chieda esplicitamente una titlebar (lo showcase della finestra glass
-        // decorata), il chrome collassa allo stile "trivial" (margin/raggi/fade = 0) → il
-        // present è una scrittura opaca full-window, niente pannello/ombra/bordo.
+        // Web default: NO glass frame — on the web the browser tab IS the window, so the
+        // content fills the <canvas> edge-to-edge (like the Android backend). Unless the
+        // app explicitly asks for a titlebar (the decorated glass-window showcase), the
+        // chrome collapses to the "trivial" style (margin/radii/fade = 0) → the present
+        // is an opaque full-window write, no panel/shadow/border.
         var opts = opts_in;
         if (!opts.titlebar) {
             opts.style.margin = 0;

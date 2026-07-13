@@ -84,15 +84,15 @@ const BufferSlot = struct {
     buffer: ?*wl.Buffer = null,
     pixels: []u32 = &.{},
     busy: bool = false,
-    /// Damage accumulato da quando questo slot è stato composto l'ultima volta
-    /// (il back buffer contiene i pixel di due commit fa): al suo turno ricompone
-    /// l'unione di tutto ciò che è cambiato nel frattempo. Parte `full` così il
-    /// primo compose copre l'intero buffer.
+    /// Damage accumulated since this slot was last composed
+    /// (the back buffer holds the pixels from two commits ago): on its turn it recomposes
+    /// the union of everything that changed in the meantime. Starts `full` so the
+    /// first compose covers the whole buffer.
     pending: SlotDamage = .{},
 };
 
-/// Regione sporca accumulata per uno slot: `full` copre tutto, altrimenti il
-/// bounding box dell'unione dei rect ricevuti (in pixel buffer).
+/// Dirty region accumulated for a slot: `full` covers everything, otherwise the
+/// bounding box of the union of the received rects (in buffer pixels).
 const SlotDamage = struct {
     full: bool = true,
     rect: ?Rect = null,
@@ -133,8 +133,8 @@ pub const Window = struct {
     pointer: ?*wl.Pointer = null,
     keyboard: ?*wl.Keyboard = null,
     touch: ?*wl.Touch = null,
-    /// Slot del dito primario attivo (`-1` = nessuno): il touch a un dito è sintetizzato
-    /// come pointer, così le app funzionano al tocco senza modifiche.
+    /// Active primary-finger slot (`-1` = none): single-finger touch is synthesized
+    /// as a pointer, so apps work with touch without changes.
     touch_id: i32 = -1,
     cursor_device: ?*wl.CursorShapeDevice = null,
     // HiDPI: with both globals present the buffer is rendered at `logical × scale`
@@ -150,9 +150,9 @@ pub const Window = struct {
     panel_h: u32,
     configured: bool = false,
     needs_redraw: bool = false,
-    // Damage del prossimo redraw: `dirty_staged` = c'è un nuovo frame app (regione
-    // = rect del frame); qualunque altro trigger (input/panel/stile/resize) marca
-    // `dirty_full`. Con entrambi vince il full. Consumati da `redraw`.
+    // Damage for the next redraw: `dirty_staged` = there's a new app frame (region
+    // = the frame's rect); any other trigger (input/panel/style/resize) marks
+    // `dirty_full`. With both, full wins. Consumed by `redraw`.
     dirty_full: bool = false,
     dirty_staged: bool = false,
     /// Gutter on the RIGHT of the content that the app keeps for its own overlay
@@ -164,16 +164,16 @@ pub const Window = struct {
     /// outside the frame rect, so the next redraw must be a FULL recompose (a
     /// staged frame alone only damages the frame's own rect).
     overlay_dirty: std.atomic.Value(bool) = .init(false),
-    /// Regione sporca dichiarata dai panel (union dei loro `dirtyBounds` sui
-    /// tick di animazione), in pixel buffer. Consumata da `redraw`.
+    /// Dirty region declared by the panels (union of their `dirtyBounds` on the
+    /// animation ticks), in buffer pixels. Consumed by `redraw`.
     dirty_rect: ?Rect = null,
-    /// Rect canvas dell'ultimo frame app composto: quando il frame cambia
-    /// dimensione/posizione la regione damage è l'UNIONE di vecchio e nuovo
-    /// (altrimenti il bordo del frame vecchio resterebbe come ghost).
+    /// Canvas rect of the last composed app frame: when the frame changes
+    /// size/position the damage region is the UNION of old and new
+    /// (otherwise the old frame's border would linger as a ghost).
     last_front_rect: ?Rect = null,
-    // Resize richiesto da un altro thread (protetto da `mutex`): le operazioni
-    // sulla surface Wayland NON sono thread-safe, quindi `requestResize` deposita
-    // solo il target e il run loop chiama `animateResize` sul thread finestra.
+    // Resize requested by another thread (guarded by `mutex`): operations
+    // on the Wayland surface are NOT thread-safe, so `requestResize` only stages
+    // the target and the run loop calls `animateResize` on the window thread.
     pending_resize: ?[2]u32 = null,
     // True once `run` is pumping. Before that (init roundtrips) `onXdgConfigure` must
     // redraw synchronously to map the window; during the loop it only flags a redraw so
@@ -183,17 +183,17 @@ pub const Window = struct {
     /// the run loop): a HUD over a dmabuf video must not repaint at video rate.
     last_overlay_ms: i64 = 0,
     closed: bool = false,
-    // Stato fullscreen: in fullscreen il gutter/ombra/angoli vengono azzerati
-    // così il contenuto riempie lo schermo; i valori originali si ripristinano
-    // all'uscita insieme alla dimensione del pannello a finestra.
+    // Fullscreen state: in fullscreen the gutter/shadow/corners are zeroed
+    // so the content fills the screen; the original values are restored
+    // on exit together with the windowed panel size.
     fullscreen: bool = false,
     saved_panel_w: u32 = 0,
     saved_panel_h: u32 = 0,
     saved_margin: u32 = 0,
     saved_radius: f32 = 0,
     saved_content_radius: f32 = 0,
-    // Motore di testo (stb_truetype), creato pigramente al primo uso: font di
-    // default Hack regular+bold, sostituibile con `setFont`/`loadFont`.
+    // Text engine (stb_truetype), created lazily on first use: default font
+    // Hack regular+bold, replaceable with `setFont`/`loadFont`.
     font: ?text.Font = null,
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
@@ -202,8 +202,8 @@ pub const Window = struct {
     pointer_serial: u32 = 0,
     /// Cursor shape currently requested, so repeated motion doesn't re-issue set_shape.
     cursor_shape: u32 = wl.CursorShapeDevice.SHAPE_DEFAULT,
-    // Stato massimizzato, come per il fullscreen: rilevato dagli stati del configure,
-    // pilota l'icona massimizza/ripristina dei controlli.
+    // Maximized state, like fullscreen: detected from the configure states,
+    // drives the controls' maximize/restore icon.
     maximized: bool = false,
 
     // --- keyboard layout translation (xkbcommon) --------------------------------------
@@ -239,16 +239,16 @@ pub const Window = struct {
     // panel. Dormant (invisible) until the app reports its content size via
     // `win.scrollbars.setContent(w, h)`; the viewport tracks the content rect for free.
     scrollbars: scroll.Scroll = .{ .follow_content = true },
-    // timerfd che batte l'orologio d'animazione: armato (~60 Hz) mentre un pannello si
-    // anima, disarmato quando tutto si è assestato così `poll` torna a bloccarsi a riposo.
+    // timerfd that beats the animation clock: armed (~60 Hz) while a panel is
+    // animating, disarmed once everything has settled so `poll` blocks idle again.
     timer_fd: posix.fd_t = -1,
     timer_armed: bool = false,
     last_tick_ns: i64 = 0,
-    // Dimensione massima utile della geometria finestra suggerita dal compositore
-    // (xdg_toplevel.configure_bounds): l'area dello schermo meno pannelli/riserve.
-    // 0 = non nota. Vincola i ridimensionamenti così la finestra non sborda oltre
-    // lo schermo (in particolare sotto). Il client non può posizionarsi da sé su
-    // Wayland — il compositore piazza (e di norma centra) la finestra.
+    // Maximum usable window-geometry size suggested by the compositor
+    // (xdg_toplevel.configure_bounds): the screen area minus panels/reservations.
+    // 0 = unknown. Constrains resizes so the window doesn't overflow past
+    // the screen (especially at the bottom). The client cannot position itself on
+    // Wayland — the compositor places (and usually centers) the window.
     bounds_w: u32 = 0,
     bounds_h: u32 = 0,
     // Optional StatusNotifierItem tray connection; created in `run` when `opts.tray` is set,
@@ -317,21 +317,21 @@ pub const Window = struct {
     dismissables: [8]Dismissable = undefined,
     n_dismissables: usize = 0,
 
-    // --- attesa vsync (`waitFrame`) -----------------------------------------------
-    // Contatore dei frame callback del compositor sulla surface principale: il
-    // dispatch (thread finestra) lo incrementa e sveglia i waiter via futex; i
-    // chiamanti di `waitFrame` dormono in FUTEX_WAIT proprio su questo indirizzo.
-    // (Zig 0.16 tiene mutex/condvar bloccanti dietro `std.Io`, vedi `SpinLock`:
-    // per un'attesa bloccante con timeout il futex raw è la primitiva giusta qui,
-    // e questo backend è comunque solo-Linux.)
+    // --- vsync wait (`waitFrame`) -----------------------------------------------
+    // Counter of the compositor's frame callbacks on the main surface: the
+    // dispatch (window thread) increments it and wakes the waiters via futex; the
+    // callers of `waitFrame` sleep in FUTEX_WAIT on exactly this address.
+    // (Zig 0.16 keeps blocking mutex/condvar behind `std.Io`, see `SpinLock`:
+    // for a blocking wait with timeout the raw futex is the right primitive here,
+    // and this backend is Linux-only anyway.)
     frame_seq: std.atomic.Value(u32) = .init(0),
-    /// Solo thread finestra: true mentre un `wl_surface.frame` è in volo sulla
-    /// surface principale (al massimo un callback pendente per volta, richiesto
-    /// insieme al commit in `redraw`).
+    /// Window thread only: true while a `wl_surface.frame` is in flight on the
+    /// main surface (at most one pending callback at a time, requested
+    /// together with the commit in `redraw`).
     frame_cb_pending: bool = false,
-    /// Alzato al teardown (uscita dal run loop o `deinit`): i waiter vengono
-    /// svegliati e `waitFrame` ritorna false invece di aspettare un callback che
-    /// non arriverà più.
+    /// Raised at teardown (exit from the run loop or `deinit`): the waiters are
+    /// woken and `waitFrame` returns false instead of waiting for a callback that
+    /// will never arrive again.
     frame_teardown: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
@@ -429,10 +429,10 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
-        // Cintura di sicurezza per chi non è mai entrato in `run`: segna il
-        // teardown e sveglia eventuali waiter di `waitFrame` PRIMA di smontare.
-        // (Il contratto resta: i thread che chiamano waitFrame vanno joinati
-        // prima di deinit — qui si riduce solo la finestra di corsa.)
+        // Safety belt for callers that never entered `run`: mark the
+        // teardown and wake any `waitFrame` waiters BEFORE tearing down.
+        // (The contract still holds: threads that call waitFrame must be joined
+        // before deinit — this only narrows the race window.)
         self.frame_teardown.store(true, .release);
         self.wakeFrameWaiters();
         if (self.appmenu_obj) |o| o.release();
@@ -519,11 +519,11 @@ pub const Window = struct {
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
-    /// Richiede un resize della finestra da un thread qualsiasi. Deposita il
-    /// target e sveglia il run loop, che eseguirà `animateResize` sul thread
-    /// finestra: le operazioni sulla surface Wayland (attach/commit) non sono
-    /// thread-safe e chiamarle da un worker durante `run` corrompe il protocollo
-    /// (es. `xdg_surface: attached a buffer before configure`).
+    /// Request a window resize from any thread. Stages the
+    /// target and wakes the run loop, which will run `animateResize` on the window
+    /// thread: operations on the Wayland surface (attach/commit) are not
+    /// thread-safe and calling them from a worker during `run` corrupts the protocol
+    /// (e.g. `xdg_surface: attached a buffer before configure`).
     pub fn requestResize(self: *Window, width: u32, height: u32) void {
         self.mutex.lock();
         self.pending_resize = .{ width, height };
@@ -665,23 +665,23 @@ pub const Window = struct {
         return self.video_pending.load(.acquire);
     }
 
-    /// Blocca il thread chiamante (uno QUALSIASI, tipicamente il render worker
-    /// dell'app) fino al prossimo frame callback del compositor — il momento
-    /// giusto per comporre il frame successivo — o fino a `timeout_ms`.
-    /// Ritorna `true` se svegliato dal callback, `false` su timeout o a
-    /// finestra chiusa/in teardown (il chiamante degrada al proprio pacer).
+    /// Blocks the calling thread (ANY thread, typically the app's render
+    /// worker) until the compositor's next frame callback — the right
+    /// moment to compose the following frame — or until `timeout_ms`.
+    /// Returns `true` if woken by the callback, `false` on timeout or with the
+    /// window closed/in teardown (the caller falls back to its own pacer).
     ///
-    /// Contratto:
-    /// - Il callback viene richiesto solo quando `redraw` committa davvero un
-    ///   frame: senza commit dall'ultimo callback (es. video in pausa) o con la
-    ///   finestra nascosta/occlusa (i compositor fermano i frame callback)
-    ///   l'attesa scade col timeout — è la rete di sicurezza, non un errore.
-    /// - Più waiter contemporanei sono ammessi (il risveglio è broadcast).
-    /// - Alla chiusura della finestra i waiter vengono svegliati e ricevono
-    ///   `false`; il chiamante deve essere uscito da `waitFrame` (cioè il suo
-    ///   thread raggiunto/joinato) prima di chiamare `deinit`.
-    /// - Su Win32 il metodo omologo ritorna sempre subito `false` (nessun
-    ///   aggancio vsync): lì il chiamante usa il suo pacer software.
+    /// Contract:
+    /// - The callback is requested only when `redraw` actually commits a
+    ///   frame: with no commit since the last callback (e.g. paused video) or with the
+    ///   window hidden/occluded (compositors stop frame callbacks)
+    ///   the wait expires on the timeout — it's the safety net, not an error.
+    /// - Multiple concurrent waiters are allowed (the wake-up is a broadcast).
+    /// - On window close the waiters are woken and receive
+    ///   `false`; the caller must have left `waitFrame` (i.e. its
+    ///   thread reached/joined) before calling `deinit`.
+    /// - On Win32 the equivalent method always returns `false` immediately (no
+    ///   vsync hook): there the caller uses its software pacer.
     pub fn waitFrame(self: *Window, timeout_ms: u32) bool {
         if (self.frame_teardown.load(.acquire)) return false;
         const start = self.frame_seq.load(.acquire);
@@ -694,9 +694,9 @@ pub const Window = struct {
                 .sec = @intCast(left / 1_000_000_000),
                 .nsec = @intCast(left % 1_000_000_000),
             };
-            // FUTEX_WAIT dorme solo se `frame_seq` vale ancora `start`: un
-            // callback arrivato tra la load e la wait fa fallire la wait con
-            // EAGAIN — niente lost wake-up. Timeout relativo, clock monotonico.
+            // FUTEX_WAIT sleeps only if `frame_seq` still equals `start`: a
+            // callback that arrived between the load and the wait makes the wait fail with
+            // EAGAIN — no lost wake-up. Relative timeout, monotonic clock.
             const rc = linux.futex_4arg(
                 &self.frame_seq.raw,
                 .{ .cmd = .WAIT, .private = true },
@@ -705,16 +705,16 @@ pub const Window = struct {
             );
             switch (linux.errno(rc)) {
                 .SUCCESS, .AGAIN, .INTR => {},
-                else => return false, // TIMEDOUT o errore inatteso
+                else => return false, // TIMEDOUT or unexpected error
             }
             if (self.frame_teardown.load(.acquire)) return false;
             if (self.frame_seq.load(.acquire) != start) return true;
-            // Risveglio spurio/EINTR: il tempo rimasto si ricalcola e si riprova.
+            // Spurious wake-up/EINTR: the remaining time is recomputed and we retry.
         }
     }
 
-    /// Sveglia in broadcast tutti i thread fermi in `waitFrame` (store già fatto
-    /// dal chiamante: qui solo la syscall di wake).
+    /// Broadcast-wakes every thread parked in `waitFrame` (the store is already done
+    /// by the caller: here only the wake syscall).
     fn wakeFrameWaiters(self: *Window) void {
         _ = linux.futex_3arg(
             &self.frame_seq.raw,
@@ -725,8 +725,8 @@ pub const Window = struct {
 
     const frame_done_listener = wl.Callback.Listener{ .done = onFrameDone };
 
-    /// Frame callback della surface principale (dispatch sul thread finestra):
-    /// SOLO store + wake, nessun lavoro pesante nel dispatch Wayland.
+    /// Frame callback of the main surface (dispatched on the window thread):
+    /// ONLY store + wake, no heavy work in the Wayland dispatch.
     fn onFrameDone(data: ?*anyopaque, callback: *wl.Callback, _: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         callback.destroy();
@@ -738,9 +738,9 @@ pub const Window = struct {
     /// The event loop: blocks until the window is closed or the connection drops.
     pub fn run(self: *Window) !void {
         self.running = true;
-        // All'uscita dal loop (chiusura o errore di connessione) nessun frame
-        // callback arriverà più: sveglia chi è fermo in `waitFrame`, che così
-        // ritorna false e lascia terminare il proprio thread.
+        // On exit from the loop (close or connection error) no frame
+        // callback will arrive again: wake whoever is parked in `waitFrame`, which then
+        // returns false and lets its own thread terminate.
         defer {
             self.frame_teardown.store(true, .release);
             self.wakeFrameWaiters();
@@ -810,8 +810,8 @@ pub const Window = struct {
                 const has_frame = self.staged.fresh;
                 self.mutex.unlock();
                 if (has_frame) {
-                    // Nuovo frame app: damage = rect del frame (non full) — la
-                    // regione esatta viene derivata in `redraw` dopo lo swap.
+                    // New app frame: damage = the frame's rect (not full) — the
+                    // exact region is derived in `redraw` after the swap.
                     self.needs_redraw = true;
                     self.dirty_staged = true;
                 } else if (had_video and self.opts.on_draw != null) {
@@ -838,8 +838,8 @@ pub const Window = struct {
                 if (fds[4].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) mnu.process();
             }
 
-            // Resize richiesto da un altro thread: eseguilo QUI, sul thread
-            // finestra, prima del redraw (le surface Wayland non sono thread-safe).
+            // Resize requested by another thread: run it HERE, on the window
+            // thread, before the redraw (Wayland surfaces are not thread-safe).
             self.mutex.lock();
             const rr = self.pending_resize;
             self.pending_resize = null;
@@ -902,8 +902,8 @@ pub const Window = struct {
             0.016;
         self.last_tick_ns = now;
         const panels_active = self.panels.tick(dt, self.host());
-        // Damage parziale se OGNI panel sa dichiarare la propria area; basta un
-        // panel senza `dirtyBounds` per ricadere nel full conservativo.
+        // Partial damage if EVERY panel can declare its own area; a single
+        // panel without `dirtyBounds` is enough to fall back to the conservative full.
         switch (self.panels.dirtyBounds(self.host())) {
             .rect => |r| {
                 self.needs_redraw = true;
@@ -915,9 +915,9 @@ pub const Window = struct {
         if (!panels_active) self.disarmTimer();
     }
 
-    /// Arma un redraw COMPLETO: qualunque trigger che non sia "e' arrivato un nuovo
-    /// frame app" (input, panel, stile, resize, configure) ridisegna tutto — la
-    /// granularita' fine per i panel (bbox) e' un'estensione futura del seam.
+    /// Arms a FULL redraw: any trigger other than "a new app frame
+    /// arrived" (input, panel, style, resize, configure) redraws everything — the
+    /// fine granularity for panels (bbox) is a future extension of the seam.
     inline fn redrawAll(self: *Window) void {
         self.needs_redraw = true;
         self.dirty_full = true;
@@ -1091,20 +1091,20 @@ pub const Window = struct {
         self.redrawAll();
     }
 
-    /// Alterna la modalità a schermo intero. Si limita a chiedere/rilasciare il
-    /// fullscreen al compositore: la dimensione reale e lo stato arrivano dal
-    /// `configure` successivo (onToplevelConfigure), che azzera/ripristina
-    /// gutter/ombra/angoli. Solo dal thread finestra (parla con oggetti Wayland):
-    /// chiamalo da una callback di input.
+    /// Toggles fullscreen mode. It only requests/releases
+    /// fullscreen from the compositor: the actual size and state come from the
+    /// following `configure` (onToplevelConfigure), which zeroes/restores
+    /// gutter/shadow/corners. Window thread only (talks to Wayland objects):
+    /// call it from an input callback.
     pub fn toggleFullscreen(self: *Window) void {
         const tl = self.toplevel orelse return;
         if (self.fullscreen) tl.unsetFullscreen() else tl.setFullscreen();
     }
 
-    /// Riduce (in scala, preservando le proporzioni) `w`×`h` perché la geometria
-    /// finestra stia nell'area utile suggerita dal compositore (`bounds_*`), con
-    /// un piccolo margine di sicurezza. Non ingrandisce mai. No-op se i bounds
-    /// non sono noti. Serve a non far sbordare la finestra oltre lo schermo.
+    /// Scales `w`×`h` down (preserving the aspect ratio) so the window
+    /// geometry fits the usable area suggested by the compositor (`bounds_*`), with
+    /// a small safety margin. Never enlarges. No-op when the bounds
+    /// are unknown. Keeps the window from overflowing past the screen.
     fn fitBounds(self: *const Window, w: u32, h: u32) struct { w: u32, h: u32 } {
         if (self.bounds_w == 0 or self.bounds_h == 0) return .{ .w = w, .h = h };
         const inset: u32 = 8;
@@ -1120,60 +1120,60 @@ pub const Window = struct {
         };
     }
 
-    /// Porta la finestra al pannello `target_w`×`target_h`, capato all'area utile
-    /// (`fitBounds` → mai fuori schermo), e la ri-centra. Su Wayland il client non può
-    /// spostare il proprio toplevel: l'unico modo per ri-centrare dopo un resize è
-    /// smappare e rimappare la surface (un breve "flash"), così il compositore riesegue
-    /// il placement e la rimette al centro. No-op in fullscreen/massimizzato o se la
-    /// dimensione non cambia. Solo dal thread finestra (callback di input o prima di run).
+    /// Resizes the window to the `target_w`×`target_h` panel, capped to the usable area
+    /// (`fitBounds` → never off-screen), and re-centers it. On Wayland the client cannot
+    /// move its own toplevel: the only way to re-center after a resize is to
+    /// unmap and remap the surface (a brief "flash"), so the compositor redoes
+    /// the placement and puts it back in the center. No-op in fullscreen/maximized or when the
+    /// size doesn't change. Window thread only (input callback or before run).
     pub fn animateResize(self: *Window, target_w: u32, target_h: u32) void {
         if (self.fullscreen or self.maximized) return;
         const fitted = self.fitBounds(target_w, target_h);
         const tw = @max(fitted.w, self.minPanel());
         const th = @max(fitted.h, self.minPanel());
-        if (tw == self.panel_w and th == self.panel_h) return; // già a misura
+        if (tw == self.panel_w and th == self.panel_h) return; // already at size
         self.panel_w = tw;
         self.panel_h = th;
-        // Non ancora mappata (init, prima del primo map): imposta soltanto — il primo
-        // map la centrerà da sé.
+        // Not yet mapped (init, before the first map): just set it — the first
+        // map will center it by itself.
         if (!self.configured or self.surface == null) {
             self.redrawAll();
             return;
         }
-        // Smappa e rimappa così il compositore rifà il placement e ri-centra la finestra
-        // (unico aggancio su Wayland). Il protocollo xdg impone la sequenza di re-map:
-        // attach(null)+commit per smappare, poi un commit "iniziale" senza buffer e si
-        // ATTENDE un nuovo configure prima di ri-attaccare pixel (altrimenti
-        // `unconfigured_buffer`). Marcando `configured=false` il loop non ridisegna finché
-        // il configure non arriva; onXdgConfigure lo rialza e il redraw riattacca → re-map.
+        // Unmap and remap so the compositor redoes the placement and re-centers the window
+        // (the only hook on Wayland). The xdg protocol mandates the re-map sequence:
+        // attach(null)+commit to unmap, then an "initial" commit with no buffer and we
+        // WAIT for a new configure before re-attaching pixels (otherwise
+        // `unconfigured_buffer`). Marking `configured=false` keeps the loop from redrawing until
+        // the configure arrives; onXdgConfigure raises it again and the redraw re-attaches → re-map.
         const surface = self.surface.?;
         surface.attach(null, 0, 0);
         surface.commit();
         self.configured = false;
         surface.commit();
-        // Un frame callback in volo era legato alla surface mappata: dopo l'unmap
-        // potrebbe non arrivare mai. Sbloccando il flag, il primo redraw dopo il
-        // re-map ne richiede uno nuovo; se il vecchio arriva comunque, gestirne
-        // due è innocuo (ogni `done` distrugge solo il proprio wl_callback).
+        // A frame callback in flight was tied to the mapped surface: after the unmap
+        // it might never arrive. By clearing the flag, the first redraw after the
+        // re-map requests a new one; if the old one arrives anyway, handling
+        // two is harmless (each `done` destroys only its own wl_callback).
         self.frame_cb_pending = false;
         self.redrawAll();
     }
 
-    /// Motore di testo della finestra, creato pigramente col font di default
-    /// (Hack regular+bold). Usalo per disegnare testo in `on_draw`:
+    /// The window's text engine, created lazily with the default font
+    /// (Hack regular+bold). Use it to draw text in `on_draw`:
     /// `canvas.drawText(try win.textFont(), x, baseline, "…", .{})`.
     pub fn textFont(self: *Window) !*text.Font {
         if (self.font == null) self.font = try text.Font.initDefault(self.gpa);
         return &self.font.?;
     }
 
-    /// Sostituisce la faccia regular del font con byte TTF (es. un `@embedFile`).
+    /// Replaces the font's regular face with TTF bytes (e.g. an `@embedFile`).
     pub fn setFont(self: *Window, ttf: []const u8) !void {
         const f = try self.textFont();
         try f.setFace(.regular, ttf, false);
     }
 
-    /// Carica la faccia regular da un file .ttf/.otf su disco.
+    /// Loads the regular face from a .ttf/.otf file on disk.
     pub fn loadFont(self: *Window, path: []const u8) !void {
         const f = try self.textFont();
         try f.loadFace(.regular, path);
@@ -1219,8 +1219,8 @@ pub const Window = struct {
         if (self.data_source != null) return null; // self-paste: caller's copy is fresher
         const offer = self.selection_offer orelse return null;
         if (self.selection_mime == .none) return null;
-        // std.posix.pipe2 non esiste in questa toolchain: syscall raw come il resto
-        // del file (linux.write/close/eventfd).
+        // std.posix.pipe2 doesn't exist in this toolchain: raw syscall like the rest
+        // of the file (linux.write/close/eventfd).
         var pipe_fds: [2]i32 = undefined;
         if (linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })) != .SUCCESS) return null;
         offer.receive(self.selection_mime.mime(), pipe_fds[1]);
@@ -1340,7 +1340,7 @@ pub const Window = struct {
         const deadline = monotonicNs() + 1_000_000_000;
         var off: usize = 0;
         while (off < self.clip_text.len) {
-            // std.posix.write assente in questa toolchain: syscall raw + decode errno.
+            // std.posix.write is absent in this toolchain: raw syscall + errno decode.
             const rc = linux.write(fd, self.clip_text.ptr + off, self.clip_text.len - off);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
@@ -1469,20 +1469,20 @@ pub const Window = struct {
     /// This is the platform seam for presentation: every backend — the Wayland
     /// shm path below, or a future Cocoa/Metal path — acquires a writable pixel
     /// buffer its own way, calls this to fill it, then presents it however it can.
-    /// `region == null` → ricomposizione completa (comportamento storico).
-    /// Con una regione: il decor viene ricopiato solo nelle sue righe e
-    /// contenuto+panels vengono ridisegnati col clip del canvas su di essa —
-    /// i pixel fuori regione restano quelli già presenti nello slot (validi
-    /// per costruzione: vedi `SlotDamage`). Lo swap del front è del chiamante
-    /// (`redraw`), che dal frame appena arrivato deriva la regione stessa.
-    /// Nota contratto `on_draw`: il suo output deve cambiare solo a fronte di
-    /// `request_redraw` (full) — un overlay che cambia "da solo" durante un
-    /// redraw parziale resterebbe stantio fuori regione.
+    /// `region == null` → full recomposition (historical behavior).
+    /// With a region: the decor is copied back only in its rows and
+    /// content+panels are redrawn with the canvas clipped to it —
+    /// the pixels outside the region keep what's already in the slot (valid
+    /// by construction: see `SlotDamage`). The front swap belongs to the caller
+    /// (`redraw`), which derives the region itself from the just-arrived frame.
+    /// `on_draw` contract note: its output must change only in response to
+    /// `request_redraw` (full) — an overlay that changes "on its own" during a
+    /// partial redraw would go stale outside the region.
     fn composeFrame(self: *Window, pixels: []u32, bw: u32, bh: u32, region: ?Rect) void {
         var canvas = paint.Canvas.init(pixels, bw, bh);
         if (region) |r0| {
-            // Clamp difensivo al buffer (regione calcolata da geometrie che un
-            // resize concorrente può aver superato).
+            // Defensive clamp to the buffer (region computed from geometries that a
+            // concurrent resize may have outrun).
             const x1 = @min(bw, r0.x +| r0.w);
             const y1 = @min(bh, r0.y +| r0.h);
             if (r0.x < x1 and r0.y < y1) {
@@ -1511,34 +1511,34 @@ pub const Window = struct {
         const bh = self.physPx(self.panel_h + 2 * m);
         if (bw != self.buf_w or bh != self.buf_h) {
             try self.resizeBuffers(bw, bh);
-            // Buffer nuovi: coordinate del vecchio frame prive di senso.
+            // New buffers: the old frame's coordinates are meaningless.
             self.last_front_rect = null;
             self.dirty_full = true;
         }
 
         const slot = self.freeSlot() orelse return; // both busy: retry on next wake
 
-        // Danno di QUESTO frame: nuovo frame app → unione del rect vecchio/nuovo
-        // (un frame che si restringe deve ripulire il bordo che scopre); qualunque
-        // altro trigger → full. Accumulato su ENTRAMBI gli slot: il back buffer
-        // contiene i pixel di due commit fa e al suo turno dovrà ricomporre anche
-        // ciò che è cambiato nel frattempo.
+        // Damage of THIS frame: new app frame → union of the old/new rect
+        // (a shrinking frame must clean up the border it uncovers); any
+        // other trigger → full. Accumulated on BOTH slots: the back buffer
+        // holds the pixels from two commits ago and on its turn will also have to recompose
+        // what changed in the meantime.
         chrome.swapFront(&self.mutex, &self.staged, &self.front);
         var full = self.dirty_full;
         var partial: ?Rect = null;
         if (self.front.width > 0) {
             const r = chrome.frameRect(self.frameArea(), self.front.width, self.front.height);
             if (self.dirty_staged) {
-                // Primo frame (nessun rect precedente) → full.
+                // First frame (no previous rect) → full.
                 if (self.last_front_rect) |prev| partial = plugin.unionOf(prev, r) else full = true;
             }
             self.last_front_rect = r;
         } else if (self.dirty_staged) {
             full = true;
         }
-        // Regione dichiarata dai panel (animazioni con `dirtyBounds`).
+        // Region declared by the panels (animations with `dirtyBounds`).
         if (self.dirty_rect) |dr| partial = if (partial) |p| plugin.unionOf(p, dr) else dr;
-        // Redraw senza alcuna informazione di regione → conservativo.
+        // Redraw with no region information → conservative.
         if (partial == null) full = true;
         self.dirty_full = false;
         self.dirty_staged = false;
@@ -1556,10 +1556,10 @@ pub const Window = struct {
         } else {
             surface.damageBuffer(0, 0, @intCast(bw), @intCast(bh));
         }
-        // Vsync: chiedi un frame callback per QUESTO commit (la richiesta `frame`
-        // è stato double-buffered, va emessa prima del commit), se non ce n'è già
-        // uno in volo. Niente commit → niente callback → i waiter di `waitFrame`
-        // scadono col loro timeout (coalescenza: video in pausa non blocca).
+        // Vsync: request a frame callback for THIS commit (the `frame` request
+        // is double-buffered state, it must be emitted before the commit), if there isn't
+        // already one in flight. No commit → no callback → the `waitFrame` waiters
+        // expire on their timeout (coalescing: paused video doesn't block).
         if (!self.frame_cb_pending) {
             const fcb = surface.frame();
             fcb.setListener(&frame_done_listener, self);
@@ -1753,14 +1753,14 @@ pub const Window = struct {
         .wm_capabilities = onWmCapabilities,
     };
 
-    // wl_array: buffer dinamico Wayland. `states` di xdg_toplevel.configure è un
-    // array di u32 (enum di stato); `size` è in byte.
+    // wl_array: Wayland dynamic buffer. `states` of xdg_toplevel.configure is a
+    // u32 array (state enum); `size` is in bytes.
     const WlArray = extern struct { size: usize, alloc: usize, data: ?[*]u32 };
 
     fn onToplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32, states: ?*anyopaque) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
 
-        // Rileva fullscreen e massimizzato dall'array di stati del compositore.
+        // Detect fullscreen and maximized from the compositor's states array.
         var is_fs = false;
         var is_max = false;
         if (states) |sp| {
@@ -1776,9 +1776,9 @@ pub const Window = struct {
         }
         self.maximized = is_max;
 
-        // Ingresso/uscita da fullscreen: azzera o ripristina gutter/ombra/angoli.
-        // La dimensione la porta il `width`/`height` di questa stessa configure;
-        // il repaint della decor e la geometria li aggiorna il redraw sul resize.
+        // Entering/leaving fullscreen: zero or restore gutter/shadow/corners.
+        // The size is carried by the `width`/`height` of this same configure;
+        // the decor repaint and geometry are updated by the redraw on resize.
         if (is_fs != self.fullscreen) {
             self.fullscreen = is_fs;
             if (is_fs) {
@@ -1789,15 +1789,15 @@ pub const Window = struct {
                 self.saved_content_radius = self.opts.style.content_radius;
                 self.opts.style.margin = 0;
                 self.opts.style.corner_radius = 0;
-                // Anche il contenuto senza angoli tondi: a schermo intero niente
-                // cornice/bordo, il contenuto riempe da bordo a bordo.
+                // Content without rounded corners too: fullscreen has no
+                // frame/border, the content fills edge to edge.
                 self.opts.style.content_radius = 0;
             } else {
                 self.opts.style.margin = self.saved_margin;
                 self.opts.style.corner_radius = self.saved_radius;
                 self.opts.style.content_radius = self.saved_content_radius;
-                // Se il compositore non suggerisce una dimensione (0), torna a
-                // quella pre-fullscreen.
+                // If the compositor suggests no size (0), fall back to
+                // the pre-fullscreen one.
                 if (width <= 0) self.panel_w = self.saved_panel_w;
                 if (height <= 0) self.panel_h = self.saved_panel_h;
             }
@@ -1815,12 +1815,12 @@ pub const Window = struct {
 
     fn onConfigureBounds(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        // Area utile massima per la geometria finestra (0 = "nessun vincolo").
+        // Maximum usable area for the window geometry (0 = "no constraint").
         if (width > 0) self.bounds_w = @intCast(width);
         if (height > 0) self.bounds_h = @intCast(height);
-        // Se il contenuto attuale eccede l'area utile, riportalo dentro: prima della
-        // mappatura (init roundtrip) in modo istantaneo, a finestra viva con
-        // un'animazione. Così un documento più alto dello schermo non sborda sotto.
+        // If the current content exceeds the usable area, bring it back in: before
+        // mapping (init roundtrip) instantly, and with the window alive using
+        // an animation. This way a document taller than the screen doesn't overflow below.
         const fitted = self.fitBounds(self.panel_w, self.panel_h);
         if (fitted.w != self.panel_w or fitted.h != self.panel_h) {
             if (self.running) {
@@ -1940,9 +1940,9 @@ pub const Window = struct {
     }
     fn onKeyRepeatInfo(_: ?*anyopaque, _: *wl.Keyboard, _: i32, _: i32) callconv(.c) void {}
 
-    // --- touch: il dito primario è sintetizzato come pointer (down→press, motion, up→release),
-    //     così ogni app zrame è usabile al tocco senza modifiche. Il multi-touch (pinch) potrà
-    //     esporre un callback dedicato più avanti.
+    // --- touch: the primary finger is synthesized as a pointer (down→press, motion, up→release),
+    //     so every zrame app is usable with touch without changes. Multi-touch (pinch) may
+    //     expose a dedicated callback later.
     const touch_listener = wl.Touch.Listener{
         .down = onTouchDown,
         .up = onTouchUp,
@@ -1995,7 +1995,7 @@ pub const Window = struct {
         self.pointer_x = fx;
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
-        // Mouse in coordinate APP, come il percorso pointer (vedi `MouseEvent`).
+        // Mouse in APP coordinates, like the pointer path (see `MouseEvent`).
         if (self.opts.on_mouse) |cb| {
             const o = self.appOriginPx();
             _ = cb(self, .{ .motion = .{ .x = fx - o.x, .y = fy - o.y } }, self.opts.user);
@@ -2010,7 +2010,7 @@ pub const Window = struct {
 
     fn onTouchDown(data: ?*anyopaque, _: *wl.Touch, _: u32, _: u32, _: ?*wl.Surface, id: i32, x: wl.Fixed, y: wl.Fixed) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
-        if (self.touch_id != -1) return; // un solo dito primario alla volta
+        if (self.touch_id != -1) return; // a single primary finger at a time
         self.touch_id = id;
         const s = self.scaleFactor();
         self.touchEmitMotion(wl.fixedToF32(x) * s, wl.fixedToF32(y) * s);
@@ -2082,9 +2082,9 @@ pub const Window = struct {
         self.pointer_y = fy;
         if (self.routeInput(.{ .motion = .{ .x = fx, .y = fy } })) return;
         if (self.opts.on_mouse) |cb| {
-            // Mouse in coordinate APP (vedi `MouseEvent`): canvas meno l'origine del frame
-            // staged/video (o del content rect), così l'app fa hit-test nello stesso
-            // spazio in cui ha disegnato — pannelli e resize band restano in canvas.
+            // Mouse in APP coordinates (see `MouseEvent`): canvas minus the origin of the
+            // staged/video frame (or of the content rect), so the app hit-tests in the same
+            // space it drew in — panels and the resize band stay in canvas space.
             const o = self.appOriginPx();
             const consumed = cb(self, .{ .motion = .{ .x = fx - o.x, .y = fy - o.y } }, self.opts.user);
             if (consumed) {

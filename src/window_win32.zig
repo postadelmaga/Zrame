@@ -455,10 +455,10 @@ pub const Window = struct {
         return false;
     }
 
-    /// Parità di API col backend Wayland: su Win32 non c'è (ancora) un aggancio
-    /// al vsync del compositore, quindi ritorna SUBITO `false` senza bloccare —
-    /// il chiamante degrada al proprio pacer software (stesso contratto del
-    /// timeout scaduto su Wayland).
+    /// API parity with the Wayland backend: on Win32 there is not (yet) a hook
+    /// into the compositor's vsync, so it returns `false` IMMEDIATELY without blocking —
+    /// the caller falls back to its own software pacer (same contract as the
+    /// timed-out case on Wayland).
     pub fn waitFrame(_: *Window, _: u32) bool {
         return false;
     }
@@ -529,9 +529,9 @@ pub const Window = struct {
         self.syncClientSize();
     }
 
-    /// Parità API con il backend Wayland: là il resize dev'essere differito al
-    /// thread finestra; su Win32 `SetWindowPos` marshalla da sé al thread della
-    /// finestra, quindi si può chiamare direttamente.
+    /// API parity with the Wayland backend: there the resize must be deferred to
+    /// the window thread; on Win32 `SetWindowPos` marshals itself to the window
+    /// thread, so it can be called directly.
     pub fn requestResize(self: *Window, width: u32, height: u32) void {
         self.animateResize(width, height);
     }
@@ -1048,8 +1048,8 @@ pub const Window = struct {
                     self.tracking_leave = true;
                 }
                 if (self.routeInput(.{ .motion = .{ .x = p.x, .y = p.y } })) return 0;
-                // Mouse in coordinate APP (vedi `MouseEvent`): canvas meno l'origine del
-                // frame staged/content rect — pannelli e resize band restano in canvas.
+                // Mouse in APP coordinates (see `MouseEvent`): canvas minus the origin of the
+                // staged frame/content rect — panels and the resize band stay in canvas space.
                 if (self.opts.on_mouse) |cb| {
                     const o = chrome.appOrigin(self.contentRect(), &self.front);
                     _ = cb(self, .{ .motion = .{ .x = p.x - o.x, .y = p.y - o.y } }, self.opts.user);

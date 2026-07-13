@@ -23,7 +23,7 @@ const text = zicro.text;
 /// the [`paint.Canvas`] and the pointer events (surface-local == buffer-local here).
 pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
 
-/// Bounding box dell'unione di due rect (per l'accumulo del damage).
+/// Bounding box of the union of two rects (for damage accumulation).
 pub fn unionOf(a: Rect, b: Rect) Rect {
     const x0 = @min(a.x, b.x);
     const y0 = @min(a.y, b.y);
@@ -216,9 +216,9 @@ pub const Registry = struct {
         var i = self.panels.items.len;
         while (i > 0) {
             i -= 1;
-            // Un pannello può rimuoversi (o rimuoverne altri) dentro `onInput` e la
-            // lista si accorcia sotto i piedi: riallinea l'indice alla nuova coda
-            // prima di dereferenziare.
+            // A panel may remove itself (or others) inside `onInput` and the
+            // list shrinks under our feet: realign the index to the new tail
+            // before dereferencing.
             if (i >= self.panels.items.len) {
                 i = self.panels.items.len;
                 continue;
@@ -237,10 +237,10 @@ pub const Registry = struct {
         return active;
     }
 
-    /// Bounding box di ciò che i panel possono aver toccato (union dei
-    /// `dirtyBounds`): `.rect` per il damage parziale, `.none` se nessun panel
-    /// disegna nulla, `.unknown` se ALMENO un panel non sa dichiararlo — il
-    /// chiamante allora ridisegna tutto (default conservativo).
+    /// Bounding box of what the panels may have touched (union of the
+    /// `dirtyBounds`): `.rect` for partial damage, `.none` if no panel
+    /// draws anything, `.unknown` if AT LEAST one panel cannot declare it — the
+    /// caller then redraws everything (conservative default).
     pub fn dirtyBounds(self: *Registry, host: Host) Panel.Dirty {
         var acc: Panel.Dirty = .none;
         for (self.panels.items) |e| switch (e.panel.dirty(host)) {
