@@ -191,12 +191,22 @@ pub const Window = struct {
     pub fn glCount(self: *Window) usize {
         return self.gl_rec.vertexCount();
     }
-    /// La lista di comandi (run per-texture) dell'ultimo frame (layout `paint_gl.Cmd`).
-    pub fn glCmdBytes(self: *Window) []const u8 {
-        return self.gl_rec.cmdBytes();
+    // Atlante glifi/icone (RGBA 2048²): il lato JS lo carica quando cambia (banda sporca)
+    // e disegna l'intero frame in UNA draw call.
+    pub fn glAtlasPtr(self: *Window) usize {
+        return @intFromPtr(self.gl_rec.atlasPtr());
     }
-    pub fn glCmdCount(self: *Window) usize {
-        return self.gl_rec.cmdCount();
+    pub fn glAtlasReady(self: *Window) bool {
+        return self.gl_rec.atlasReady();
+    }
+    pub fn glDirtyLo(self: *Window) u32 {
+        return self.gl_rec.dirtyLo();
+    }
+    pub fn glDirtyHi(self: *Window) u32 {
+        return self.gl_rec.dirtyHi();
+    }
+    pub fn glClearDirty(self: *Window) void {
+        self.gl_rec.clearDirty();
     }
 
     pub fn textFont(self: *Window) !*text.Font {
