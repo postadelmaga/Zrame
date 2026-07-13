@@ -158,6 +158,12 @@ pub const Window = struct {
     pub fn scaleFactor(_: *const Window) f32 {
         return zicro.window.scaleFactor();
     }
+    /// Responsive metrics (dp size, form factor, touch, density) — the browser reports
+    /// devicePixelRatio and touch; the content size is the current canvas.
+    pub fn metrics(self: *Window) facade.Metrics {
+        const c = self.contentPx();
+        return facade.computeMetrics(zicro.window.scaleFactor(), c.w, c.h, zicro.window.isTouch());
+    }
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }

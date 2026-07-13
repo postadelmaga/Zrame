@@ -104,6 +104,12 @@ pub const Window = struct {
     pub fn scaleFactor(_: *const Window) f32 {
         return 1;
     }
+    /// Responsive metrics — Android is always touch-primary. (Display density feeds in
+    /// through `scaleFactor`; until it's wired it stays 1, so `w_dp` == physical px.)
+    pub fn metrics(self: *Window) facade.Metrics {
+        const c = self.contentPx();
+        return facade.computeMetrics(self.scaleFactor(), c.w, c.h, true);
+    }
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }

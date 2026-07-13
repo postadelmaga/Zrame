@@ -436,6 +436,11 @@ pub const Window = struct {
     pub fn scaleFactor(_: *const Window) f32 {
         return 1.0;
     }
+    /// Responsive metrics — desktop, pointer-driven (no touch).
+    pub fn metrics(self: *Window) facade.Metrics {
+        const c = self.contentPx();
+        return facade.computeMetrics(self.scaleFactor(), c.w, c.h, false);
+    }
 
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; newest
     /// frame wins. Wakes the UI thread with a thread-safe PostMessageW.

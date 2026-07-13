@@ -1389,6 +1389,12 @@ pub const Window = struct {
     pub fn scaleFactor(self: *const Window) f32 {
         return @as(f32, @floatFromInt(self.scale120)) / 120.0;
     }
+    /// Responsive metrics — desktop is pointer-driven (no touch); dp derives from the
+    /// physical content size and the compositor's fractional scale.
+    pub fn metrics(self: *Window) facade.Metrics {
+        const c = self.contentPx();
+        return facade.computeMetrics(self.scaleFactor(), c.w, c.h, false);
+    }
 
     /// Logical → physical pixels, rounded.
     fn physPx(self: *const Window, v: u32) u32 {
