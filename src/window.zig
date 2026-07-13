@@ -113,6 +113,11 @@ pub const MouseEvent = union(enum) {
     leave,
 };
 
+/// Gesto multi-touch riconosciuto dal substrato (pinch, …). Un dito arriva come evento
+/// mouse su `on_mouse`; due dita qui. `scale` = rapporto di zoom incrementale, `(cx,cy)` il
+/// centro, `(dx,dy)` la traslazione — l'app zooma/pana a modo suo. Vedi `zicro.gesture`.
+pub const GestureEvent = zicro.gesture.Gesture;
+
 /// Declarative tray-icon config (see `tray.zig`). `on_activate` fires on left-click.
 /// Linux-only in effect (StatusNotifierItem over DBus); ignored on other platforms.
 pub const TrayConfig = struct {
@@ -180,6 +185,9 @@ pub const Options = struct {
     /// hit-testing). Returns **true to consume** the event so the window skips its
     /// default handling.
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) bool = null,
+    /// Optional multi-touch gesture handler (pinch, …) recognised by the substrate. Single
+    /// touch still arrives through `on_mouse`; two fingers here. See [`GestureEvent`].
+    on_gesture: ?*const fn (window: *Window, gesture: GestureEvent, user: ?*anyopaque) void = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). Linux-only; a no-op
     /// elsewhere.
     tray: ?TrayConfig = null,

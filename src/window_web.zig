@@ -128,6 +128,7 @@ pub const Window = struct {
             .on_draw = innerDraw,
             .on_key = innerKey,
             .on_mouse = innerMouse,
+            .on_gesture = innerGesture,
             .user = self,
         });
         return self;
@@ -391,6 +392,19 @@ pub const Window = struct {
                 if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = value_px, .line = true } }, self.host())) return;
                 if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(value_px * 256.0), self.opts.user);
             },
+        }
+    }
+
+    // Gesto multi-touch dal substrato: come `innerMouse`, riporta il centro in coordinate
+    // app (sottrae l'origine del content); dx/dy sono delta e restano invariati.
+    fn innerGesture(_: *zicro.window.Window, g: zicro.gesture.Gesture, user: ?*anyopaque) void {
+        const self: *Window = @ptrCast(@alignCast(user.?));
+        if (self.opts.on_gesture) |cb| {
+            const o = chrome.appOrigin(self.contentRect(), &self.front);
+            var gg = g;
+            gg.cx -= o.x;
+            gg.cy -= o.y;
+            cb(self, gg, self.opts.user);
         }
     }
 };
