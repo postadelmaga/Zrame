@@ -70,9 +70,24 @@ pub const Window = struct {
     cache_w: u32 = 0,
     cache_h: u32 = 0,
 
-    pub fn init(gpa: Allocator, opts: Options) !*Window {
+    pub fn init(gpa: Allocator, opts_in: Options) !*Window {
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
+
+        // Web default: NO glass frame — sul web il tab del browser È la finestra, quindi il
+        // contenuto riempie il <canvas> edge-to-edge (come il backend Android). A meno che
+        // l'app non chieda esplicitamente una titlebar (lo showcase della finestra glass
+        // decorata), il chrome collassa allo stile "trivial" (margin/raggi/fade = 0) → il
+        // present è una scrittura opaca full-window, niente pannello/ombra/bordo.
+        var opts = opts_in;
+        if (!opts.titlebar) {
+            opts.style.margin = 0;
+            opts.style.corner_radius = 0;
+            opts.style.content_radius = 0;
+            opts.style.content_fade_width = 0;
+            opts.style.border_anim_width = 0;
+        }
+
         self.* = .{
             .gpa = gpa,
             .opts = opts,

@@ -9,6 +9,7 @@ const zicro = @import("zicro");
 pub const paint = zicro.paint;
 pub const text = zicro.text;
 pub const widget = zicro.widget;
+pub const keymap = zicro.keymap;
 
 pub const window = @import("window.zig"); // facade → wasm branch → window_web
 pub const plugin = @import("plugin.zig");

@@ -7,6 +7,9 @@ const zicro = @import("zicro");
 pub const paint = zicro.paint;
 pub const text = zicro.text;
 pub const widget = zicro.widget;
+pub const keymap = zicro.keymap;
+/// The NDK glue struct (`android_app`) an `android_main` entry receives.
+pub const android = zicro.android;
 
 pub const window = @import("window.zig"); // facade → window_android on android
 pub const plugin = @import("plugin.zig");
