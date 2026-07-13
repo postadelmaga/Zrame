@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
     }.add;
     inline for (.{ "hello", "frames", "scroll", "widgets" }) |name| addExample(b, target, optimize, zrame, zicro, name);
     if (target.result.os.tag == .linux) {
-        inline for (.{ "tray", "menu" }) |name| addExample(b, target, optimize, zrame, zicro, name);
+        inline for (.{ "tray", "menu", "runtime" }) |name| addExample(b, target, optimize, zrame, zicro, name);
     }
 
     // A loadable plugin built as a shared library, plus a host that dlopens it:

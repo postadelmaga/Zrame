@@ -27,6 +27,7 @@ pub const sdbus = @import("sdbus.zig");
 pub const tray = @import("tray.zig");
 pub const dbusmenu = @import("dbusmenu.zig");
 pub const appmenu = @import("appmenu.zig");
+pub const runtime = @import("runtime.zig");
 // The immediate-mode toolkit lives in zicro (it only needs paint/text/anim and the
 // normalized input events); re-exported so zrame apps keep their spelling.
 pub const widget = zicro.widget;
@@ -52,6 +53,7 @@ pub const Event = plugin.Event;
 pub const Action = plugin.Action;
 pub const Info = plugin.Info;
 pub const Widgets = widgets.Widgets;
+pub const Runtime = runtime.Runtime;
 
 test {
     @import("std").testing.refAllDecls(@This());
