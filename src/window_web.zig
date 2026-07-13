@@ -70,6 +70,13 @@ pub const Window = struct {
     cache_w: u32 = 0,
     cache_h: u32 = 0,
 
+    /// Motore 2D-GL (Slice 2): quando `gl_mode` è attivo, `innerDraw` compone `on_draw`+
+    /// pannelli in un `Canvas` GPU-backed (registra vertici in `gl_rec`) invece del raster
+    /// CPU; il lato JS legge `glBytes()` e li disegna via l'ubershader WebGL2. Default OFF.
+    gl_mode: bool = false,
+    gl_rec: zicro.paint_gl.GlRecorder = undefined,
+    gl_iface: paint.GlBackend = undefined,
+
     pub fn init(gpa: Allocator, opts_in: Options) !*Window {
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
@@ -95,6 +102,11 @@ pub const Window = struct {
             .win_h = opts.height + 2 * opts.style.margin,
             .panels = plugin.Registry.init(gpa),
         };
+
+        // Recorder 2D-GL (Slice 2): il Window è su heap (gpa.create) → `&self.gl_rec` è
+        // stabile, quindi `gl_iface` può puntarci per tutta la vita della pagina.
+        self.gl_rec = zicro.paint_gl.GlRecorder.init(gpa);
+        self.gl_iface = self.gl_rec.iface();
 
         // Bottom-most panel: floating scrollbars (borrowed — the Window owns the field).
         try self.panels.add(Panel.of(scroll.Scroll, &self.scrollbars), false);
@@ -165,6 +177,26 @@ pub const Window = struct {
     /// Stage an externally-rendered straight-RGBA frame (composed centered in the content).
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
         _ = chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba);
+    }
+
+    // --- motore 2D-GL: seam per gli export wasm (li chiama l'app in web.zig) ------------
+    pub fn setGl(self: *Window, on: bool) void {
+        self.gl_mode = on;
+    }
+    /// I vertici dell'ultimo frame come byte grezzi (layout `paint_gl.Vertex`), da caricare
+    /// nel VBO lato JS. Validi dopo `innerDraw`.
+    pub fn glBytes(self: *Window) []const u8 {
+        return self.gl_rec.vertexBytes();
+    }
+    pub fn glCount(self: *Window) usize {
+        return self.gl_rec.vertexCount();
+    }
+    /// La lista di comandi (run per-texture) dell'ultimo frame (layout `paint_gl.Cmd`).
+    pub fn glCmdBytes(self: *Window) []const u8 {
+        return self.gl_rec.cmdBytes();
+    }
+    pub fn glCmdCount(self: *Window) usize {
+        return self.gl_rec.cmdCount();
     }
 
     pub fn textFont(self: *Window) !*text.Font {
@@ -274,6 +306,20 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(user.?));
         self.win_w = @intCast(@max(content.w, 1));
         self.win_h = @intCast(@max(content.h, 1));
+
+        // Motore 2D-GL: compone `on_draw`+pannelli in un Canvas GPU-backed (registra vertici
+        // in `gl_rec`); niente raster CPU né premul→straight. Il present è lato JS (ubershader
+        // WebGL2 che legge `glBytes()`). Il chrome glass è disabilitato sul web (titlebar=false).
+        if (self.gl_mode) {
+            self.gl_rec.reset();
+            _ = self.panels.tick(0.016, self.host());
+            chrome.swapFront(&self.lock, &self.staged, &self.front);
+            const cr = self.contentRect();
+            var gc = paint.Canvas{ .pixels = &.{}, .width = self.win_w, .height = self.win_h, .gl = &self.gl_iface };
+            chrome.composeContent(&gc, cr, cr, &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+            return;
+        }
+
         const n = @as(usize, self.win_w) * self.win_h;
         self.ensure(&self.decor, n);
         if (self.decor.len < n or canvas.pixels.len < n) return;

@@ -7,6 +7,7 @@
 const zicro = @import("zicro");
 
 pub const paint = zicro.paint;
+pub const paint_gl = zicro.paint_gl;
 pub const text = zicro.text;
 pub const widget = zicro.widget;
 pub const keymap = zicro.keymap;

@@ -15,6 +15,7 @@
 const zicro = @import("zicro");
 pub const wl = zicro.wl;
 pub const paint = zicro.paint;
+pub const paint_gl = zicro.paint_gl;
 pub const window = @import("window.zig");
 pub const sink = @import("sink.zig");
 pub const text = zicro.text;
