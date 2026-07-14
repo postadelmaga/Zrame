@@ -175,6 +175,9 @@ pub const Window = struct {
     // on the Wayland surface are NOT thread-safe, so `requestResize` only stages
     // the target and the run loop calls `animateResize` on the window thread.
     pending_resize: ?[2]u32 = null,
+    // `hideVideo` from another thread: same reason — the unmap is a surface op,
+    // so it is staged here and performed on the window thread.
+    pending_hide_video: std.atomic.Value(bool) = .init(false),
     // True once `run` is pumping. Before that (init roundtrips) `onXdgConfigure` must
     // redraw synchronously to map the window; during the loop it only flags a redraw so
     // a burst of resize configures coalesces into one paint per iteration.
@@ -532,6 +535,21 @@ pub const Window = struct {
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
+    /// Unmap the video subsurface, so the parent's own staged frame
+    /// (`presentRgba`) is what the window shows again.
+    ///
+    /// A dmabuf frame does not replace the parent's content, it is a SUBSURFACE
+    /// stacked above it — so an app that renders 3D on the GPU and then wants to
+    /// show something composed in software instead (a picture slide, a still)
+    /// would find its last GPU frame still sitting on top of it. This takes the
+    /// video plane away; the next `presentDmabuf` puts it straight back.
+    /// Thread-safe (the unmap itself happens on the window thread).
+    pub fn hideVideo(self: *Window) void {
+        self.pending_hide_video.store(true, .release);
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
     /// Present a GPU frame with zero CPU pixel work: `fd` is a dmabuf export
     /// of the frame image (`fourcc`/`stride`/`modifier` as the exporter
     /// reports them). `slot` (0..2) identifies a persistent image the caller
@@ -845,6 +863,16 @@ pub const Window = struct {
             self.pending_resize = null;
             self.mutex.unlock();
             if (rr) |wh| self.animateResize(wh[0], wh[1]);
+
+            // Same rule for taking the video plane away (see `hideVideo`).
+            if (self.pending_hide_video.swap(false, .acquire)) {
+                if (self.video_surface) |vs| {
+                    vs.attach(null, 0, 0);
+                    vs.commit();
+                    self.needs_redraw = true;
+                    self.dirty_full = true;
+                }
+            }
 
             if (self.overlay_dirty.swap(false, .acquire)) {
                 self.dirty_full = true;

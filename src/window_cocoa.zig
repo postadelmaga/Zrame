@@ -129,6 +129,9 @@ pub const Window = struct {
     }
 
     /// dmabuf zero-copy present is a Linux/Wayland path; callers fall back to `presentRgba`.
+    /// No video plane on this backend (`presentDmabuf` is a no-op): nothing to hide.
+    pub fn hideVideo(_: *Window) void {}
+
     pub fn presentDmabuf(_: *Window, _: u8, _: i32, _: u32, _: u32, _: u32, _: u32, _: u64) bool {
         return false;
     }

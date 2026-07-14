@@ -171,6 +171,9 @@ pub const Window = struct {
     pub fn waitFrame(_: *Window, _: u32) bool {
         return true;
     }
+    /// No video plane on this backend (`presentDmabuf` is a no-op): nothing to hide.
+    pub fn hideVideo(_: *Window) void {}
+
     pub fn presentDmabuf(_: *Window, _: u8, _: i32, _: u32, _: u32, _: u32, _: u32, _: u64) bool {
         return false; // GPU zero-copy is a Linux/Wayland path
     }
