@@ -46,6 +46,9 @@ pub const Window = struct {
     win_h: u32,
     closed: bool = false,
     fullscreen: bool = false,
+    /// Pixels reserved on the right of the content for the app's own overlay
+    /// (see `reserveGutter`).
+    gutter_right: u32 = 0,
     maximized: bool = false,
 
     font: ?text.Font = null,
@@ -93,6 +96,20 @@ pub const Window = struct {
             opts.style.content_radius = 0;
             opts.style.content_fade_width = 0;
             opts.style.border_anim_width = 0;
+            // Zeroing the geometry is not enough: `drawChrome` paints the glass fill and
+            // the highlight ring at the panel edge whatever the margin is, so a window
+            // that asked for no frame still came out with a translucent border drawn
+            // around a page that has nothing behind it to shine through. A tab has no
+            // compositor blur — a "glass" panel over a browser is a grey ring and a veil
+            // over the app's own background. So the chrome collapses to an OPAQUE fill of
+            // the same colour: no ring, no shadow, no translucency, and the pixels the app
+            // does not paint are simply its background.
+            opts.style.border_alpha = 0;
+            opts.style.shadow_alpha = 0;
+            opts.style.glass_fade_width = 0;
+            opts.style.sheen = 0;
+            opts.style.specular = 0;
+            opts.style.glass.a = 1.0;
         }
 
         self.* = .{
@@ -173,6 +190,20 @@ pub const Window = struct {
     }
     /// No video plane on this backend (`presentDmabuf` is a no-op): nothing to hide.
     pub fn hideVideo(_: *Window) void {}
+
+    /// The browser repaints the whole canvas every animation frame, so an overlay
+    /// that changed is already on its way: there is no partial-damage path here to
+    /// tell, and nothing to wake — the rAF loop never sleeps. (On Wayland this is
+    /// what keeps a HUD from freezing over a moving video plane.)
+    pub fn invalidate(_: *Window) void {}
+
+    /// Keep `px` pixels of the content for the app's own overlay (a side panel), so
+    /// a staged frame centers in the rest. Same contract as Wayland's; here the app
+    /// composes into the canvas itself, so recording the reservation is all there is
+    /// to do — the app reads it back through `contentPx` and lays out around it.
+    pub fn reserveGutter(self: *Window, px: u32) void {
+        self.gutter_right = px;
+    }
 
     pub fn presentDmabuf(_: *Window, _: u8, _: i32, _: u32, _: u32, _: u32, _: u32, _: u64) bool {
         return false; // GPU zero-copy is a Linux/Wayland path
