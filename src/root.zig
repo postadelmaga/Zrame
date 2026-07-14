@@ -33,6 +33,9 @@ pub const runtime = @import("runtime.zig");
 // normalized input events); re-exported so zrame apps keep their spelling.
 pub const widget = zicro.widget;
 pub const keymap = zicro.keymap;
+pub const proportion = zicro.proportion;
+pub const phi = zicro.phi; // rapporto aureo del substrato (default di proporzione)
+pub const clipboard = zicro.clipboard; // appunti generici del substrato (blob opaco + tag)
 pub const widgets = @import("widgets.zig");
 
 pub const Window = window.Window;
