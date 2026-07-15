@@ -178,6 +178,10 @@ pub const Window = struct {
     // `hideVideo` from another thread: same reason — the unmap is a surface op,
     // so it is staged here and performed on the window thread.
     pending_hide_video: std.atomic.Value(bool) = .init(false),
+    /// Cross-thread "toggle hide/show" request (tray click, global shortcut).
+    pending_toggle_visible: std.atomic.Value(bool) = .init(false),
+    /// True while the toplevel is unmapped by `setVisible(false)` (hidden to tray).
+    hidden: bool = false,
     // True once `run` is pumping. Before that (init roundtrips) `onXdgConfigure` must
     // redraw synchronously to map the window; during the loop it only flags a redraw so
     // a burst of resize configures coalesces into one paint per iteration.
@@ -864,6 +868,10 @@ pub const Window = struct {
             self.mutex.unlock();
             if (rr) |wh| self.animateResize(wh[0], wh[1]);
 
+            // Same rule for hide/show: the unmap/remap touches the surface,
+            // so it must run here on the window thread (see `requestToggleVisible`).
+            if (self.pending_toggle_visible.swap(false, .acquire)) self.setVisible(self.hidden);
+
             // Same rule for taking the video plane away (see `hideVideo`).
             if (self.pending_hide_video.swap(false, .acquire)) {
                 if (self.video_surface) |vs| {
@@ -881,6 +889,53 @@ pub const Window = struct {
 
             if (self.configured and self.needs_redraw) try self.redraw();
         }
+    }
+
+    /// Hide (unmap) or re-show (remap) the toplevel — the "minimize to tray"
+    /// primitive. Window thread only; from other threads use `requestToggleVisible`.
+    ///
+    /// Hiding follows the `animateResize` unmap recipe but STOPS before the
+    /// initial empty commit: that commit is what solicits the configure that
+    /// remaps the surface, so it belongs to the show half. While hidden,
+    /// `configured` stays false, which keeps the run loop from redrawing, and
+    /// staged frames simply accumulate in the mailbox (newest wins) until show.
+    pub fn setVisible(self: *Window, show: bool) void {
+        if (show == !self.hidden) return;
+        if (show) {
+            self.hidden = false;
+            if (self.surface) |surface| {
+                // Initial commit (no buffer): the compositor answers with a
+                // configure; onXdgConfigure raises `configured` and the next
+                // redraw re-attaches pixels → the window remaps where it was.
+                surface.commit();
+            }
+            self.redrawAll();
+        } else {
+            if (self.surface) |surface| {
+                surface.attach(null, 0, 0);
+                surface.commit();
+            }
+            self.configured = false;
+            self.frame_cb_pending = false;
+            self.hidden = true;
+            // A hidden surface gets no frame callbacks: release anyone parked
+            // in `waitFrame` so render workers fall back to their own pacer.
+            self.wakeFrameWaiters();
+        }
+    }
+
+    /// True while the window is on screen (not hidden to tray).
+    pub fn isVisible(self: *Window) bool {
+        return !self.hidden;
+    }
+
+    /// Toggle hide/show from any thread (tray click, global shortcut, RPC):
+    /// stages the request and wakes the run loop, which performs the
+    /// unmap/remap on the window thread (Wayland surfaces are not thread-safe).
+    pub fn requestToggleVisible(self: *Window) void {
+        self.pending_toggle_visible.store(true, .release);
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
     /// sd-bus `Activate` trampoline: recover the window from the tray's ctx and forward to
