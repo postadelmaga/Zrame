@@ -175,6 +175,10 @@ pub const Window = struct {
     // on the Wayland surface are NOT thread-safe, so `requestResize` only stages
     // the target and the run loop calls `animateResize` on the window thread.
     pending_resize: ?[2]u32 = null,
+    // Clipboard text staged by another thread (guarded by `mutex`, owned by the
+    // window's gpa): the run loop applies it via `clipboardSet`, which must run
+    // on the window thread and wants a recent input serial.
+    pending_clip: ?[]u8 = null,
     // `hideVideo` from another thread: same reason — the unmap is a surface op,
     // so it is staged here and performed on the window thread.
     pending_hide_video: std.atomic.Value(bool) = .init(false),
@@ -219,6 +223,18 @@ pub const Window = struct {
     xkb_context: ?*xkb.Context = null,
     xkb_keymap: ?*xkb.Keymap = null,
     xkb_state: ?*xkb.State = null,
+
+    // --- client-side key repeat ---------------------------------------------------------
+    // Wayland delegates auto-repeat to the client: the compositor only sends one
+    // press/release pair plus `repeat_info` (rate/delay). A dedicated timerfd fires
+    // the synthetic repeats; the shared animation timer_fd self-disarms and can't
+    // hold a steady cadence.
+    /// From `wl_keyboard.repeat_info`; rate in keys/sec, delay in ms. rate 0 = disabled.
+    repeat_rate: i32 = 25,
+    repeat_delay: i32 = 400,
+    /// evdev keycode currently held and repeating (0 = none).
+    repeat_key: u32 = 0,
+    repeat_fd: posix.fd_t = -1,
 
     // --- clipboard (wl_data_device selection) -----------------------------------------
     /// Latest keyboard/pointer-button input serial: `set_selection` must be
@@ -355,6 +371,11 @@ pub const Window = struct {
         const timer_fd: posix.fd_t = @intCast(tfd);
         errdefer _ = linux.close(timer_fd);
 
+        const rfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+        if (linux.errno(rfd) != .SUCCESS) return error.TimerFdFailed;
+        const repeat_fd: posix.fd_t = @intCast(rfd);
+        errdefer _ = linux.close(repeat_fd);
+
         const self = try gpa.create(Window);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -366,6 +387,7 @@ pub const Window = struct {
             .panel_h = opts.height,
             .wake_fd = wake_fd,
             .timer_fd = timer_fd,
+            .repeat_fd = repeat_fd,
             .panels = plugin.Registry.init(gpa),
         };
         self.panel_w = @max(self.panel_w, self.minPanel());
@@ -467,6 +489,7 @@ pub const Window = struct {
         if (self.selection_offer) |o| o.destroy();
         if (self.data_device) |d| d.release();
         if (self.clip_text.len > 0) self.gpa.free(self.clip_text);
+        if (self.pending_clip) |p| self.gpa.free(p);
         if (self.xkb_state) |st| xkb.xkb_state_unref(st);
         if (self.xkb_keymap) |km| xkb.xkb_keymap_unref(km);
         if (self.xkb_context) |ctx| xkb.xkb_context_unref(ctx);
@@ -482,6 +505,7 @@ pub const Window = struct {
         wl.wl_display_disconnect(self.display);
         _ = linux.close(self.wake_fd);
         if (self.timer_fd >= 0) _ = linux.close(self.timer_fd);
+        if (self.repeat_fd >= 0) _ = linux.close(self.repeat_fd);
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -534,6 +558,20 @@ pub const Window = struct {
     pub fn requestResize(self: *Window, width: u32, height: u32) void {
         self.mutex.lock();
         self.pending_resize = .{ width, height };
+        self.mutex.unlock();
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
+    /// Thread-safe `clipboardSet`: stages a copy of `bytes` and wakes the run
+    /// loop, which takes the selection on the window thread. Newest wins if
+    /// called again before the loop drains. For window-thread callers,
+    /// `clipboardSet` directly is simpler and immediate.
+    pub fn requestClipboardSet(self: *Window, bytes: []const u8) void {
+        const copy = self.gpa.dupe(u8, bytes) catch return;
+        self.mutex.lock();
+        if (self.pending_clip) |old| self.gpa.free(old);
+        self.pending_clip = copy;
         self.mutex.unlock();
         const one: u64 = 1;
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
@@ -803,6 +841,7 @@ pub const Window = struct {
                 .{ .fd = wl.wl_display_get_fd(self.display), .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.wake_fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.timer_fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
                 // Negative fd = ignored by poll, so these slots are inert when absent.
                 .{ .fd = if (self.tray) |t| t.fd() else -1, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = if (self.menu) |mnu| mnu.fd() else -1, .events = posix.POLL.IN, .revents = 0 },
@@ -852,12 +891,13 @@ pub const Window = struct {
             }
 
             if (fds[2].revents & posix.POLL.IN != 0) self.onTimerTick();
+            if (fds[3].revents & posix.POLL.IN != 0) self.onRepeatTick();
 
             if (self.tray) |t| {
-                if (fds[3].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) t.process();
+                if (fds[4].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) t.process();
             }
             if (self.menu) |mnu| {
-                if (fds[4].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) mnu.process();
+                if (fds[5].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) mnu.process();
             }
 
             // Resize requested by another thread: run it HERE, on the window
@@ -871,6 +911,16 @@ pub const Window = struct {
             // Same rule for hide/show: the unmap/remap touches the surface,
             // so it must run here on the window thread (see `requestToggleVisible`).
             if (self.pending_toggle_visible.swap(false, .acquire)) self.setVisible(self.hidden);
+
+            // Clipboard staged by another thread (see `requestClipboardSet`).
+            self.mutex.lock();
+            const pclip = self.pending_clip;
+            self.pending_clip = null;
+            self.mutex.unlock();
+            if (pclip) |clip| {
+                self.clipboardSet(clip);
+                self.gpa.free(clip);
+            }
 
             // Same rule for taking the video plane away (see `hideVideo`).
             if (self.pending_hide_video.swap(false, .acquire)) {
@@ -1164,6 +1214,14 @@ pub const Window = struct {
         self.closed = true;
     }
 
+    /// Thread-safe `close`: set the flag and wake the run loop so it exits
+    /// even when idle. Safe to call from any thread (e.g. the RPC server).
+    pub fn requestClose(self: *Window) void {
+        self.closed = true;
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
     /// Dynamically update the window's decoration style. Window thread only (it talks
     /// to Wayland objects): call it from an input callback or before [`run`].
     pub fn setStyle(self: *Window, style: Style) !void {
@@ -1269,8 +1327,15 @@ pub const Window = struct {
     /// text. Ownership needs a recent input serial, so call it in response to input.
     /// Window thread only (talks to Wayland objects) — call from an input callback.
     pub fn clipboardSet(self: *Window, bytes: []const u8) void {
-        const mgr = self.data_device_manager orelse return;
-        const dev = self.data_device orelse return;
+        const mgr = self.data_device_manager orelse {
+            std.log.debug("zrame: clipboardSet senza data_device_manager", .{});
+            return;
+        };
+        const dev = self.data_device orelse {
+            std.log.debug("zrame: clipboardSet senza data_device", .{});
+            return;
+        };
+        std.log.debug("zrame: clipboardSet {d} byte, serial {d}", .{ bytes.len, self.input_serial });
         const copy = self.gpa.dupe(u8, bytes) catch return;
         if (self.clip_text.len > 0) self.gpa.free(self.clip_text);
         self.clip_text = copy;
@@ -1287,6 +1352,15 @@ pub const Window = struct {
         dev.setSelection(src, self.input_serial);
         self.data_source = src;
         _ = wl.wl_display_flush(self.display);
+    }
+
+    /// Our own selection text when WE currently own the clipboard, else null.
+    /// The complement of `clipboardGet`'s self-paste hole; the slice is owned
+    /// by the window (valid until the next `clipboardSet`/deinit) — copy it to
+    /// keep it. Window thread only.
+    pub fn clipboardOwn(self: *Window) ?[]const u8 {
+        if (self.data_source == null) return null;
+        return if (self.clip_text.len > 0) self.clip_text else null;
     }
 
     /// Read the system selection as UTF-8 text (the ctrl+V side). Returns null when the
@@ -1987,12 +2061,17 @@ pub const Window = struct {
     }
 
     fn onKeyEnter(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface, _: ?*anyopaque) callconv(.c) void {}
-    fn onKeyLeave(_: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface) callconv(.c) void {}
+    fn onKeyLeave(data: ?*anyopaque, _: *wl.Keyboard, _: u32, _: ?*wl.Surface) callconv(.c) void {
+        // Focus gone: the release for a held key will never arrive — stop repeating.
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.cancelRepeat();
+    }
 
     fn onKey(data: ?*anyopaque, _: *wl.Keyboard, serial: u32, _: u32, key: u32, state: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.input_serial = serial;
         const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
+        if (pressed) self.armRepeat(key) else if (key == self.repeat_key) self.cancelRepeat();
         if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
         if (key == wl.KEY_ESC and pressed) {
             // Layered dismissal: the topmost registered layer eats this ESC.
@@ -2004,6 +2083,46 @@ pub const Window = struct {
         }
         if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
         if (pressed) self.emitText(key);
+    }
+
+    /// Start (or retarget — a newer key steals the repeat, like every toolkit) the
+    /// repeat timer for `key`, if the keymap marks it as repeating. No keymap →
+    /// no repeat, matching `on_text` degrading in the same situation.
+    fn armRepeat(self: *Window, key: u32) void {
+        if (self.repeat_rate <= 0) return;
+        const km = self.xkb_keymap orelse return;
+        if (xkb.xkb_keymap_key_repeats(km, key + 8) == 0) return;
+        self.repeat_key = key;
+        const delay_ns: isize = @as(isize, self.repeat_delay) * 1_000_000;
+        const period_ns: isize = @divTrunc(1_000_000_000, @as(isize, self.repeat_rate));
+        const spec = linux.itimerspec{
+            .it_value = .{ .sec = @divTrunc(delay_ns, 1_000_000_000), .nsec = @rem(delay_ns, 1_000_000_000) },
+            .it_interval = .{ .sec = @divTrunc(period_ns, 1_000_000_000), .nsec = @rem(period_ns, 1_000_000_000) },
+        };
+        _ = linux.timerfd_settime(self.repeat_fd, .{}, &spec, null);
+    }
+
+    fn cancelRepeat(self: *Window) void {
+        if (self.repeat_key == 0) return;
+        self.repeat_key = 0;
+        const spec = std.mem.zeroes(linux.itimerspec);
+        _ = linux.timerfd_settime(self.repeat_fd, .{}, &spec, null);
+    }
+
+    /// A repeat tick: re-deliver the held key as synthetic presses, exactly like
+    /// `onKey` minus the layer/ESC bookkeeping (a repeat never dismisses a popup).
+    /// Multiple expirations (loop stalled by a redraw) are honored, capped so a
+    /// long stall can't flood the app.
+    fn onRepeatTick(self: *Window) void {
+        var expirations: u64 = 0;
+        _ = posix.read(self.repeat_fd, std.mem.asBytes(&expirations)) catch return;
+        if (self.repeat_key == 0) return;
+        const n: u64 = @min(expirations, 8);
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            if (self.opts.on_key) |cb| cb(self, self.repeat_key, wl.KEYBOARD_KEY_STATE_PRESSED, self.opts.user);
+            self.emitText(self.repeat_key);
+        }
     }
 
     /// Layout-correct text for a pressed evdev key, additive to `on_key`: 1..4 UTF-8
@@ -2027,7 +2146,12 @@ pub const Window = struct {
         // text comes out right. `group` is the effective layout index.
         if (self.xkb_state) |st| _ = xkb.xkb_state_update_mask(st, depressed, latched, locked, 0, 0, group);
     }
-    fn onKeyRepeatInfo(_: ?*anyopaque, _: *wl.Keyboard, _: i32, _: i32) callconv(.c) void {}
+    fn onKeyRepeatInfo(data: ?*anyopaque, _: *wl.Keyboard, rate: i32, delay: i32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.repeat_rate = rate;
+        self.repeat_delay = delay;
+        if (rate <= 0) self.cancelRepeat(); // compositor says: no repeat
+    }
 
     // --- touch: the primary finger is synthesized as a pointer (down→press, motion, up→release),
     //     so every zrame app is usable with touch without changes. Multi-touch (pinch) may
@@ -2197,16 +2321,26 @@ pub const Window = struct {
         self.input_serial = serial;
         const pressed = state == wl.POINTER_BUTTON_STATE_PRESSED;
         if (self.routeInput(.{ .button = .{ .x = self.pointer_x, .y = self.pointer_y, .button = button, .pressed = pressed } })) return;
+        // The resize band is window chrome: it wins over the app even when the app
+        // content reaches the panel edge (a browser consuming every click would
+        // otherwise make a frameless window impossible to resize). It matches the
+        // cursor, which already shows the resize arrows over the band unconditionally.
+        if (button == wl.BTN_LEFT and pressed and !self.fullscreen and !self.maximized) {
+            const edge = self.resizeEdgeAt(self.pointer_x, self.pointer_y);
+            if (edge != wl.RESIZE_EDGE_NONE) {
+                if (self.seat) |seat| {
+                    self.toplevel.?.resize(seat, serial, edge);
+                    return;
+                }
+            }
+        }
         if (self.opts.on_mouse) |cb| {
             // App consumed it (e.g. grabbed its own scrollbar) → skip the default
-            // window move/resize so the two don't fight over the same click.
+            // window move so the two don't fight over the same click.
             if (cb(self, .{ .button = .{ .button = button, .state = state } }, self.opts.user)) return;
         }
         if (button == wl.BTN_LEFT and state == wl.POINTER_BUTTON_STATE_PRESSED) {
-            const edge = self.resizeEdgeAt(self.pointer_x, self.pointer_y);
-            if (edge != wl.RESIZE_EDGE_NONE and !self.fullscreen and !self.maximized) {
-                if (self.seat) |seat| self.toplevel.?.resize(seat, serial, edge);
-            } else if (!self.opts.titlebar) {
+            if (!self.opts.titlebar) {
                 // No title bar to grab: keep the panel draggable from near its edge, as
                 // before. With a title bar, dragging is the bar's job (see controls.zig).
                 const p = self.physPanel();

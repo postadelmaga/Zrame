@@ -39,3 +39,7 @@ pub extern fn xkb_state_update_mask(state: *State, depressed_mods: u32, latched_
 /// (evdev code + 8). Returns the byte length the full text needs (0 = none);
 /// the buffer gets at most `size - 1` bytes plus a NUL.
 pub extern fn xkb_state_key_get_utf8(state: *State, key: u32, buffer: [*]u8, size: usize) c_int;
+
+/// Whether the keymap marks `key` (xkb keycode = evdev + 8) as auto-repeating.
+/// Modifiers and lock keys report 0; letters, arrows, backspace… report 1.
+pub extern fn xkb_keymap_key_repeats(keymap: *Keymap, key: u32) c_int;

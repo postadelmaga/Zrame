@@ -106,10 +106,10 @@ pub const Window = struct {
         gpa.destroy(self);
     }
 
-    /// Native macOS windows have no compositor blur seam (vibrancy would be
-    /// NSVisualEffectView — not wired).
-    pub fn hasBlur(_: *Window) bool {
-        return false;
+    /// Native glass: true when the zicro window mounted its NSVisualEffectView
+    /// (real AppKit). Under Darling/Cocotron the class is missing → false, as before.
+    pub fn hasBlur(self: *Window) bool {
+        return self.inner.hasBlur();
     }
 
     /// Retina scaling is not wired yet — the buffer is 1:1, as on Win32.

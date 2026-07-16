@@ -109,7 +109,14 @@ pub const Window = struct {
             opts.style.glass_fade_width = 0;
             opts.style.sheen = 0;
             opts.style.specular = 0;
-            opts.style.glass.a = 1.0;
+            // …unless the app asked for alpha 0 ON PURPOSE. That reasoning rests on "a
+            // page that has nothing behind it to shine through", and an app that requests
+            // a fully transparent glass is saying precisely that something IS behind: a
+            // second canvas under this one (E8's GPU build stacks the software HUD over a
+            // WebGPU canvas). Forcing opacity there paints a black lid over the very
+            // thing the window was made a hole for. Any other alpha still collapses to
+            // opaque, exactly as before — only a deliberate 0 gets through.
+            if (opts.style.glass.a != 0.0) opts.style.glass.a = 1.0;
         }
 
         self.* = .{
