@@ -8,6 +8,9 @@ pub const paint = zicro.paint;
 pub const text = zicro.text;
 pub const widget = zicro.widget;
 pub const keymap = zicro.keymap;
+pub const clipboard = zicro.clipboard;
+pub const proportion = zicro.proportion;
+pub const phi = zicro.phi; // rapporto aureo del substrato (default di proporzione)
 /// The NDK glue struct (`android_app`) an `android_main` entry receives.
 pub const android = zicro.android;
 
