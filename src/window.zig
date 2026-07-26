@@ -1,19 +1,24 @@
 //! # zrame.window — the public window facade
 //!
-//! The window comes in one of two shapes depending on the target OS:
+//! Five backends, selected at comptime by `Window` below:
 //!
-//! | os       | backend             | transport                              |
-//! |----------|---------------------|----------------------------------------|
-//! | linux    | `window_wayland.zig`| frameless Wayland toplevel, client-side glass chrome, compositor blur |
-//! | windows  | `window_win32.zig`  | native decorated window, GDI blit      |
+//! | os/target       | backend                | transport                                                          |
+//! |-----------------|-------------------------|---------------------------------------------------------------------|
+//! | linux (desktop) | `window_wayland.zig`    | frameless Wayland toplevel, client-side glass chrome, compositor blur |
+//! | windows         | `window_win32.zig`      | native decorated window, GDI blit                                 |
+//! | macos           | `window_cocoa.zig`      | thin adapter delegating to zicro's Cocoa window                   |
+//! | wasm            | `window_web.zig`        | thin adapter over zicro's web window, glass chrome in `<canvas>`  |
+//! | android         | `window_android.zig`    | thin adapter over zicro's NDK window                               |
 //!
-//! Both backends expose the SAME public surface (`init`/`run`/`presentRgba`/
-//! `waitFrame`/`toggleFullscreen`/`setStyle`/`animateResize`/`close` + the
-//! `panel_w`/`panel_h`/`closed` fields), so callers — and zrame's own `sink.zig` —
-//! are backend-agnostic. `waitFrame(timeout_ms)` blocks any thread until the
-//! compositor's next frame callback (Wayland); on Win32 it returns false at once
-//! and callers fall back to their own software pacer.
-//! This file owns the platform-independent public *types* both backends share, so the
+//! Every backend exposes the SAME core surface (`init`/`run`/`presentRgba`/`waitFrame`/
+//! `toggleFullscreen`/`setStyle`/`close` + the `panel_w`/`panel_h`/`closed` fields), so
+//! callers — and zrame's own `sink.zig` — are backend-agnostic; a handful of Linux-only
+//! extras (tray, dbusmenu, plugin dlopen) exist only on Wayland and are no-ops elsewhere.
+//! `waitFrame(timeout_ms)` blocks any thread until the compositor's next frame callback
+//! (Wayland); other backends return false at once and callers fall back to their own
+//! software pacer.
+//!
+//! This file owns the platform-independent public *types* every backend shares, so the
 //! callback signatures (`fn (window: *Window, …)`) resolve to the selected backend.
 
 const std = @import("std");
@@ -180,10 +185,9 @@ pub const Options = struct {
     /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
     /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates
-    /// are in **canvas coordinates** — the same space as the `content` rect passed to
-    /// `on_draw` (so use `content.x/content.y` as the origin for both drawing and
-    /// hit-testing). Returns **true to consume** the event so the window skips its
-    /// default handling.
+    /// are in the app's PRESENTATION space, not canvas space — see [`MouseEvent`]'s doc
+    /// for the exact origin. Returns **true to consume** the event so the window skips
+    /// its default handling.
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) bool = null,
     /// Optional multi-touch gesture handler (pinch, …) recognised by the substrate. Single
     /// touch still arrives through `on_mouse`; two fingers here. See [`GestureEvent`].

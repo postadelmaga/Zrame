@@ -6,8 +6,8 @@
 //! the same `poll(fd) → process()` loop (see `examples/tray.zig`), with no way to fold in a
 //! second fd (the menu, a custom bus, an app timer).
 //!
-//! [`Runtime`] is that loop, factored out: register any number of [`Source`]s — anything with
-//! an fd to poll and `flush`/`process` to drive — and call [`run`](Runtime.run). It owns the
+//! [`EventLoop`] is that loop, factored out: register any number of [`Source`]s — anything with
+//! an fd to poll and `flush`/`process` to drive — and call [`run`](EventLoop.run). It owns the
 //! `poll` set, flushes every source before parking, and dispatches the ready ones. [`stop`] is
 //! thread-safe (an eventfd breaks the poll), so another thread — or a source's own callback —
 //! can end the loop cleanly. [`Tray`](tray.Tray) and the menu [`Server`](dbusmenu.Server) both
@@ -64,7 +64,7 @@ pub const Source = struct {
 
 /// A single-threaded poll loop over a set of [`Source`]s. Not thread-safe except for
 /// [`stop`], which any thread may call to wake the loop and end it.
-pub const Runtime = struct {
+pub const EventLoop = struct {
     gpa: Allocator,
     sources: std.ArrayListUnmanaged(Source) = .empty,
     /// Reused across iterations so a steady loop does not allocate per poll.
@@ -73,43 +73,43 @@ pub const Runtime = struct {
     wake_fd: posix.fd_t,
     should_stop: std.atomic.Value(bool) = .init(false),
 
-    pub fn init(gpa: Allocator) !Runtime {
+    pub fn init(gpa: Allocator) !EventLoop {
         const efd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         if (linux.errno(efd) != .SUCCESS) return error.EventFdFailed;
         return .{ .gpa = gpa, .wake_fd = @intCast(efd) };
     }
 
-    pub fn deinit(self: *Runtime) void {
+    pub fn deinit(self: *EventLoop) void {
         self.sources.deinit(self.gpa);
         self.pollfds.deinit(self.gpa);
         _ = linux.close(self.wake_fd);
     }
 
     /// Register a source. Sources are borrowed — keep them alive for the loop's lifetime.
-    pub fn add(self: *Runtime, source: Source) !void {
+    pub fn add(self: *EventLoop, source: Source) !void {
         try self.sources.append(self.gpa, source);
     }
 
     /// Convenience: register a [`Tray`](tray.Tray).
-    pub fn addTray(self: *Runtime, t: *tray_mod.Tray) !void {
+    pub fn addTray(self: *EventLoop, t: *tray_mod.Tray) !void {
         try self.add(Source.of(tray_mod.Tray, t));
     }
 
     /// Convenience: register a standalone dbusmenu [`Server`](dbusmenu.Server).
-    pub fn addServer(self: *Runtime, s: *dbusmenu.Server) !void {
+    pub fn addServer(self: *EventLoop, s: *dbusmenu.Server) !void {
         try self.add(Source.of(dbusmenu.Server, s));
     }
 
     /// Ask the loop to exit. Thread-safe: sets the flag and wakes the `poll`. A `stop` that
     /// races ahead of [`run`] is not lost — `run` observes the flag before its first park.
-    pub fn stop(self: *Runtime) void {
+    pub fn stop(self: *EventLoop) void {
         self.should_stop.store(true, .release);
         pokeEventFd(self.wake_fd);
     }
 
     /// Poll every source until [`stop`] is called (or a source's fd errors). Flushes all
     /// sources before each park, then dispatches whichever became ready.
-    pub fn run(self: *Runtime) !void {
+    pub fn run(self: *EventLoop) !void {
         while (!self.should_stop.load(.acquire)) {
             for (self.sources.items) |s| s.flush();
 
@@ -143,12 +143,12 @@ pub const Runtime = struct {
 /// the whole loop is driven and torn down on one thread, deterministically, with no real DBus.
 const CountingSource = struct {
     efd: posix.fd_t,
-    rt: *Runtime,
+    rt: *EventLoop,
     stop_at: u32,
     processed: u32 = 0,
     flushes: u32 = 0,
 
-    fn init(rt: *Runtime, stop_at: u32) !CountingSource {
+    fn init(rt: *EventLoop, stop_at: u32) !CountingSource {
         // SEMAPHORE: a read decrements by one and the fd stays readable until it hits zero,
         // so N signals produce N distinct poll/process cycles (a plain eventfd coalesces).
         const efd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK | linux.EFD.SEMAPHORE);
@@ -176,7 +176,7 @@ const CountingSource = struct {
 };
 
 test "runtime polls, flushes, and dispatches its sources until stopped" {
-    var rt = try Runtime.init(std.testing.allocator);
+    var rt = try EventLoop.init(std.testing.allocator);
     defer rt.deinit();
 
     var src = try CountingSource.init(&rt, 3);
@@ -196,7 +196,7 @@ test "runtime polls, flushes, and dispatches its sources until stopped" {
 }
 
 test "runtime stop() from another thread ends the loop" {
-    var rt = try Runtime.init(std.testing.allocator);
+    var rt = try EventLoop.init(std.testing.allocator);
     defer rt.deinit();
 
     // A source that never signals — the loop parks in poll until stop() wakes it.
@@ -205,7 +205,7 @@ test "runtime stop() from another thread ends the loop" {
     try rt.add(Source.of(CountingSource, &src));
 
     const Stopper = struct {
-        fn kick(r: *Runtime) void {
+        fn kick(r: *EventLoop) void {
             r.stop(); // race-free: run() observes should_stop before/at its first park
         }
     };
@@ -219,6 +219,6 @@ test "runtime stop() from another thread ends the loop" {
 test "convenience registrars type-check against Tray/Server" {
     // No DBus in the test env, so we don't construct them — just force the wrappers to be
     // analyzed, proving Source.of(Tray)/Source.of(Server) match their fd/flush/process shape.
-    _ = &Runtime.addTray;
-    _ = &Runtime.addServer;
+    _ = &EventLoop.addTray;
+    _ = &EventLoop.addServer;
 }

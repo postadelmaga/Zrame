@@ -1,16 +1,19 @@
 //! # zrame — the window layer of the Frame architecture
 //!
-//! zicro deliberately stops at the `FrameSink` contract; zrame picks up from there:
-//! a frameless Wayland toplevel with client-side chrome (rounded glass, drop shadow),
-//! real compositor background blur via `ext-background-effect-v1`, and a thread-safe
-//! present path that plugs straight into zicro's video data plane.
+//! zicro owns platform transport (windowing, input, the CPU/GL canvas); zrame picks up
+//! from there with the chrome, panel stack, and multi-backend facade:
 //!
-//! | file         | role                                                        |
-//! |--------------|-------------------------------------------------------------|
-//! | `wl.zig`     | hand-written libwayland-client FFI + protocol wrappers      |
-//! | `paint.zig`  | premultiplied ARGB software canvas, SDF chrome              |
-//! | `window.zig` | the frameless glass window + event loop                     |
-//! | `sink.zig`   | zicro `video.FrameSink` adapter                             |
+//! | file            | role                                                              |
+//! |-----------------|--------------------------------------------------------------------|
+//! | `window.zig`    | the public facade (`Options`/`MouseEvent`/`Style`) + per-OS dispatch |
+//! | `window_*.zig`  | the five backends (Wayland/Win32/Cocoa/web/Android), thin adapters over zicro's window |
+//! | `chrome.zig`    | shared composition: the frame mailbox, glass panel + content blit |
+//! | `plugin.zig`    | the `Panel`/`Host`/`Registry` extension seam (title bar, menu, scrollbars, dlopen plugins) |
+//! | `sink.zig`      | zicro `video.FrameSink` adapter                                  |
+//! | `sdbus.zig`/`tray.zig`/`dbusmenu.zig`/`xkb.zig` | Linux-desktop-only integrations, Wayland backend only |
+//!
+//! `wl.zig`/`paint.zig`/`paint_gl.zig`/`text.zig`/`widget.zig` are re-exports of zicro's
+//! own modules (below) — zrame reuses the substrate rather than duplicating it.
 
 const zicro = @import("zicro");
 pub const wl = zicro.wl;
@@ -27,7 +30,6 @@ pub const scroll = @import("scroll.zig");
 pub const sdbus = @import("sdbus.zig");
 pub const tray = @import("tray.zig");
 pub const dbusmenu = @import("dbusmenu.zig");
-pub const appmenu = @import("appmenu.zig");
 pub const runtime = @import("runtime.zig");
 // The immediate-mode toolkit lives in zicro (it only needs paint/text/anim and the
 // normalized input events); re-exported so zrame apps keep their spelling.
@@ -57,7 +59,10 @@ pub const Event = plugin.Event;
 pub const Action = plugin.Action;
 pub const Info = plugin.Info;
 pub const Widgets = widgets.Widgets;
-pub const Runtime = runtime.Runtime;
+// Named EventLoop, not Runtime: zicro already has a `Runtime` (the threaded module
+// host over the pub/sub bus) — a same-named, unrelated type one import away was a
+// naming trap for apps that use both modules.
+pub const EventLoop = runtime.EventLoop;
 
 test {
     @import("std").testing.refAllDecls(@This());

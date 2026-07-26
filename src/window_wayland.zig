@@ -27,7 +27,10 @@ const menu = @import("menu.zig");
 const scroll = @import("scroll.zig");
 const tray_mod = @import("tray.zig");
 const dbusmenu = @import("dbusmenu.zig");
-const appmenu_mod = @import("appmenu.zig");
+// The org_kde_kwin_appmenu wrappers live in zicro.wl (zicro generates and links every
+// Wayland protocol table, including this one, so the interface symbol exists once).
+const appmenu_global = "org_kde_kwin_appmenu_manager";
+const appmenu_interface = &wl.org_kde_kwin_appmenu_manager_interface;
 
 // Public window types (Options, MouseEvent, TrayConfig, Rect, Style, …) live in the
 // facade `window.zig` so both backends share them and `*Window` in a callback resolves
@@ -185,7 +188,7 @@ pub const Window = struct {
     /// Cross-thread "toggle hide/show" request (tray click, global shortcut).
     pending_toggle_visible: std.atomic.Value(bool) = .init(false),
     /// True while the toplevel is unmapped by `setVisible(false)` (hidden to tray).
-    hidden: bool = false,
+    hidden: std.atomic.Value(bool) = .init(false),
     // True once `run` is pumping. Before that (init roundtrips) `onXdgConfigure` must
     // redraw synchronously to map the window; during the loop it only flags a redraw so
     // a burst of resize configures coalesces into one paint per iteration.
@@ -280,8 +283,8 @@ pub const Window = struct {
     // Optional KDE global menu: the com.canonical.dbusmenu server plus the Wayland
     // appmenu object that tells KWin where to find it. Bus fd polled alongside Wayland.
     menu: ?*dbusmenu.Server = null,
-    appmenu_manager: ?*appmenu_mod.Manager = null,
-    appmenu_obj: ?*appmenu_mod.Appmenu = null,
+    appmenu_manager: ?*wl.OrgKdeKwinAppmenuManager = null,
+    appmenu_obj: ?*wl.OrgKdeKwinAppmenu = null,
     // Open handles of `dlopen`'d plugin `.so`s. Closed after `panels.deinit` in `deinit`,
     // because the panels' `deinit` code lives inside these libraries.
     plugin_libs: std.ArrayList(std.DynLib) = .empty,
@@ -910,7 +913,7 @@ pub const Window = struct {
 
             // Same rule for hide/show: the unmap/remap touches the surface,
             // so it must run here on the window thread (see `requestToggleVisible`).
-            if (self.pending_toggle_visible.swap(false, .acquire)) self.setVisible(self.hidden);
+            if (self.pending_toggle_visible.swap(false, .acquire)) self.setVisible(self.hidden.load(.acquire));
 
             // Clipboard staged by another thread (see `requestClipboardSet`).
             self.mutex.lock();
@@ -950,10 +953,16 @@ pub const Window = struct {
     /// `configured` stays false, which keeps the run loop from redrawing, and
     /// staged frames simply accumulate in the mailbox (newest wins) until show.
     pub fn setVisible(self: *Window, show: bool) void {
-        if (show == !self.hidden) return;
+        if (show == !self.hidden.load(.acquire)) return;
         if (show) {
-            self.hidden = false;
+            self.hidden.store(false, .release);
             if (self.surface) |surface| {
+                // Unmapping reset the xdg_surface state, window geometry
+                // included: re-stage it BEFORE the mapping commit or the
+                // compositor sizes the remap from the full buffer (shadow
+                // gutter included) and echoes that as the next configure —
+                // the panel would grow by 2*margin per hide/show cycle.
+                self.applySurfaceMetrics();
                 // Initial commit (no buffer): the compositor answers with a
                 // configure; onXdgConfigure raises `configured` and the next
                 // redraw re-attaches pixels → the window remaps where it was.
@@ -967,7 +976,7 @@ pub const Window = struct {
             }
             self.configured = false;
             self.frame_cb_pending = false;
-            self.hidden = true;
+            self.hidden.store(true, .release);
             // A hidden surface gets no frame callbacks: release anyone parked
             // in `waitFrame` so render workers fall back to their own pacer.
             self.wakeFrameWaiters();
@@ -976,7 +985,7 @@ pub const Window = struct {
 
     /// True while the window is on screen (not hidden to tray).
     pub fn isVisible(self: *Window) bool {
-        return !self.hidden;
+        return !self.hidden.load(.acquire);
     }
 
     /// Toggle hide/show from any thread (tray click, global shortcut, RPC):
@@ -1882,8 +1891,8 @@ pub const Window = struct {
             self.viewporter = @ptrCast(registry.bind(name, &wl.wp_viewporter_interface, 1).?);
         } else if (std.mem.eql(u8, iface, "wp_fractional_scale_manager_v1")) {
             self.fractional_manager = @ptrCast(registry.bind(name, &wl.wp_fractional_scale_manager_v1_interface, 1).?);
-        } else if (std.mem.eql(u8, iface, appmenu_mod.manager_global)) {
-            self.appmenu_manager = @ptrCast(registry.bind(name, appmenu_mod.manager_interface, 1).?);
+        } else if (std.mem.eql(u8, iface, appmenu_global)) {
+            self.appmenu_manager = @ptrCast(registry.bind(name, appmenu_interface, 1).?);
         }
     }
 

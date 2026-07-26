@@ -18,6 +18,68 @@ const plugin = @import("plugin.zig");
 
 const Rect = plugin.Rect;
 
+/// Route a zicro mouse motion/press/release event through the panel stack, then — if no
+/// panel claimed it — into the app's `on_mouse`, converting motion into the app's
+/// presentation space (subtracting `appOrigin`). Shared by the web/android/macOS thin
+/// adapters, which are otherwise identical here; only `.scroll` is left to the caller,
+/// since each backend's `scroll_dy` is in a different unit (Wayland's wl_pointer.axis
+/// fixed-point vs. a browser/NDK raw delta).
+///
+/// `self` is `*Window` for whichever backend calls this (comptime duck-typed): it needs
+/// `.panels`, `.host()`, `.opts.{on_mouse,user}`, `.contentRect()` and `.front`, plus the
+/// optional `.pointer_x`/`.pointer_y` tracking fields some backends keep for other uses.
+pub fn forwardMouse(self: anytype, event: anytype) void {
+    const Self = @TypeOf(self.*);
+    switch (event.kind) {
+        .motion => {
+            if (@hasField(Self, "pointer_x")) self.pointer_x = event.x;
+            if (@hasField(Self, "pointer_y")) self.pointer_y = event.y;
+            if (self.panels.route(.{ .motion = .{ .x = event.x, .y = event.y } }, self.host())) return;
+            if (self.opts.on_mouse) |cb| {
+                const o = appOrigin(self.contentRect(), &self.front);
+                _ = cb(self, .{ .motion = .{ .x = event.x - o.x, .y = event.y - o.y } }, self.opts.user);
+            }
+        },
+        .press, .release => {
+            const pressed = event.kind == .press;
+            if (self.panels.route(.{ .button = .{ .x = event.x, .y = event.y, .button = event.button, .pressed = pressed } }, self.host())) return;
+            if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = event.button, .state = @intFromBool(pressed) } }, self.opts.user);
+        },
+        .scroll => {}, // backend-specific scale — the caller handles this case itself
+    }
+}
+
+/// Route a multi-touch gesture (pinch, …) from the shared `zicro.gesture` recognizer into
+/// the app's `on_gesture`, translating its center into the app's presentation space (same
+/// origin `forwardMouse` uses). Shared by the web/android adapters — the only backends
+/// that feed a touchscreen into the recognizer.
+pub fn forwardGesture(self: anytype, g: anytype) void {
+    if (self.opts.on_gesture) |cb| {
+        const o = appOrigin(self.contentRect(), &self.front);
+        var gg = g;
+        gg.cx -= o.x;
+        gg.cy -= o.y;
+        cb(self, gg, self.opts.user);
+    }
+}
+
+/// Route a key event ALREADY TRANSLATED TO EVDEV through the panel stack, the app's
+/// `on_key`, and — on press — the shared US-layout keymap into `on_text`. Tracks shift
+/// state on `self.shift_down` for that keymap lookup. Shared by the web/android
+/// adapters: neither platform hands zrame real layout-aware text (unlike Wayland's
+/// xkbcommon or Win32's `WM_CHAR`), so both synthesize it the same way from raw keys.
+pub fn forwardKey(self: anytype, evdev: u32, state: u32) void {
+    const pressed = state == 1;
+    if (evdev == 42 or evdev == 54) self.shift_down = pressed; // Left/Right Shift
+    if (self.panels.route(.{ .key = .{ .key = evdev, .pressed = pressed } }, self.host())) return;
+    if (self.opts.on_key) |cb| cb(self, evdev, state, self.opts.user);
+    if (pressed) {
+        if (self.opts.on_text) |cb| {
+            if (zicro.keymap.toChar(evdev, self.shift_down)) |ch| cb(self, .{ ch, 0, 0, 0 }, 1, self.opts.user);
+        }
+    }
+}
+
 /// The staged/front RGBA frame. `presentRgba` fills `staged`; the window thread swaps it
 /// into `front` before compositing, so the per-pixel blit never runs under the lock.
 pub const Staged = struct {

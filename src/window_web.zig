@@ -87,37 +87,11 @@ pub const Window = struct {
         // Web default: NO glass frame — on the web the browser tab IS the window, so the
         // content fills the <canvas> edge-to-edge (like the Android backend). Unless the
         // app explicitly asks for a titlebar (the decorated glass-window showcase), the
-        // chrome collapses to the "trivial" style (margin/radii/fade = 0) → the present
-        // is an opaque full-window write, no panel/shadow/border.
+        // style collapses via `Style.contentFill` — see its doc for the opaque-unless-
+        // alpha-0 rule (E8's GPU build relies on the alpha-0 hole to stack a software HUD
+        // over a WebGPU canvas).
         var opts = opts_in;
-        if (!opts.titlebar) {
-            opts.style.margin = 0;
-            opts.style.corner_radius = 0;
-            opts.style.content_radius = 0;
-            opts.style.content_fade_width = 0;
-            opts.style.border_anim_width = 0;
-            // Zeroing the geometry is not enough: `drawChrome` paints the glass fill and
-            // the highlight ring at the panel edge whatever the margin is, so a window
-            // that asked for no frame still came out with a translucent border drawn
-            // around a page that has nothing behind it to shine through. A tab has no
-            // compositor blur — a "glass" panel over a browser is a grey ring and a veil
-            // over the app's own background. So the chrome collapses to an OPAQUE fill of
-            // the same colour: no ring, no shadow, no translucency, and the pixels the app
-            // does not paint are simply its background.
-            opts.style.border_alpha = 0;
-            opts.style.shadow_alpha = 0;
-            opts.style.glass_fade_width = 0;
-            opts.style.sheen = 0;
-            opts.style.specular = 0;
-            // …unless the app asked for alpha 0 ON PURPOSE. That reasoning rests on "a
-            // page that has nothing behind it to shine through", and an app that requests
-            // a fully transparent glass is saying precisely that something IS behind: a
-            // second canvas under this one (E8's GPU build stacks the software HUD over a
-            // WebGPU canvas). Forcing opacity there paints a black lid over the very
-            // thing the window was made a hole for. Any other alpha still collapses to
-            // opaque, exactly as before — only a deliberate 0 gets through.
-            if (opts.style.glass.a != 0.0) opts.style.glass.a = 1.0;
-        }
+        if (!opts.titlebar) opts.style = opts.style.contentFill();
 
         self.* = .{
             .gpa = gpa,
@@ -180,14 +154,14 @@ pub const Window = struct {
     pub fn hasBlur(_: *Window) bool {
         return false; // the compositor blur seam is Wayland's; the browser has none
     }
-    pub fn scaleFactor(_: *const Window) f32 {
-        return zicro.window.scaleFactor();
+    pub fn scaleFactor(self: *const Window) f32 {
+        return self.inner.scaleFactor();
     }
     /// Responsive metrics (dp size, form factor, touch, density) — the browser reports
     /// devicePixelRatio and touch; the content size is the current canvas.
     pub fn metrics(self: *Window) facade.Metrics {
         const c = self.contentPx();
-        return facade.computeMetrics(zicro.window.scaleFactor(), c.w, c.h, zicro.window.isTouch());
+        return facade.computeMetrics(self.inner.scaleFactor(), c.w, c.h, self.inner.isTouch());
     }
     pub fn videoBusy(_: *const Window) bool {
         return false;
@@ -284,7 +258,7 @@ pub const Window = struct {
     fn panelH(self: *const Window) u32 {
         return self.win_h -| 2 * self.marginPx();
     }
-    fn contentRect(self: *Window) Rect {
+    pub fn contentRect(self: *Window) Rect {
         const m = self.marginPx();
         const tb = self.titlebarPx();
         return .{ .x = @intCast(m), .y = @intCast(m + tb), .w = self.panelW(), .h = self.panelH() -| tb };
@@ -399,54 +373,25 @@ pub const Window = struct {
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        const pressed = state == 1;
-        if (key == 42 or key == 54) self.shift_down = pressed; // track Shift for on_text
-        if (self.panels.route(.{ .key = .{ .key = key, .pressed = pressed } }, self.host())) return;
-        if (self.opts.on_key) |cb| cb(self, key, state, self.opts.user);
-        // Layout-aware text (additive to on_key), synthesized US-layout like the widget path.
-        if (pressed) {
-            if (self.opts.on_text) |cb| {
-                if (zicro.keymap.toChar(key, self.shift_down)) |ch| cb(self, .{ ch, 0, 0, 0 }, 1, self.opts.user);
-            }
-        }
+        chrome.forwardKey(self, key, state); // key is already evdev (the JS glue translates it)
     }
 
     fn innerMouse(_: *zicro.window.Window, event: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        switch (event.kind) {
-            .motion => {
-                self.pointer_x = event.x;
-                self.pointer_y = event.y;
-                if (self.panels.route(.{ .motion = .{ .x = event.x, .y = event.y } }, self.host())) return;
-                if (self.opts.on_mouse) |cb| {
-                    const o = chrome.appOrigin(self.contentRect(), &self.front);
-                    _ = cb(self, .{ .motion = .{ .x = event.x - o.x, .y = event.y - o.y } }, self.opts.user);
-                }
-            },
-            .press, .release => {
-                const pressed = event.kind == .press;
-                if (self.panels.route(.{ .button = .{ .x = event.x, .y = event.y, .button = event.button, .pressed = pressed } }, self.host())) return;
-                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = event.button, .state = @intFromBool(pressed) } }, self.opts.user);
-            },
-            .scroll => {
-                const value_px = -event.scroll_dy;
-                if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = value_px, .line = true } }, self.host())) return;
-                if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(value_px * 256.0), self.opts.user);
-            },
+        if (event.kind == .scroll) {
+            const value_px = -event.scroll_dy;
+            if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = value_px, .line = true } }, self.host())) return;
+            if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(value_px * 256.0), self.opts.user);
+            return;
         }
+        chrome.forwardMouse(self, event);
     }
 
     // Gesto multi-touch dal substrato: come `innerMouse`, riporta il centro in coordinate
     // app (sottrae l'origine del content); dx/dy sono delta e restano invariati.
     fn innerGesture(_: *zicro.window.Window, g: zicro.gesture.Gesture, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        if (self.opts.on_gesture) |cb| {
-            const o = chrome.appOrigin(self.contentRect(), &self.front);
-            var gg = g;
-            gg.cx -= o.x;
-            gg.cy -= o.y;
-            cb(self, gg, self.opts.user);
-        }
+        chrome.forwardGesture(self, g);
     }
 };
 

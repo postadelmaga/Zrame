@@ -1,4 +1,4 @@
-//! `zig build run-runtime` — the tray demo, driven by `zrame.Runtime` instead of a
+//! `zig build run-runtime` — the tray demo, driven by `zrame.EventLoop` instead of a
 //! hand-rolled poll loop.
 //!
 //! Compare `examples/tray.zig`: there the app grabs `t.fd()`, builds a `pollfd`, calls
@@ -29,7 +29,7 @@ pub fn main() !void {
     };
     defer t.deinit();
 
-    var rt = try zrame.Runtime.init(gpa);
+    var rt = try zrame.EventLoop.init(gpa);
     defer rt.deinit();
     try rt.addTray(t);
 

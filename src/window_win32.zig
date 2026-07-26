@@ -17,7 +17,7 @@
 //! every click so content interactions never fight the move/resize.
 //!
 //! The public surface matches the Wayland backend exactly (see the facade `window.zig`),
-//! so `sink.zig` and callers such as zuer-gui are backend-agnostic. Key/mouse/scroll
+//! so `sink.zig` and every zrame app are backend-agnostic. Key/mouse/scroll
 //! events are translated to the **same evdev codes / axis units** the Wayland path emits,
 //! so `on_key`/`on_mouse`/`on_scroll` handlers are identical across platforms.
 //!
@@ -631,7 +631,7 @@ pub const Window = struct {
     // --- geometry / drawing -----------------------------------------------------------
 
     /// Height the (optional) client-side title bar steals from the top of the content —
-    /// mirrors the Wayland backend. zuer-gui runs title-bar-less (tb = 0).
+    /// mirrors the Wayland backend. A title-bar-less app leaves this at 0.
     fn titlebarHeight(self: *Window) u32 {
         if (!self.opts.titlebar or self.fullscreen) return 0;
         return @min(self.opts.titlebar_height, self.panel_h);

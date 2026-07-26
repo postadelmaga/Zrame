@@ -4,10 +4,10 @@
 //! NativeActivity — ANativeWindow present + AInputQueue events + the looper), and zrame
 //! adds its panels/compositing on top. Android is fullscreen with no desktop title bar, so
 //! (as on macOS) the client-side glass chrome is NOT painted — the content fills the whole
-//! surface; only the floating scrollbars mount by default. Input is normalized so `on_key`
-//! handlers stay cross-platform: Android key codes are translated to the same evdev codes
-//! the Wayland/Win32 backends emit, and printable keys additionally fire `on_text` via the
-//! shared US keymap.
+//! surface; only the floating scrollbars mount by default. Input is already normalized by
+//! the time it reaches this adapter: zicro's own Android backend translates AKEYCODE_* to
+//! the same evdev codes the Wayland/Win32 backends emit, so `on_key` handlers stay
+//! cross-platform, and printable keys additionally fire `on_text` via the shared US keymap.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -137,7 +137,7 @@ pub const Window = struct {
 
     // --- geometry (content fills the whole surface; no chrome gutter) -------------------
 
-    fn contentRect(self: *Window) Rect {
+    pub fn contentRect(self: *Window) Rect {
         return .{ .x = 0, .y = 0, .w = self.panel_w, .h = self.panel_h };
     }
     pub fn contentPx(self: *Window) struct { w: u32, h: u32 } {
@@ -145,15 +145,9 @@ pub const Window = struct {
     }
 
     /// Content-fill style: every mask/fade zeroed so `blitRgba` takes its fast path and no
-    /// rounded/faded clipping trims a fullscreen frame.
+    /// rounded/faded clipping trims a fullscreen frame (same preset the web backend uses).
     fn presentStyle(self: *const Window) Style {
-        var s = self.opts.style;
-        s.margin = 0;
-        s.corner_radius = 0;
-        s.content_radius = 0;
-        s.content_fade_width = 0;
-        s.border_anim_width = 0;
-        return s;
+        return self.opts.style.contentFill();
     }
 
     // --- host seam ----------------------------------------------------------------------
@@ -192,74 +186,22 @@ pub const Window = struct {
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        const evdev = androidToEvdev(key);
-        const pressed = state == 1;
-        if (evdev == 42 or evdev == 54) self.shift_down = pressed;
-        if (self.panels.route(.{ .key = .{ .key = evdev, .pressed = pressed } }, self.host())) return;
-        if (self.opts.on_key) |cb| cb(self, evdev, state, self.opts.user);
-        if (pressed) {
-            if (self.opts.on_text) |cb| {
-                if (zicro.keymap.toChar(evdev, self.shift_down)) |ch| cb(self, .{ ch, 0, 0, 0 }, 1, self.opts.user);
-            }
-        }
+        chrome.forwardKey(self, key, state); // key is already evdev (zicro's Android backend translates it)
     }
 
     fn innerMouse(_: *zicro.window.Window, event: zicro.window.MouseEvent, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        switch (event.kind) {
-            .motion => {
-                if (self.panels.route(.{ .motion = .{ .x = event.x, .y = event.y } }, self.host())) return;
-                if (self.opts.on_mouse) |cb| {
-                    const o = chrome.appOrigin(self.contentRect(), &self.front);
-                    _ = cb(self, .{ .motion = .{ .x = event.x - o.x, .y = event.y - o.y } }, self.opts.user);
-                }
-            },
-            .press, .release => {
-                const pressed = event.kind == .press;
-                if (self.panels.route(.{ .button = .{ .x = event.x, .y = event.y, .button = event.button, .pressed = pressed } }, self.host())) return;
-                if (self.opts.on_mouse) |cb| _ = cb(self, .{ .button = .{ .button = event.button, .state = @intFromBool(pressed) } }, self.opts.user);
-            },
-            .scroll => {
-                if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = event.scroll_dy, .line = true } }, self.host())) return;
-                if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(event.scroll_dy * 256.0), self.opts.user);
-            },
+        if (event.kind == .scroll) {
+            if (self.panels.route(.{ .axis = .{ .x = event.x, .y = event.y, .axis = 0, .value = event.scroll_dy, .line = true } }, self.host())) return;
+            if (self.opts.on_scroll) |cb| cb(self, 0, @intFromFloat(event.scroll_dy * 256.0), self.opts.user);
+            return;
         }
+        chrome.forwardMouse(self, event);
     }
 
     // Gesto multi-touch dal substrato: riporta il centro in coordinate app (come innerMouse).
     fn innerGesture(_: *zicro.window.Window, g: zicro.gesture.Gesture, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        if (self.opts.on_gesture) |cb| {
-            const o = chrome.appOrigin(self.contentRect(), &self.front);
-            var gg = g;
-            gg.cx -= o.x;
-            gg.cy -= o.y;
-            cb(self, gg, self.opts.user);
-        }
+        chrome.forwardGesture(self, g);
     }
 };
-
-/// Android `AKEYCODE_*` → evdev, so `on_key` handlers and the shared keymap see the same
-/// codes on every OS (as Win32 translates VK codes). Covers the letters/digits/space/
-/// editing keys a soft keyboard produces; unmapped codes pass through unchanged.
-fn androidToEvdev(code: u32) u32 {
-    return switch (code) {
-        29...54 => evdev_a_table[code - 29], // A..Z (AKEYCODE_A=29); evdev letters aren't contiguous
-        7 => 11, // 0
-        8...16 => code - 8 + 2, // 1..9 → evdev 2..10
-        62 => 57, // SPACE
-        66 => 28, // ENTER
-        67 => 14, // DEL (backspace)
-        112 => 111, // FORWARD_DEL → evdev Delete
-        59, 60 => 42, // SHIFT_LEFT/RIGHT → LeftShift
-        21 => 105, // DPAD_LEFT
-        22 => 106, // DPAD_RIGHT
-        19 => 103, // DPAD_UP
-        20 => 108, // DPAD_DOWN
-        4 => 1, // BACK → Esc
-        else => code,
-    };
-}
-
-// Letters: AKEYCODE_A..Z (29..54) map to evdev by position (evdev letters aren't contiguous).
-const evdev_a_table = [26]u32{ 30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44 };
