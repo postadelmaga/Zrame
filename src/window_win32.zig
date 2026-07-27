@@ -459,6 +459,10 @@ pub const Window = struct {
         return false;
     }
 
+    pub fn presentDmabufPlanes(_: *Window, _: u8, _: []const facade.DmabufPlane, _: u32, _: u32, _: u32) bool {
+        return false;
+    }
+
     pub fn videoBusy(_: *const Window) bool {
         return false;
     }

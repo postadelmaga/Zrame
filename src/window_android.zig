@@ -120,6 +120,9 @@ pub const Window = struct {
     pub fn presentDmabuf(_: *Window, _: u8, _: i32, _: u32, _: u32, _: u32, _: u32, _: u64) bool {
         return false;
     }
+    pub fn presentDmabufPlanes(_: *Window, _: u8, _: []const facade.DmabufPlane, _: u32, _: u32, _: u32) bool {
+        return false;
+    }
     pub fn toggleFullscreen(_: *Window) void {}
     pub fn setStyle(self: *Window, style: Style) !void {
         self.opts.style = style;

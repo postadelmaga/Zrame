@@ -50,15 +50,16 @@ pub const Rect = facade.Rect;
 const chrome = @import("chrome.zig");
 const Staged = chrome.Staged;
 
-/// One pending dmabuf present (see `Window.presentDmabuf`).
+pub const DmabufPlane = facade.DmabufPlane;
+
+/// One pending dmabuf present (see `Window.presentDmabuf` / `Window.presentDmabufPlanes`).
 const StagedDma = struct {
     slot: u8,
-    fd: posix.fd_t,
     width: u32,
     height: u32,
-    stride: u32,
     fourcc: u32,
-    modifier: u64,
+    plane_count: u8 = 1,
+    planes: [4]DmabufPlane = undefined,
 };
 
 /// Zig 0.16 keeps blocking mutexes behind `std.Io`; the staging handoff is a short,
@@ -595,26 +596,30 @@ pub const Window = struct {
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
     }
 
-    /// Present a GPU frame with zero CPU pixel work: `fd` is a dmabuf export
-    /// of the frame image (`fourcc`/`stride`/`modifier` as the exporter
-    /// reports them). `slot` (0..2) identifies a persistent image the caller
-    /// re-renders into; its wl_buffer is created once and reused. Returns
-    /// false when the compositor lacks linux-dmabuf/subcompositor support —
-    /// fall back to `presentRgba`. Thread-safe, same mailbox as `presentRgba`.
+    /// Single-plane dmabuf present (convenience overload for `presentDmabufPlanes`).
     pub fn presentDmabuf(self: *Window, slot: u8, fd: posix.fd_t, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64) bool {
-        if (self.dmabuf == null or self.subcompositor == null) return false;
+        return self.presentDmabufPlanes(slot, &.{.{ .fd = fd, .offset = 0, .stride = stride, .modifier = modifier }}, width, height, fourcc);
+    }
+
+    /// Present a GPU frame (1..4 planes) with zero CPU pixel work: planes specify the dmabuf
+    /// exports (`fourcc`/`stride`/`modifier`/`offset` as reported by exporter/Vulkan). `slot`
+    /// (0..7) identifies a persistent image; its wl_buffer is created once and reused. Returns
+    /// false when compositor lacks linux-dmabuf/subcompositor support — fall back to `presentRgba`.
+    pub fn presentDmabufPlanes(self: *Window, slot: u8, planes: []const DmabufPlane, width: u32, height: u32, fourcc: u32) bool {
+        if (self.dmabuf == null or self.subcompositor == null or planes.len == 0 or planes.len > 4) return false;
         std.debug.assert(slot < self.video_buffers.len);
+        var stored: [4]DmabufPlane = undefined;
+        for (planes, 0..) |p, i| stored[i] = p;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.staged_dma = .{
                 .slot = slot,
-                .fd = fd,
                 .width = width,
                 .height = height,
-                .stride = stride,
                 .fourcc = fourcc,
-                .modifier = modifier,
+                .plane_count = @intCast(planes.len),
+                .planes = stored,
             };
         }
         const one: u64 = 1;
@@ -692,7 +697,11 @@ pub const Window = struct {
         if (self.video_buffers[req.slot] == null) {
             self.video_buf_sizes[req.slot] = .{ req.width, req.height };
             const params = self.dmabuf.?.createParams();
-            params.add(req.fd, 0, 0, req.stride, req.modifier);
+            var pi: u32 = 0;
+            while (pi < req.plane_count) : (pi += 1) {
+                const pl = req.planes[pi];
+                params.add(pl.fd, pi, pl.offset, pl.stride, pl.modifier);
+            }
             self.video_buffers[req.slot] = params.createImmed(
                 @intCast(req.width),
                 @intCast(req.height),

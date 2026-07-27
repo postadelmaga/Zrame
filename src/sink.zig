@@ -54,22 +54,39 @@ pub const WindowSink = struct {
     }
 
     /// zicro `GpuFrameSink` entry point — present a dmabuf frame with **no CPU
-    /// copy**: the plane fd goes straight to the desynced video subsurface. This
-    /// keeps the fast path inside the zicro contract instead of forcing the app to
-    /// call `presentDmabuf` directly. Returns `false` when the window has no
-    /// dmabuf/subcompositor support (the caller falls back to a CPU `Frame`).
-    /// Single-plane RGBA today; the first plane's fd/stride drive the present.
+    /// copy**: plane fds go straight to the desynced video subsurface. Supports
+    /// single-plane RGBA as well as multi-planar NV12/YUV formats.
+    /// Returns `false` when the window has no dmabuf/subcompositor support.
     pub fn presentGpu(self: *WindowSink, frame: *const zicro.video.GpuFrame) bool {
         if (frame.planes.len == 0) return false;
-        const plane = frame.planes[0];
-        return self.win.presentDmabuf(
+        if (frame.planes.len == 1) {
+            const plane = frame.planes[0];
+            return self.win.presentDmabuf(
+                frame.slot,
+                plane.fd,
+                frame.width,
+                frame.height,
+                plane.stride,
+                frame.fourcc,
+                frame.modifier,
+            );
+        }
+        var planes: [4]window.DmabufPlane = undefined;
+        const count = @min(frame.planes.len, 4);
+        for (frame.planes[0..count], 0..) |p, i| {
+            planes[i] = .{
+                .fd = p.fd,
+                .offset = p.offset,
+                .stride = p.stride,
+                .modifier = frame.modifier,
+            };
+        }
+        return self.win.presentDmabufPlanes(
             frame.slot,
-            plane.fd,
+            planes[0..count],
             frame.width,
             frame.height,
-            plane.stride,
             frame.fourcc,
-            frame.modifier,
         );
     }
 
