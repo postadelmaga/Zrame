@@ -190,6 +190,10 @@ pub const Options = struct {
     /// translation is unavailable (no keymap) it simply never fires — apps fall back to
     /// their own `on_key` mapping.
     on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
+    /// Optional pre-edit composition handler for Input Method Editors (IME, `zwp_text_input_v3`).
+    /// `text` is the UTF-8 encoded in-progress composition string, `cursor_begin` and `cursor_end`
+    /// indicate the selection/cursor bounds within preedit text.
+    on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
     /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
     /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates

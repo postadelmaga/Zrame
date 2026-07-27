@@ -62,6 +62,19 @@ const StagedDma = struct {
     planes: [4]DmabufPlane = undefined,
 };
 
+/// Tracked state of an active secondary popup surface (`xdg_popup`).
+pub const PopupState = struct {
+    id: u32,
+    surface: *wl.Surface,
+    xdg_surface: *wl.XdgSurface,
+    popup: *wl.XdgPopup,
+    configured: bool = false,
+    x: i32 = 0,
+    y: i32 = 0,
+    w: u32 = 0,
+    h: u32 = 0,
+};
+
 /// Zig 0.16 keeps blocking mutexes behind `std.Io`; the staging handoff is a short,
 /// bounded copy at frame cadence, so a spin on the lock-free `std.atomic.Mutex` is
 /// simpler than threading an `Io` through the window.
@@ -128,7 +141,21 @@ pub const Window = struct {
     cursor_shapes: ?*wl.CursorShapeManager = null,
     viewporter: ?*wl.Viewporter = null,
     fractional_manager: ?*wl.FractionalScaleManager = null,
+    text_input_manager: ?*wl.ZwpTextInputManagerV3 = null,
+    text_input: ?*wl.ZwpTextInputV3 = null,
     data_device_manager: ?*wl.DataDeviceManager = null,
+    text_input_enabled: bool = false,
+    preedit_buf: [256]u8 = undefined,
+    preedit_len: usize = 0,
+    preedit_cursor_begin: i32 = -1,
+    preedit_cursor_end: i32 = -1,
+    pending_preedit_buf: [256]u8 = undefined,
+    pending_preedit_len: usize = 0,
+    pending_preedit_begin: i32 = -1,
+    pending_preedit_end: i32 = -1,
+    pending_commit_buf: [256]u8 = undefined,
+    pending_commit_len: usize = 0,
+    active_popups: std.ArrayList(PopupState) = .empty,
 
     surface: ?*wl.Surface = null,
     xdg_surface: ?*wl.XdgSurface = null,
@@ -500,6 +527,14 @@ pub const Window = struct {
         if (self.fractional) |f| wl.wl_proxy_destroy(@ptrCast(f));
         if (self.viewport) |v| wl.wl_proxy_destroy(@ptrCast(v));
         if (self.blur) |b| wl.wl_proxy_destroy(@ptrCast(b));
+        for (self.active_popups.items) |p| {
+            p.popup.destroy();
+            wl.wl_proxy_destroy(@ptrCast(p.xdg_surface));
+            p.surface.destroy();
+        }
+        self.active_popups.deinit(self.gpa);
+        if (self.text_input) |ti| ti.destroy();
+        if (self.text_input_manager) |tim| tim.destroy();
         if (self.cursor_device) |c| wl.wl_proxy_destroy(@ptrCast(c));
         if (self.keyboard) |k| wl.wl_proxy_destroy(@ptrCast(k));
         if (self.pointer) |p| wl.wl_proxy_destroy(@ptrCast(p));
@@ -1142,6 +1177,10 @@ pub const Window = struct {
             },
             .set_cursor => |shape| self.setCursorShape(shape),
             .request_redraw => self.redrawAll(),
+            .create_popup => |spec| _ = self.createPopup(spec) catch {},
+            .dismiss_popup => |id| self.dismissPopup(id),
+            .enable_text_input => |spec| self.enableTextInput(spec),
+            .disable_text_input => self.disableTextInput(),
         }
     }
 
@@ -1150,6 +1189,231 @@ pub const Window = struct {
         if (shape == self.cursor_shape) return;
         self.cursor_shape = shape;
         if (self.cursor_device) |d| d.setShape(self.pointer_serial, shape);
+    }
+
+    /// Create a secondary surface (`xdg_popup`) for context menus, tooltips, dropdowns, or IME candidate window.
+    pub fn createPopup(self: *Window, spec: plugin.PopupSpec) !u32 {
+        const wm_base = self.wm_base orelse return error.NoXdgWmBase;
+        const compositor = self.compositor orelse return error.NoCompositor;
+        const parent_xdg = self.xdg_surface orelse return error.NoXdgSurface;
+
+        const surface = compositor.createSurface();
+        errdefer surface.destroy();
+
+        const positioner = wm_base.createPositioner();
+        defer positioner.destroy();
+
+        positioner.setAnchorRect(spec.x, spec.y, 1, 1);
+        positioner.setSize(@intCast(@max(1, spec.w)), @intCast(@max(1, spec.h)));
+        if (spec.anchor != 0) positioner.setAnchor(spec.anchor);
+        if (spec.gravity != 0) positioner.setGravity(spec.gravity);
+        positioner.setConstraintAdjustment(15);
+
+        const xdg_surf = wm_base.getXdgSurface(surface);
+        errdefer wl.wl_proxy_destroy(@ptrCast(xdg_surf));
+        xdg_surf.setListener(&popup_xdg_surface_listener, self);
+
+        const popup = xdg_surf.getPopup(parent_xdg, positioner);
+        errdefer popup.destroy();
+        popup.setListener(&popup_listener, self);
+
+        surface.commit();
+
+        const id = if (spec.id != 0) spec.id else @as(u32, @intCast(self.active_popups.items.len + 1));
+        try self.active_popups.append(self.gpa, .{
+            .id = id,
+            .surface = surface,
+            .xdg_surface = xdg_surf,
+            .popup = popup,
+            .x = spec.x,
+            .y = spec.y,
+            .w = spec.w,
+            .h = spec.h,
+        });
+
+        if (spec.grab) {
+            if (self.seat) |seat| {
+                popup.grab(seat, self.pointer_serial);
+            }
+        }
+        return id;
+    }
+
+    /// Dismiss a secondary popup surface by ID (0 = dismiss all).
+    pub fn dismissPopup(self: *Window, id: u32) void {
+        var i = self.active_popups.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = self.active_popups.items[i];
+            if (p.id == id or id == 0) {
+                p.popup.destroy();
+                wl.wl_proxy_destroy(@ptrCast(p.xdg_surface));
+                p.surface.destroy();
+                _ = self.active_popups.orderedRemove(i);
+                if (id != 0) return;
+            }
+        }
+    }
+
+    pub fn setupTextInput(self: *Window, seat: *wl.Seat) void {
+        if (self.text_input_manager) |tim| {
+            if (self.text_input == null) {
+                const ti = tim.getTextInput(seat);
+                ti.setListener(&text_input_listener, self);
+                self.text_input = ti;
+            }
+        }
+    }
+
+    pub fn enableTextInput(self: *Window, spec: plugin.TextInputSpec) void {
+        if (self.text_input) |ti| {
+            ti.enable();
+            ti.setCursorRectangle(spec.x, spec.y, @intCast(spec.w), @intCast(spec.h));
+            if (spec.purpose != 0 or spec.hint != 0) {
+                ti.setContentType(spec.hint, spec.purpose);
+            }
+            ti.commit();
+            self.text_input_enabled = true;
+        }
+    }
+
+    pub fn disableTextInput(self: *Window) void {
+        if (self.text_input) |ti| {
+            if (self.text_input_enabled) {
+                ti.disable();
+                ti.commit();
+                self.text_input_enabled = false;
+            }
+        }
+    }
+
+    const popup_listener = wl.XdgPopup.Listener{
+        .configure = onPopupConfigure,
+        .popup_done = onPopupDone,
+    };
+
+    fn onPopupConfigure(data: ?*anyopaque, popup: *wl.XdgPopup, x: i32, y: i32, width: i32, height: i32) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        for (self.active_popups.items) |*p| {
+            if (p.popup == popup) {
+                p.configured = true;
+                p.x = x;
+                p.y = y;
+                p.w = @intCast(width);
+                p.h = @intCast(height);
+                break;
+            }
+        }
+    }
+
+    fn onPopupDone(data: ?*anyopaque, popup: *wl.XdgPopup) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        for (self.active_popups.items, 0..) |p, i| {
+            if (p.popup == popup) {
+                p.popup.destroy();
+                wl.wl_proxy_destroy(@ptrCast(p.xdg_surface));
+                p.surface.destroy();
+                _ = self.active_popups.orderedRemove(i);
+                break;
+            }
+        }
+    }
+
+    const popup_xdg_surface_listener = wl.XdgSurface.Listener{
+        .configure = onPopupXdgConfigure,
+    };
+
+    fn onPopupXdgConfigure(data: ?*anyopaque, xdg_surface: *wl.XdgSurface, serial: u32) callconv(.c) void {
+        _ = data;
+        xdg_surface.ackConfigure(serial);
+    }
+
+    const text_input_listener = wl.ZwpTextInputV3.Listener{
+        .enter = onTextInputEnter,
+        .leave = onTextInputLeave,
+        .preedit_string = onTextInputPreeditString,
+        .commit_string = onTextInputCommitString,
+        .delete_surrounding_text = onTextInputDeleteSurrounding,
+        .done = onTextInputDone,
+    };
+
+    fn onTextInputEnter(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, surface: *wl.Surface) callconv(.c) void {
+        _ = text_input;
+        _ = surface;
+        _ = data;
+    }
+
+    fn onTextInputLeave(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, surface: *wl.Surface) callconv(.c) void {
+        _ = text_input;
+        _ = surface;
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        self.preedit_len = 0;
+        self.preedit_cursor_begin = -1;
+        self.preedit_cursor_end = -1;
+        if (self.opts.on_preedit) |cb| cb(self, "", -1, -1, self.opts.user);
+    }
+
+    fn onTextInputPreeditString(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, txt: ?[*:0]const u8, cursor_begin: i32, cursor_end: i32) callconv(.c) void {
+        _ = text_input;
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (txt) |t| {
+            const span = std.mem.span(t);
+            const len = @min(span.len, self.pending_preedit_buf.len);
+            @memcpy(self.pending_preedit_buf[0..len], span[0..len]);
+            self.pending_preedit_len = len;
+        } else {
+            self.pending_preedit_len = 0;
+        }
+        self.pending_preedit_begin = cursor_begin;
+        self.pending_preedit_end = cursor_end;
+    }
+
+    fn onTextInputCommitString(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, txt: ?[*:0]const u8) callconv(.c) void {
+        _ = text_input;
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (txt) |t| {
+            const span = std.mem.span(t);
+            const len = @min(span.len, self.pending_commit_buf.len);
+            @memcpy(self.pending_commit_buf[0..len], span[0..len]);
+            self.pending_commit_len = len;
+        } else {
+            self.pending_commit_len = 0;
+        }
+    }
+
+    fn onTextInputDeleteSurrounding(_: ?*anyopaque, _: *wl.ZwpTextInputV3, _: u32, _: u32) callconv(.c) void {}
+
+    fn onTextInputDone(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, serial: u32) callconv(.c) void {
+        _ = text_input;
+        _ = serial;
+        const self: *Window = @ptrCast(@alignCast(data.?));
+        if (self.pending_commit_len > 0) {
+            const commit_bytes = self.pending_commit_buf[0..self.pending_commit_len];
+            if (self.opts.on_text) |cb| {
+                var i: usize = 0;
+                while (i < commit_bytes.len) {
+                    const cp_len = std.unicode.utf8ByteSequenceLength(commit_bytes[i]) catch 1;
+                    if (i + cp_len <= commit_bytes.len) {
+                        var b: [4]u8 = .{ 0, 0, 0, 0 };
+                        @memcpy(b[0..cp_len], commit_bytes[i .. i + cp_len]);
+                        cb(self, b, @intCast(cp_len), self.opts.user);
+                        i += cp_len;
+                    } else break;
+                }
+            }
+            self.pending_commit_len = 0;
+        }
+        @memcpy(self.preedit_buf[0..self.pending_preedit_len], self.pending_preedit_buf[0..self.pending_preedit_len]);
+        self.preedit_len = self.pending_preedit_len;
+        self.preedit_cursor_begin = self.pending_preedit_begin;
+        self.preedit_cursor_end = self.pending_preedit_end;
+        self.pending_preedit_len = 0;
+
+        if (self.opts.on_preedit) |cb| {
+            cb(self, self.preedit_buf[0..self.preedit_len], self.preedit_cursor_begin, self.preedit_cursor_end, self.opts.user);
+        }
+        self.dirty_full = true;
+        self.requestRedraw();
     }
 
     const PanelCoords = struct { px: f32, py: f32, w: f32, h: f32 };
@@ -1899,6 +2163,14 @@ pub const Window = struct {
             const seat: *wl.Seat = @ptrCast(registry.bind(name, &wl.wl_seat_interface, @min(ver, 5)).?);
             seat.setListener(&seat_listener, self);
             self.seat = seat;
+            if (self.text_input_manager != null and self.text_input == null) {
+                self.setupTextInput(seat);
+            }
+        } else if (std.mem.eql(u8, iface, "zwp_text_input_manager_v3")) {
+            self.text_input_manager = @ptrCast(registry.bind(name, &wl.zwp_text_input_manager_v3_interface, 1).?);
+            if (self.seat) |seat| {
+                self.setupTextInput(seat);
+            }
         } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
             // v3 is current; v1 still covers the selection path we use.
             self.data_device_manager = @ptrCast(registry.bind(name, &wl.wl_data_device_manager_interface, @min(ver, 3)).?);

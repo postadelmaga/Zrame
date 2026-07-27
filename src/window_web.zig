@@ -297,7 +297,7 @@ pub const Window = struct {
         switch (action) {
             .close => self.close(),
             .toggle_fullscreen => self.toggleFullscreen(),
-            .minimize, .toggle_maximize, .begin_move, .begin_resize, .set_cursor, .request_redraw => {},
+            .minimize, .toggle_maximize, .begin_move, .begin_resize, .set_cursor, .request_redraw, .create_popup, .dismiss_popup, .enable_text_input, .disable_text_input => {},
         }
     }
     fn hostInfo(ptr: *anyopaque) plugin.Info {

@@ -612,6 +612,10 @@ pub const Window = struct {
             .begin_resize => {},
             .set_cursor => {},
             .request_redraw => self.requestRedraw(),
+            .create_popup => {},
+            .dismiss_popup => {},
+            .enable_text_input => {},
+            .disable_text_input => {},
         }
     }
 

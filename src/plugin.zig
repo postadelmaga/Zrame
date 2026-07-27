@@ -65,6 +65,34 @@ pub const Action = union(enum) {
     set_cursor: u32,
     /// Force a repaint next loop turn even if nothing else is dirty.
     request_redraw,
+    /// Create a secondary surface (`xdg_popup`) for menus, tooltips, dropdowns, or IME candidates.
+    create_popup: PopupSpec,
+    /// Dismiss a secondary popup surface by ID.
+    dismiss_popup: u32,
+    /// Enable IME/text input for focused text widget (`zwp_text_input_v3`).
+    enable_text_input: TextInputSpec,
+    /// Disable IME/text input when focus leaves text field.
+    disable_text_input,
+};
+
+pub const PopupSpec = struct {
+    id: u32 = 0,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    anchor: u32 = 0,
+    gravity: u32 = 0,
+    grab: bool = true,
+};
+
+pub const TextInputSpec = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+    w: u32 = 0,
+    h: u32 = 0,
+    purpose: u32 = 0,
+    hint: u32 = 0,
 };
 
 /// A snapshot of window geometry and state, handed to panels each draw/input so they can
@@ -453,4 +481,34 @@ test "registry dirtyBounds: all-none reports none" {
     try reg.add(Panel.of(DirtyPanel, &b), false);
 
     try std.testing.expect(reg.dirtyBounds(nullHost()) == .none);
+}
+
+test "host secondary surface and text input actions" {
+    const Tracker = struct {
+        last_action: ?Action = null,
+        fn do(ptr: *anyopaque, action: Action) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.last_action = action;
+        }
+        fn info(_: *anyopaque) Info {
+            return .{ .content = .{ .x = 0, .y = 0, .w = 100, .h = 100 }, .panel_w = 100, .panel_h = 100, .margin = 0, .maximized = false, .fullscreen = false };
+        }
+        fn font(_: *anyopaque) ?*text.Font {
+            return null;
+        }
+    };
+    var tr = Tracker{};
+    const vt = Host.VTable{ .do = Tracker.do, .info = Tracker.info, .font = Tracker.font };
+    const h = Host{ .ptr = &tr, .vtable = &vt };
+
+    h.do(.{ .create_popup = .{ .x = 10, .y = 20, .w = 100, .h = 50 } });
+    try std.testing.expect(tr.last_action != null);
+    try std.testing.expectEqual(@as(i32, 10), tr.last_action.?.create_popup.x);
+    try std.testing.expectEqual(@as(i32, 20), tr.last_action.?.create_popup.y);
+
+    h.do(.{ .enable_text_input = .{ .x = 5, .y = 15, .w = 50, .h = 20 } });
+    try std.testing.expectEqual(@as(i32, 5), tr.last_action.?.enable_text_input.x);
+
+    h.do(.disable_text_input);
+    try std.testing.expect(tr.last_action.? == .disable_text_input);
 }

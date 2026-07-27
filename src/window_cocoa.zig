@@ -249,6 +249,10 @@ pub const Window = struct {
             .set_cursor => {},
             // The zicro loop repaints every frame; nothing to poke.
             .request_redraw => {},
+            .create_popup => {},
+            .dismiss_popup => {},
+            .enable_text_input => {},
+            .disable_text_input => {},
         }
     }
 
