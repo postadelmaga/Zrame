@@ -676,20 +676,26 @@ pub const Window = struct {
         return .{ .w = r.w, .h = r.h };
     }
 
+    fn panelLocal(self: *Window, sx: f32, sy: f32) struct { px: f32, py: f32, w: f32, h: f32 } {
+        const m: f32 = @floatFromInt(self.curMargin());
+        return .{
+            .px = sx - m,
+            .py = sy - m,
+            .w = @floatFromInt(self.panel_w),
+            .h = @floatFromInt(self.panel_h),
+        };
+    }
+
     /// Which resize border the buffer point (sx,sy) is over (8px band around the panel), or
     /// `.none`. Coords are buffer-space (include the margin), so shift into panel space first
     /// — matching the Wayland `resizeEdgeAt`.
     fn resizeEdgeAt(self: *Window, sx: f32, sy: f32) Edge {
-        const m: f32 = @floatFromInt(self.curMargin());
-        const px = sx - m;
-        const py = sy - m;
-        const w: f32 = @floatFromInt(self.panel_w);
-        const h: f32 = @floatFromInt(self.panel_h);
-        if (px < 0 or py < 0 or px >= w or py >= h) return .none;
-        const l = px < RESIZE_BAND;
-        const r = px >= w - RESIZE_BAND;
-        const t = py < RESIZE_BAND;
-        const b = py >= h - RESIZE_BAND;
+        const p = self.panelLocal(sx, sy);
+        if (p.px < 0 or p.py < 0 or p.px >= p.w or p.py >= p.h) return .none;
+        const l = p.px < RESIZE_BAND;
+        const r = p.px >= p.w - RESIZE_BAND;
+        const t = p.py < RESIZE_BAND;
+        const b = p.py >= p.h - RESIZE_BAND;
         if (t and l) return .top_left;
         if (t and r) return .top_right;
         if (b and l) return .bottom_left;
@@ -704,12 +710,8 @@ pub const Window = struct {
     /// True when the buffer point (sx,sy) is within `band` px of the panel border (the move
     /// grab zone). Buffer coords → shift into panel space, mirroring the Wayland backend.
     fn nearBorder(self: *Window, sx: f32, sy: f32, band: f32) bool {
-        const m: f32 = @floatFromInt(self.curMargin());
-        const px = sx - m;
-        const py = sy - m;
-        const w: f32 = @floatFromInt(self.panel_w);
-        const h: f32 = @floatFromInt(self.panel_h);
-        return px < band or py < band or px > w - band or py > h - band;
+        const p = self.panelLocal(sx, sy);
+        return p.px < band or p.py < band or p.px > p.w - band or p.py > p.h - band;
     }
 
     /// Hand the drag to the OS interactive-move loop (Aero snap included), as if the click

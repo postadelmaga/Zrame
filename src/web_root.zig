@@ -12,8 +12,8 @@ pub const text = zicro.text;
 pub const widget = zicro.widget;
 pub const keymap = zicro.keymap;
 pub const proportion = zicro.proportion;
-pub const phi = zicro.phi; // rapporto aureo del substrato (default di proporzione)
-pub const clipboard = zicro.clipboard; // appunti generici del substrato (blob opaco + tag)
+pub const phi = zicro.phi; // substrate golden ratio (default proportion)
+pub const clipboard = zicro.clipboard; // substrate clipboard (opaque blob + tag)
 
 pub const window = @import("window.zig"); // facade → wasm branch → window_web
 pub const plugin = @import("plugin.zig");

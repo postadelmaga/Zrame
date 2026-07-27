@@ -1143,21 +1143,24 @@ pub const Window = struct {
         if (self.cursor_device) |d| d.setShape(self.pointer_serial, shape);
     }
 
+    const PanelCoords = struct { px: f32, py: f32, w: f32, h: f32 };
+
+    fn panelLocal(self: *const Window, sx: f32, sy: f32) PanelCoords {
+        const p = self.physPanel();
+        return .{ .px = sx - p.m, .py = sy - p.m, .w = p.w, .h = p.h };
+    }
+
     /// The `xdg_toplevel` resize-edge bitmask for a pointer at canvas `(sx,sy)`: an 8px
     /// band around the panel border, corners combining two edges. NONE in the interior.
     fn resizeEdgeAt(self: *const Window, sx: f32, sy: f32) u32 {
-        const p = self.physPanel();
-        const px = sx - p.m;
-        const py = sy - p.m;
-        const w = p.w;
-        const h = p.h;
-        if (px < 0 or py < 0 or px >= w or py >= h) return wl.RESIZE_EDGE_NONE;
+        const p = self.panelLocal(sx, sy);
+        if (p.px < 0 or p.py < 0 or p.px >= p.w or p.py >= p.h) return wl.RESIZE_EDGE_NONE;
         const band: f32 = self.physPxF(8.0);
         var edge: u32 = 0;
-        if (py < band) edge |= wl.RESIZE_EDGE_TOP;
-        if (py >= h - band) edge |= wl.RESIZE_EDGE_BOTTOM;
-        if (px < band) edge |= wl.RESIZE_EDGE_LEFT;
-        if (px >= w - band) edge |= wl.RESIZE_EDGE_RIGHT;
+        if (p.py < band) edge |= wl.RESIZE_EDGE_TOP;
+        if (p.py >= p.h - band) edge |= wl.RESIZE_EDGE_BOTTOM;
+        if (p.px < band) edge |= wl.RESIZE_EDGE_LEFT;
+        if (p.px >= p.w - band) edge |= wl.RESIZE_EDGE_RIGHT;
         return edge;
     }
 
@@ -2359,13 +2362,9 @@ pub const Window = struct {
             if (!self.opts.titlebar) {
                 // No title bar to grab: keep the panel draggable from near its edge, as
                 // before. With a title bar, dragging is the bar's job (see controls.zig).
-                const p = self.physPanel();
-                const px = self.pointer_x - p.m;
-                const py = self.pointer_y - p.m;
-                const w = p.w;
-                const h = p.h;
+                const p = self.panelLocal(self.pointer_x, self.pointer_y);
                 const grab = self.physPxF(30.0);
-                if (px < grab or py < grab or px > w - grab or py > h - grab) {
+                if (p.px < grab or p.py < grab or p.px > p.w - grab or p.py > p.h - grab) {
                     if (self.seat) |seat| self.toplevel.?.move(seat, serial);
                 }
             }

@@ -283,13 +283,7 @@ pub const Window = struct {
     /// `blitRgba` takes its trivial fast path — a square opaque window doesn't want
     /// rounded/faded content clipping.
     fn presentStyle(self: *const Window) Style {
-        var s = self.opts.style;
-        s.margin = 0;
-        s.corner_radius = 0;
-        s.content_radius = 0;
-        s.content_fade_width = 0;
-        s.border_anim_width = 0;
-        return s;
+        return self.opts.style.contentFill();
     }
 
     fn innerDraw(canvas: *paint.Canvas, content: zicro.window.Rect, user: ?*anyopaque) void {
