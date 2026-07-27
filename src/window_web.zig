@@ -41,9 +41,11 @@ pub const Window = struct {
     opts: Options,
     inner: *zicro.window.Window = undefined,
 
-    /// Physical (buffer) window size, learned from every zicro `on_draw`.
-    win_w: u32,
-    win_h: u32,
+    /// Physical (buffer) window size, learned from every zicro `on_draw`. Named
+    /// `panel_w`/`panel_h` (not `win_w`/`win_h`) to satisfy the shared backend
+    /// contract every other backend already exposes these fields under.
+    panel_w: u32,
+    panel_h: u32,
     closed: bool = false,
     fullscreen: bool = false,
     /// Pixels reserved on the right of the content for the app's own overlay
@@ -94,8 +96,8 @@ pub const Window = struct {
         self.* = .{
             .gpa = gpa,
             .opts = opts,
-            .win_w = opts.width + 2 * opts.style.margin,
-            .win_h = opts.height + 2 * opts.style.margin,
+            .panel_w = opts.width + 2 * opts.style.margin,
+            .panel_h = opts.height + 2 * opts.style.margin,
             .panels = plugin.Registry.init(gpa),
         };
 
@@ -119,8 +121,8 @@ pub const Window = struct {
         // no blocking on a wasm page), so `undefined` is safe.
         self.inner = try zicro.window.Window.init(gpa, undefined, .{
             .title = opts.title,
-            .width = self.win_w,
-            .height = self.win_h,
+            .width = self.panel_w,
+            .height = self.panel_h,
             .on_draw = innerDraw,
             .on_key = innerKey,
             .on_mouse = innerMouse,
@@ -267,10 +269,10 @@ pub const Window = struct {
         return self.opts.titlebar_height;
     }
     fn panelW(self: *const Window) u32 {
-        return self.win_w -| 2 * self.marginPx();
+        return self.panel_w -| 2 * self.marginPx();
     }
     fn panelH(self: *const Window) u32 {
-        return self.win_h -| 2 * self.marginPx();
+        return self.panel_h -| 2 * self.marginPx();
     }
     pub fn contentRect(self: *Window) Rect {
         const m = self.marginPx();
@@ -346,20 +348,20 @@ pub const Window = struct {
     /// (Re)paint the chrome into the cache only when the window size changed — the SDF is
     /// the costliest per-pixel work and the panel/shadow are static between resizes.
     fn refreshChrome(self: *Window, n: usize) void {
-        if (self.cache_w == self.win_w and self.cache_h == self.win_h and self.chrome_cache.len >= n) return;
+        if (self.cache_w == self.panel_w and self.cache_h == self.panel_h and self.chrome_cache.len >= n) return;
         self.ensure(&self.chrome_cache, n);
         if (self.chrome_cache.len < n) return;
         @memset(self.chrome_cache[0..n], 0);
-        var cc = paint.Canvas.init(self.chrome_cache[0..n], self.win_w, self.win_h);
+        var cc = paint.Canvas.init(self.chrome_cache[0..n], self.panel_w, self.panel_h);
         cc.drawChrome(self.paintStyle());
-        self.cache_w = self.win_w;
-        self.cache_h = self.win_h;
+        self.cache_w = self.panel_w;
+        self.cache_h = self.panel_h;
     }
 
     fn innerDraw(canvas: *paint.Canvas, content: zicro.window.Rect, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
-        self.win_w = @intCast(@max(content.w, 1));
-        self.win_h = @intCast(@max(content.h, 1));
+        self.panel_w = @intCast(@max(content.w, 1));
+        self.panel_h = @intCast(@max(content.h, 1));
 
         _ = self.panels.tick(0.016, self.host());
         self.mailbox.swap();
@@ -372,12 +374,12 @@ pub const Window = struct {
         // the web backend (titlebar=false).
         if (self.gl_mode) {
             self.gl_rec.reset();
-            var gc = paint.Canvas{ .pixels = &.{}, .width = self.win_w, .height = self.win_h, .gl = &self.gl_iface };
+            var gc = paint.Canvas{ .pixels = &.{}, .width = self.panel_w, .height = self.panel_h, .gl = &self.gl_iface };
             chrome.composeContent(&gc, cr, fa, &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
             return;
         }
 
-        const n = @as(usize, self.win_w) * self.win_h;
+        const n = @as(usize, self.panel_w) * self.panel_h;
         self.ensure(&self.decor, n);
         if (self.decor.len < n or canvas.pixels.len < n) return;
 
@@ -386,7 +388,7 @@ pub const Window = struct {
         self.refreshChrome(n);
         if (self.chrome_cache.len < n) return;
         @memcpy(self.decor[0..n], self.chrome_cache[0..n]);
-        var pc = paint.Canvas.init(self.decor[0..n], self.win_w, self.win_h);
+        var pc = paint.Canvas.init(self.decor[0..n], self.panel_w, self.panel_h);
         chrome.composeContent(&pc, cr, fa, &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
 
         // …then convert premul→straight into zicro's browser canvas (shared LUT converter).

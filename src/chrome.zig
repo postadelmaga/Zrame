@@ -26,8 +26,8 @@ const Rect = plugin.Rect;
 /// fixed-point vs. a browser/NDK raw delta).
 ///
 /// `self` is `*Window` for whichever backend calls this (comptime duck-typed): it needs
-/// `.panels`, `.host()`, `.opts.{on_mouse,user}`, `.contentRect()` and `.front`, plus the
-/// optional `.pointer_x`/`.pointer_y` tracking fields some backends keep for other uses.
+/// `.panels`, `.host()`, `.opts.{on_mouse,user}`, `.contentRect()` and `.mailbox.front`, plus
+/// the optional `.pointer_x`/`.pointer_y` tracking fields some backends keep for other uses.
 pub fn forwardMouse(self: anytype, event: anytype) void {
     const Self = @TypeOf(self.*);
     switch (event.kind) {
@@ -36,7 +36,7 @@ pub fn forwardMouse(self: anytype, event: anytype) void {
             if (@hasField(Self, "pointer_y")) self.pointer_y = event.y;
             if (self.panels.route(.{ .motion = .{ .x = event.x, .y = event.y } }, self.host())) return;
             if (self.opts.on_mouse) |cb| {
-                const o = appOrigin(self.contentRect(), &self.front);
+                const o = appOrigin(self.contentRect(), &self.mailbox.front);
                 _ = cb(self, .{ .motion = .{ .x = event.x - o.x, .y = event.y - o.y } }, self.opts.user);
             }
         },
@@ -55,7 +55,7 @@ pub fn forwardMouse(self: anytype, event: anytype) void {
 /// that feed a touchscreen into the recognizer.
 pub fn forwardGesture(self: anytype, g: anytype) void {
     if (self.opts.on_gesture) |cb| {
-        const o = appOrigin(self.contentRect(), &self.front);
+        const o = appOrigin(self.contentRect(), &self.mailbox.front);
         var gg = g;
         gg.cx -= o.x;
         gg.cy -= o.y;

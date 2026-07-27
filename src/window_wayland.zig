@@ -211,6 +211,9 @@ pub const Window = struct {
     /// size/position the damage region is the UNION of old and new
     /// (otherwise the old frame's border would linger as a ghost).
     last_front_rect: ?Rect = null,
+    /// Guards `pending_resize`/`pending_clip`/`staged_dma` — cross-thread requests
+    /// unrelated to the RGBA frame data `mailbox` already locks on its own.
+    mutex: SpinLock = .{},
     // Resize requested by another thread (guarded by `mutex`): operations
     // on the Wayland surface are NOT thread-safe, so `requestResize` only stages
     // the target and the run loop calls `animateResize` on the window thread.
@@ -385,7 +388,11 @@ pub const Window = struct {
     // (Zig 0.16 keeps blocking mutex/condvar behind `std.Io`, see `SpinLock`:
     // for a blocking wait with timeout the raw futex is the right primitive here,
     // and this backend is Linux-only anyway.)
-    /// Monotonic source for frame callback pacing.
+    /// Monotonic counter `waitFrame`/`wakeFrameWaiters` futex on.
+    frame_seq: std.atomic.Value(u32) = .init(0),
+    /// The outstanding `wl_surface.frame` callback proxy, so a hide mid-flight
+    /// (`setVisible(false)`) can destroy it instead of leaking it — the compositor
+    /// does not fire `done` for an unmapped surface.
     frame_cb: ?*wl.Callback = null,
     /// Window thread only: true while a `wl_surface.frame` is in flight on the
     /// main surface (at most one pending callback at a time, requested
@@ -922,10 +929,7 @@ pub const Window = struct {
                 // (`on_draw` — e.g. a live HUD) the parent must repaint too, or the
                 // overlay freezes on its first paint while the video keeps moving.
                 const had_video = self.processVideo();
-                self.mutex.lock();
-                const has_frame = self.staged.fresh;
-                self.mutex.unlock();
-                if (has_frame) {
+                if (self.mailbox.isFresh()) {
                     // New app frame: damage = the frame's rect (not full) — the
                     // exact region is derived in `redraw` after the swap.
                     self.needs_redraw = true;
@@ -2573,7 +2577,7 @@ pub const Window = struct {
     fn appOriginPx(self: *Window) struct { x: f32, y: f32 } {
         if (self.video_rect) |r|
             return .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y) };
-        const o = chrome.appOrigin(self.frameArea(), &self.front);
+        const o = chrome.appOrigin(self.frameArea(), &self.mailbox.front);
         return .{ .x = o.x, .y = o.y };
     }
 
