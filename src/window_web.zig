@@ -73,9 +73,9 @@ pub const Window = struct {
     cache_w: u32 = 0,
     cache_h: u32 = 0,
 
-    /// Motore 2D-GL (Slice 2): quando `gl_mode` è attivo, `innerDraw` compone `on_draw`+
-    /// pannelli in un `Canvas` GPU-backed (registra vertici in `gl_rec`) invece del raster
-    /// CPU; il lato JS legge `glBytes()` e li disegna via l'ubershader WebGL2. Default OFF.
+    /// 2D-GL engine (Slice 2): when `gl_mode` is enabled, `innerDraw` composes `on_draw`+
+    /// panels into a GPU-backed `Canvas` (recording vertices in `gl_rec`) instead of the CPU
+    /// rasterizer; JS reads `glBytes()` and renders them via the WebGL2 ubershader. Default OFF.
     gl_mode: bool = false,
     gl_rec: zicro.paint_gl.GlRecorder = undefined,
     gl_iface: paint.GlBackend = undefined,
@@ -101,8 +101,8 @@ pub const Window = struct {
             .panels = plugin.Registry.init(gpa),
         };
 
-        // Recorder 2D-GL (Slice 2): il Window è su heap (gpa.create) → `&self.gl_rec` è
-        // stabile, quindi `gl_iface` può puntarci per tutta la vita della pagina.
+        // 2D-GL recorder (Slice 2): Window lives on heap (gpa.create) → `&self.gl_rec` is
+        // stable, so `gl_iface` can point to it for the lifetime of the page.
         self.gl_rec = zicro.paint_gl.GlRecorder.init(gpa);
         self.gl_iface = self.gl_rec.iface();
 
@@ -201,12 +201,12 @@ pub const Window = struct {
         _ = chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba);
     }
 
-    // --- motore 2D-GL: seam per gli export wasm (li chiama l'app in web.zig) ------------
+    // --- 2D-GL engine: seam for wasm exports (called by the app in web.zig) ----------------
     pub fn setGl(self: *Window, on: bool) void {
         self.gl_mode = on;
     }
-    /// I vertici dell'ultimo frame come byte grezzi (layout `paint_gl.Vertex`), da caricare
-    /// nel VBO lato JS. Validi dopo `innerDraw`.
+    /// Vertices of the last frame as raw bytes (layout `paint_gl.Vertex`), to upload
+    /// into JS-side VBO. Valid after `innerDraw`.
     pub fn glBytes(self: *Window) []const u8 {
         return self.gl_rec.vertexBytes();
     }

@@ -80,14 +80,48 @@ pub fn forwardKey(self: anytype, evdev: u32, state: u32) void {
     }
 }
 
-/// The staged/front RGBA frame. `presentRgba` fills `staged`; the window thread swaps it
-/// into `front` before compositing, so the per-pixel blit never runs under the lock.
+pub const LayerKind = enum {
+    shm,
+    dmabuf,
+};
+
+pub const DmabufBuffer = struct {
+    fd: i32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: u32,
+};
+
+pub const LayerSource = union(LayerKind) {
+    shm: []const u8,
+    dmabuf: DmabufBuffer,
+};
+
+pub const Layer = struct {
+    id: u32 = 0,
+    rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    z: i32 = 0,
+    visible: bool = true,
+    source: LayerSource,
+};
+
+/// The staged/front RGBA frame and layer list. `presentRgba`/`stageLayer` fills `staged`; the
+/// window thread swaps it into `front` before compositing, so per-pixel blitting never runs under the lock.
 pub const Staged = struct {
     pixels: std.ArrayList(u8) = .empty,
     width: u32 = 0,
     height: u32 = 0,
-    /// Set by `stageFrame`, cleared when `swapFront` moves the frame to the front slot.
+    /// Set by `stageFrame` or `stageLayer`, cleared when `swapFront` moves to front slot.
     fresh: bool = false,
+    /// Multi-layer list (Issue #4).
+    layers: std.ArrayList(Layer) = .empty,
+
+    pub fn deinit(self: *Staged, gpa: std.mem.Allocator) void {
+        self.pixels.deinit(gpa);
+        self.layers.deinit(gpa);
+        self.* = .{};
+    }
 };
 
 /// Zig 0.16 keeps blocking mutexes behind `std.Io`; the staging handoff is a short,
@@ -121,6 +155,22 @@ pub fn stageFrame(gpa: std.mem.Allocator, lock: *SpinLock, staged: *Staged, widt
     };
     staged.width = width;
     staged.height = height;
+    staged.fresh = true;
+    return true;
+}
+
+/// Stage an explicit layer into `staged` (thread-safe). Inserts or updates layer by `layer.id`.
+pub fn stageLayer(gpa: std.mem.Allocator, lock: *SpinLock, staged: *Staged, layer: Layer) bool {
+    lock.lock();
+    defer lock.unlock();
+    for (staged.layers.items, 0..) |*item, idx| {
+        if (item.id == layer.id) {
+            staged.layers.items[idx] = layer;
+            staged.fresh = true;
+            return true;
+        }
+    }
+    staged.layers.append(gpa, layer) catch return false;
     staged.fresh = true;
     return true;
 }
@@ -187,7 +237,19 @@ pub fn composeContent(
 ) void {
     if (on_draw) |draw| draw(canvas, content, user);
 
-    if (front.width > 0) {
+    if (front.layers.items.len > 0) {
+        for (front.layers.items) |layer| {
+            if (!layer.visible) continue;
+            switch (layer.source) {
+                .shm => |pix| {
+                    if (layer.rect.w > 0 and layer.rect.h > 0 and pix.len >= @as(usize, layer.rect.w) * layer.rect.h * 4) {
+                        canvas.blitRgba(layer.rect.x, layer.rect.y, pix, layer.rect.w, layer.rect.h, style);
+                    }
+                },
+                .dmabuf => {},
+            }
+        }
+    } else if (front.width > 0) {
         const fw = @min(front.width, frame_area.w);
         const fh = @min(front.height, frame_area.h);
         const origin = frameOrigin(frame_area, front.width, front.height);

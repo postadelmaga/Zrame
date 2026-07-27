@@ -105,6 +105,9 @@ pub const Controls = struct {
         return .{ .x = x, .y = b.y, .w = c, .h = c };
     }
 
+    const macos_order = [3]Button{ .close, .minimize, .maximize };
+    const material_order = [3]Button{ .minimize, .maximize, .close };
+
     fn buttonAt(self: *const Controls, info: plugin.Info, x: f32, y: f32) ?Button {
         const b = self.bar(info);
         if (y < b.y or y >= b.y + b.h) return null;
@@ -112,13 +115,13 @@ pub const Controls = struct {
             .macos => {
                 const d = discDiameter(b);
                 const hit = d / 2.0 + 3.0; // a little slop
-                inline for (.{ Button.close, Button.minimize, Button.maximize }) |btn| {
+                inline for (macos_order) |btn| {
                     const c = discCenter(btn, b);
                     if ((x - c.x) * (x - c.x) + (y - c.y) * (y - c.y) <= hit * hit) return btn;
                 }
             },
             .material => {
-                inline for (.{ Button.minimize, Button.maximize, Button.close }) |btn| {
+                inline for (material_order) |btn| {
                     const r = cell(btn, b);
                     if (x >= r.x and x < r.x + r.w) return btn;
                 }
@@ -153,10 +156,10 @@ pub const Controls = struct {
         self.drawTitle(canvas, host, b);
 
         switch (self.layout) {
-            .macos => inline for (.{ Button.close, Button.minimize, Button.maximize }) |btn| {
+            .macos => inline for (macos_order) |btn| {
                 self.drawDisc(canvas, btn, b, info);
             },
-            .material => inline for (.{ Button.minimize, Button.maximize, Button.close }) |btn| {
+            .material => inline for (material_order) |btn| {
                 self.drawCell(canvas, btn, cell(btn, b), info);
             },
         }

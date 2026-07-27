@@ -194,13 +194,17 @@ pub const Menu = struct {
                 _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "type"), @as([*:0]const u8, "s"), @as([*:0]const u8, "separator"));
             if (it.toggle) {
                 _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "toggle-type"), @as([*:0]const u8, "s"), @as([*:0]const u8, "checkmark"));
-                const on = if (it.checked) |c| c(if (it.ctx != null) it.ctx else self.ctx) else false;
+                const on = if (it.checked) |c| c(self.effectiveCtx(it)) else false;
                 _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "toggle-state"), @as([*:0]const u8, "i"), @as(c_int, @intFromBool(on)));
             }
         }
         if (node.children.len > 0)
             _ = bus.sd_bus_message_append(reply, "{sv}", @as([*:0]const u8, "children-display"), @as([*:0]const u8, "s"), @as([*:0]const u8, "submenu"));
         _ = bus.sd_bus_message_close_container(reply);
+    }
+
+    fn effectiveCtx(self: *const Menu, it: *const Item) ?*anyopaque {
+        return it.ctx orelse self.ctx;
     }
 
     /// Emit the recursive `(ia{sv}av)` layout for `id`, descending `depth` levels
@@ -289,7 +293,7 @@ pub const Menu = struct {
         } else if (it != null and std.mem.eql(u8, key, "enabled")) {
             _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "b"), @as(c_int, @intFromBool(it.?.enabled)));
         } else if (it != null and it.?.toggle and std.mem.eql(u8, key, "toggle-state")) {
-            const on = if (it.?.checked) |c| c(if (it.?.ctx != null) it.?.ctx else self.ctx) else false;
+            const on = if (it.?.checked) |c| c(self.effectiveCtx(it.?)) else false;
             _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "i"), @as(c_int, @intFromBool(on)));
         } else {
             _ = bus.sd_bus_message_append(reply, "v", @as([*:0]const u8, "s"), @as([*:0]const u8, ""));
@@ -305,7 +309,7 @@ pub const Menu = struct {
         const name = if (event) |e| std.mem.span(e) else "";
         if (std.mem.eql(u8, name, "clicked") and self.valid(id)) {
             if (self.nodes[@intCast(id)].item) |it| {
-                if (it.on_click) |cb| cb(if (it.ctx != null) it.ctx else self.ctx);
+                if (it.on_click) |cb| cb(self.effectiveCtx(it));
             }
         }
         return bus.sd_bus_reply_method_return(m, "");

@@ -17,9 +17,14 @@ const window = @import("window.zig");
 
 pub const WindowSink = struct {
     win: *window.Window,
+    swizzle_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(win: *window.Window) WindowSink {
-        return .{ .win = win };
+        return .{ .win = win, .swizzle_buf = .empty };
+    }
+
+    pub fn deinit(self: *WindowSink) void {
+        self.swizzle_buf.deinit(self.win.gpa);
     }
 
     /// zicro `FrameSink` entry point. `bgra8` frames are swizzled to RGBA on the way in.
@@ -28,9 +33,9 @@ pub const WindowSink = struct {
         switch (frame.format) {
             .rgba8 => self.win.presentRgba(frame.width, frame.height, pixels),
             .bgra8 => {
-                // Rare path, so the swizzle buffer is per-call.
-                const swizzled = self.win.gpa.alloc(u8, pixels.len) catch return;
-                defer self.win.gpa.free(swizzled);
+                self.swizzle_buf.clearRetainingCapacity();
+                self.swizzle_buf.resize(self.win.gpa, pixels.len) catch return;
+                const swizzled = self.swizzle_buf.items;
                 var i: usize = 0;
                 while (i < pixels.len) : (i += 4) {
                     swizzled[i] = pixels[i + 2];

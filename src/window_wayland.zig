@@ -796,6 +796,9 @@ pub const Window = struct {
         self.frame_cb_pending = false;
         _ = self.frame_seq.fetchAdd(1, .release);
         self.wakeFrameWaiters();
+        if (self.staged.fresh or self.overlay_dirty.load(.monotonic) or self.dirty_full or self.dirty_staged or self.dirty_rect != null) {
+            self.needs_redraw = true;
+        }
     }
 
     /// The event loop: blocks until the window is closed or the connection drops.
@@ -1678,6 +1681,10 @@ pub const Window = struct {
     /// -agnostic (see `composeFrame`); only the slot acquisition and surface
     /// commit are Wayland-specific.
     fn redraw(self: *Window) !void {
+        if (self.frame_cb_pending) {
+            self.needs_redraw = true;
+            return;
+        }
         const m = self.opts.style.margin;
         const bw = self.physPx(self.panel_w + 2 * m);
         const bh = self.physPx(self.panel_h + 2 * m);

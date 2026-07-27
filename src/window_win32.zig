@@ -348,7 +348,7 @@ pub const Window = struct {
             .panel_w = @max(opts.width, 160),
             .panel_h = @max(opts.height, 120),
             .panels = plugin.Registry.init(gpa),
-            .opaque_mode = if (getenv("ZUER_OPAQUE")) |v| v[0] != '0' and v[0] != 0 else false,
+            .opaque_mode = isOpaqueRequested(),
         };
 
         const hinst = GetModuleHandleW(null);
@@ -370,7 +370,7 @@ pub const Window = struct {
         // opaque escape-hatch there is no gutter and no WS_EX_LAYERED — a plain square window.
         const m = self.curMargin();
         const ex_style: u32 = if (self.opaque_mode) 0 else WS_EX_LAYERED;
-        const title = try toUtf16Z(gpa, opts.title);
+        const title = try std.unicode.utf8ToUtf16LeAllocZ(gpa, opts.title);
         defer gpa.free(title);
 
         const hwnd = CreateWindowExW(
@@ -784,13 +784,7 @@ pub const Window = struct {
             if (self.mem_dc == null) self.mem_dc = CreateCompatibleDC(null);
             if (self.dib) |d| _ = DeleteObject(d);
             self.dib = null;
-            var bmi = BITMAPINFO{
-                .bmiHeader = .{
-                    .biWidth = @intCast(bw),
-                    .biHeight = -@as(i32, @intCast(bh)), // negative = top-down, matching paint.Canvas
-                    .biBitCount = 32,
-                },
-            };
+            var bmi = makeBitmapInfo(bw, bh);
             var bits: ?*anyopaque = null;
             const hbmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse return false;
             _ = SelectObject(self.mem_dc, hbmp);
@@ -822,7 +816,7 @@ pub const Window = struct {
     /// UpdateLayeredWindow — `psize` resizes the window to the buffer (a no-op when it already
     /// matches, e.g. after an OS drag), `pptDst = null` keeps the position; under Wine this
     /// composites in software so the rounded panel + shadow + translucency show without DWM.
-    /// Opaque (ZUER_OPAQUE=1): a plain top-down-DIB BitBlt into the window DC — no alpha
+    /// Opaque (ZRAME_OPAQUE=1 / ZUER_OPAQUE=1): a plain top-down-DIB BitBlt into the window DC — no alpha
     /// compositing, so it stays fast under Wine at the cost of the glass.
     fn present(self: *Window) void {
         self.compose();
@@ -830,13 +824,7 @@ pub const Window = struct {
         if (self.opaque_mode) {
             const hdc = GetDC(self.hwnd);
             defer _ = ReleaseDC(self.hwnd, hdc);
-            var bmi = BITMAPINFO{
-                .bmiHeader = .{
-                    .biWidth = @intCast(self.buf_w),
-                    .biHeight = -@as(i32, @intCast(self.buf_h)), // negative = top-down
-                    .biBitCount = 32,
-                },
-            };
+            var bmi = makeBitmapInfo(self.buf_w, self.buf_h);
             _ = SetDIBitsToDevice(hdc, 0, 0, self.buf_w, self.buf_h, 0, 0, 0, self.buf_h, self.frame.ptr, &bmi, 0);
             return;
         }
@@ -1123,8 +1111,19 @@ fn lparamPoint(lparam: LPARAM) struct { x: f32, y: f32 } {
     return .{ .x = @floatFromInt(lo), .y = @floatFromInt(hi) };
 }
 
-fn toUtf16Z(gpa: Allocator, s: [:0]const u8) ![:0]u16 {
-    return std.unicode.utf8ToUtf16LeAllocZ(gpa, s);
+fn isOpaqueRequested() bool {
+    const val = getenv("ZRAME_OPAQUE") orelse getenv("ZUER_OPAQUE") orelse return false;
+    return val[0] != '0' and val[0] != 0;
+}
+
+fn makeBitmapInfo(w: u32, h: u32) BITMAPINFO {
+    return .{
+        .bmiHeader = .{
+            .biWidth = @intCast(w),
+            .biHeight = -@as(i32, @intCast(h)), // negative = top-down
+            .biBitCount = 32,
+        },
+    };
 }
 
 /// Translate a Win32 virtual-key code to the evdev keycode the Wayland path emits, so
