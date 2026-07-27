@@ -80,46 +80,17 @@ pub fn forwardKey(self: anytype, evdev: u32, state: u32) void {
     }
 }
 
-pub const LayerKind = enum {
-    shm,
-    dmabuf,
-};
-
-pub const DmabufBuffer = struct {
-    fd: i32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    format: u32,
-};
-
-pub const LayerSource = union(LayerKind) {
-    shm: []const u8,
-    dmabuf: DmabufBuffer,
-};
-
-pub const Layer = struct {
-    id: u32 = 0,
-    rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    z: i32 = 0,
-    visible: bool = true,
-    source: LayerSource,
-};
-
-/// The staged/front RGBA frame and layer list. `presentRgba`/`stageLayer` fills `staged`; the
-/// window thread swaps it into `front` before compositing, so per-pixel blitting never runs under the lock.
+/// The staged/front RGBA frame. `presentRgba` fills `staged`; the window thread swaps it
+/// into `front` before compositing, so per-pixel blitting never runs under the lock.
 pub const Staged = struct {
     pixels: std.ArrayList(u8) = .empty,
     width: u32 = 0,
     height: u32 = 0,
-    /// Set by `stageFrame` or `stageLayer`, cleared when `swapFront` moves to front slot.
+    /// Set by `stageFrame`, cleared when `swapFront` moves to front slot.
     fresh: bool = false,
-    /// Multi-layer list (Issue #4).
-    layers: std.ArrayList(Layer) = .empty,
 
     pub fn deinit(self: *Staged, gpa: std.mem.Allocator) void {
         self.pixels.deinit(gpa);
-        self.layers.deinit(gpa);
         self.* = .{};
     }
 };
@@ -159,22 +130,6 @@ pub fn stageFrame(gpa: std.mem.Allocator, lock: *SpinLock, staged: *Staged, widt
     return true;
 }
 
-/// Stage an explicit layer into `staged` (thread-safe). Inserts or updates layer by `layer.id`.
-pub fn stageLayer(gpa: std.mem.Allocator, lock: *SpinLock, staged: *Staged, layer: Layer) bool {
-    lock.lock();
-    defer lock.unlock();
-    for (staged.layers.items, 0..) |*item, idx| {
-        if (item.id == layer.id) {
-            staged.layers.items[idx] = layer;
-            staged.fresh = true;
-            return true;
-        }
-    }
-    staged.layers.append(gpa, layer) catch return false;
-    staged.fresh = true;
-    return true;
-}
-
 /// Take the newest staged frame with a buffer swap: the lock is held for a few word writes,
 /// never for the per-pixel blit, so producers don't spin behind it. The swapped-out front
 /// buffer becomes the producer's next staging capacity.
@@ -186,6 +141,31 @@ pub fn swapFront(lock: *SpinLock, staged: *Staged, front: *Staged) void {
         staged.fresh = false;
     }
 }
+
+/// Reusable cross-thread frame mailbox encapsulating a `SpinLock` and `staged`/`front` buffers.
+pub const FrameMailbox = struct {
+    lock: SpinLock = .{},
+    staged: Staged = .{},
+    front: Staged = .{},
+
+    pub fn deinit(self: *FrameMailbox, gpa: std.mem.Allocator) void {
+        self.staged.deinit(gpa);
+        self.front.deinit(gpa);
+        self.* = .{};
+    }
+
+    pub fn stage(self: *FrameMailbox, gpa: std.mem.Allocator, width: u32, height: u32, rgba: []const u8) bool {
+        return stageFrame(gpa, &self.lock, &self.staged, width, height, rgba);
+    }
+
+    pub fn swap(self: *FrameMailbox) void {
+        swapFront(&self.lock, &self.staged, &self.front);
+    }
+
+    pub fn isFresh(self: *const FrameMailbox) bool {
+        return self.staged.fresh;
+    }
+};
 
 /// Top-left, in canvas/pointer pixels, where a staged frame of size `fw`×`fh` lands when
 /// centered in `content` — the same math `composeContent` uses for the blit. Apps map
@@ -237,19 +217,7 @@ pub fn composeContent(
 ) void {
     if (on_draw) |draw| draw(canvas, content, user);
 
-    if (front.layers.items.len > 0) {
-        for (front.layers.items) |layer| {
-            if (!layer.visible) continue;
-            switch (layer.source) {
-                .shm => |pix| {
-                    if (layer.rect.w > 0 and layer.rect.h > 0 and pix.len >= @as(usize, layer.rect.w) * layer.rect.h * 4) {
-                        canvas.blitRgba(layer.rect.x, layer.rect.y, pix, layer.rect.w, layer.rect.h, style);
-                    }
-                },
-                .dmabuf => {},
-            }
-        }
-    } else if (front.width > 0) {
+    if (front.width > 0) {
         const fw = @min(front.width, frame_area.w);
         const fh = @min(front.height, frame_area.h);
         const origin = frameOrigin(frame_area, front.width, front.height);

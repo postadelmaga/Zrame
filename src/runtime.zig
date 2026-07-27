@@ -12,6 +12,10 @@
 //! thread-safe (an eventfd breaks the poll), so another thread — or a source's own callback —
 //! can end the loop cleanly. [`Tray`](tray.Tray) and the menu [`Server`](dbusmenu.Server) both
 //! already expose `fd`/`flush`/`process`, so [`addTray`]/[`addServer`] wire them in one call.
+//!
+//! Linux-only (built on `linux.eventfd`/`posix.poll`), like the `Tray`/`Server` sources it
+//! is meant to multiplex — there is no stub on other platforms, so don't reach for this
+//! from cross-platform application code.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -128,9 +132,19 @@ pub const EventLoop = struct {
                 // Loop condition re-checks should_stop; a stop() wake exits at the top.
             }
 
+            // Walk back-to-front so a removal doesn't shift the index of an
+            // item not yet visited.
             const ready = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP;
-            for (self.sources.items, 1..) |s, i| {
-                if (self.pollfds.items[i].revents & ready != 0) s.process();
+            const dead = posix.POLL.ERR | posix.POLL.HUP;
+            var i = self.sources.items.len;
+            while (i > 0) {
+                i -= 1;
+                const revents = self.pollfds.items[i + 1].revents;
+                if (revents & ready != 0) self.sources.items[i].process();
+                // A HUP/ERR fd stays "ready" forever with nothing left to read —
+                // drop it, or poll() would return immediately every iteration and
+                // spin the loop at 100% CPU on a dead source.
+                if (revents & dead != 0) _ = self.sources.orderedRemove(i);
             }
         }
     }

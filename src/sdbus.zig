@@ -44,6 +44,7 @@ pub extern fn sd_bus_message_enter_container(m: ?*Message, @"type": u8, contents
 pub extern fn sd_bus_message_exit_container(m: ?*Message) c_int;
 pub extern fn sd_bus_reply_method_return(call: ?*Message, types: [*:0]const u8, ...) c_int;
 pub extern fn sd_bus_message_new_method_return(call: ?*Message, m: *?*Message) c_int;
+pub extern fn sd_bus_message_new_signal(bus: ?*Bus, m: *?*Message, path: [*:0]const u8, interface: [*:0]const u8, member: [*:0]const u8) c_int;
 pub extern fn sd_bus_send(bus: ?*Bus, m: ?*Message, cookie: ?*u64) c_int;
 pub extern fn sd_bus_message_unref(m: ?*Message) ?*Message;
 pub extern fn sd_bus_error_free(e: *BusError) void;

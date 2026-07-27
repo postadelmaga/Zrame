@@ -321,9 +321,7 @@ pub const Window = struct {
 
     // Cross-thread frame mailbox (same shape as the Wayland backend): producers write
     // `staged` under the lock; the UI thread swaps it into `front` and composites.
-    lock: SpinLock = .{},
-    staged: Staged = .{},
-    front: Staged = .{},
+    mailbox: chrome.FrameMailbox = .{},
 
     // Presentation buffers. We compose into `frame`, a plain gpa heap buffer — composing
     // straight into DIB-section memory is pathologically slow under Wine (blitRgba's per-pixel
@@ -420,12 +418,25 @@ pub const Window = struct {
         if (self.decor.len > 0) self.gpa.free(self.decor);
         if (self.dib) |d| _ = DeleteObject(d);
         if (self.mem_dc != null) _ = DeleteDC(self.mem_dc);
-        self.staged.pixels.deinit(self.gpa);
-        self.front.pixels.deinit(self.gpa);
+        self.mailbox.deinit(self.gpa);
         if (self.hwnd) |h| _ = DestroyWindow(h);
         const gpa = self.gpa;
         gpa.destroy(self);
     }
+
+    pub fn requestClose(self: *Window) void {
+        self.close();
+    }
+
+    pub fn isVisible(self: *Window) bool {
+        return !self.closed;
+    }
+
+    pub fn setVisible(self: *Window, visible: bool) void {
+        if (!visible) self.close();
+    }
+
+    pub fn reserveGutter(_: *Window, _: u32) void {}
 
     /// No compositor blur on GDI.
     pub fn hasBlur(_: *Window) bool {
@@ -436,6 +447,11 @@ pub const Window = struct {
     pub fn scaleFactor(_: *const Window) f32 {
         return 1.0;
     }
+
+    pub fn physPx(self: *Window, logical_dp: u32) u32 {
+        return facade.physPxScale(self.scaleFactor(), logical_dp);
+    }
+
     /// Responsive metrics — desktop, pointer-driven (no touch).
     pub fn metrics(self: *Window) facade.Metrics {
         const c = self.contentPx();
@@ -445,7 +461,7 @@ pub const Window = struct {
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; newest
     /// frame wins. Wakes the UI thread with a thread-safe PostMessageW.
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        if (chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba)) {
+        if (self.mailbox.stage(self.gpa, width, height, rgba)) {
             _ = PostMessageW(self.hwnd, WM_APP_PRESENT, 0, 0);
         }
     }
@@ -818,8 +834,8 @@ pub const Window = struct {
         // Background: the pre-painted glass chrome, or a flat opaque fill in opaque mode.
         if (self.opaque_mode) @memset(self.frame, 0xFF141414) else @memcpy(self.frame, self.decor);
         var canvas = paint.Canvas.init(self.frame, bw, bh);
-        chrome.swapFront(&self.lock, &self.staged, &self.front);
-        chrome.composeContent(&canvas, self.contentRect(), self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        self.mailbox.swap();
+        chrome.composeContent(&canvas, self.contentRect(), self.contentRect(), &self.mailbox.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Compose and push the whole window. Glass (default): per-pixel alpha via

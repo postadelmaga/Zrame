@@ -155,7 +155,7 @@ pub const Tray = struct {
         if (std.mem.eql(u8, p, "Status")) return bus.sd_bus_message_append(reply, "s", @as([*:0]const u8, status));
         if (std.mem.eql(u8, p, "IconName")) return bus.sd_bus_message_append(reply, "s", @as([*:0]const u8, &self.icon_buf));
         if (std.mem.eql(u8, p, "ItemIsMenu")) return bus.sd_bus_message_append(reply, "b", @as(c_int, 0));
-        if (std.mem.eql(u8, p, "Menu")) return bus.sd_bus_message_append(reply, "o", @as([*:0]const u8, if (self.menu != null) menu_path else "/"));
+        if (std.mem.eql(u8, p, "Menu")) return bus.sd_bus_message_append(reply, "o", @as([*:0]const u8, if (self.menu) |mnu| mnu.objectPath() else "/"));
         return bus.sd_bus_message_append(reply, "s", @as([*:0]const u8, ""));
     }
 

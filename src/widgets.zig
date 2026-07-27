@@ -47,6 +47,7 @@ pub const Widgets = struct {
     user: ?*anyopaque,
     queue: widget.InputQueue = .{},
     win: ?*Window = null,
+    text_input_active: bool = false,
 
     /// `build` is called every redraw with a live `Ui` and your `user` pointer.
     pub fn init(
@@ -106,6 +107,15 @@ fn onDraw(canvas: *paint.Canvas, content: Rect, user: ?*anyopaque) void {
     );
     self.build(&ui, self.user);
     const report = ui.end();
+    const is_text_focused = self.store.focus != 0 and self.store.focus_is_text;
+    if (is_text_focused != self.text_input_active) {
+        self.text_input_active = is_text_focused;
+        if (is_text_focused) {
+            win.host().do(.{ .enable_text_input = .{} });
+        } else {
+            win.host().do(.disable_text_input);
+        }
+    }
     if (report.needs_repaint) win.host().do(.request_redraw);
 }
 

@@ -59,18 +59,6 @@ pub const WindowSink = struct {
     /// Returns `false` when the window has no dmabuf/subcompositor support.
     pub fn presentGpu(self: *WindowSink, frame: *const zicro.video.GpuFrame) bool {
         if (frame.planes.len == 0) return false;
-        if (frame.planes.len == 1) {
-            const plane = frame.planes[0];
-            return self.win.presentDmabuf(
-                frame.slot,
-                plane.fd,
-                frame.width,
-                frame.height,
-                plane.stride,
-                frame.fourcc,
-                frame.modifier,
-            );
-        }
         var planes: [4]window.DmabufPlane = undefined;
         const count = @min(frame.planes.len, 4);
         for (frame.planes[0..count], 0..) |p, i| {

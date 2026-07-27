@@ -59,9 +59,7 @@ pub const Window = struct {
     panels: plugin.Registry,
     scrollbars: scroll.Scroll = .{ .follow_content = true },
 
-    lock: SpinLock = .{},
-    staged: Staged = .{},
-    front: Staged = .{},
+    mailbox: chrome.FrameMailbox = .{},
 
     /// Premultiplied-ARGB scratch the chrome + content compose into, before the
     /// premul→straight conversion into zicro's straight-RGBA canvas.
@@ -136,8 +134,7 @@ pub const Window = struct {
         self.inner.deinit();
         self.panels.deinit();
         if (self.font) |*f| f.deinit();
-        self.staged.pixels.deinit(self.gpa);
-        self.front.pixels.deinit(self.gpa);
+        self.mailbox.deinit(self.gpa);
         if (self.decor.len > 0) self.gpa.free(self.decor);
         if (self.chrome_cache.len > 0) self.gpa.free(self.chrome_cache);
         const gpa = self.gpa;
@@ -147,15 +144,27 @@ pub const Window = struct {
     pub fn run(self: *Window) !void {
         return self.inner.run();
     }
+    pub fn requestClose(self: *Window) void {
+        self.close();
+    }
     pub fn close(self: *Window) void {
         self.closed = true;
         self.inner.requestClose();
+    }
+    pub fn isVisible(self: *Window) bool {
+        return !self.closed;
+    }
+    pub fn setVisible(self: *Window, visible: bool) void {
+        if (!visible) self.close();
     }
     pub fn hasBlur(_: *Window) bool {
         return false; // the compositor blur seam is Wayland's; the browser has none
     }
     pub fn scaleFactor(self: *const Window) f32 {
         return self.inner.scaleFactor();
+    }
+    pub fn physPx(self: *Window, logical_dp: u32) u32 {
+        return facade.physPxScale(self.scaleFactor(), logical_dp);
     }
     /// Responsive metrics (dp size, form factor, touch, density) — the browser reports
     /// devicePixelRatio and touch; the content size is the current canvas.
@@ -201,7 +210,9 @@ pub const Window = struct {
 
     /// Stage an externally-rendered straight-RGBA frame (composed centered in the content).
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        _ = chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba);
+        if (self.mailbox.stage(self.gpa, width, height, rgba)) {
+            self.inner.requestRedraw();
+        }
     }
 
     // --- 2D-GL engine: seam for wasm exports (called by the app in web.zig) ----------------
@@ -216,8 +227,8 @@ pub const Window = struct {
     pub fn glCount(self: *Window) usize {
         return self.gl_rec.vertexCount();
     }
-    // Atlante glifi/icone (RGBA 2048²): il lato JS lo carica quando cambia (banda sporca)
-    // e disegna l'intero frame in UNA draw call.
+    // Glyph/icon atlas (RGBA 2048²): the JS side re-uploads it when it changes (dirty band)
+    // and draws the whole frame in ONE draw call.
     pub fn glAtlasPtr(self: *Window) usize {
         return @intFromPtr(self.gl_rec.atlasPtr());
     }
@@ -269,6 +280,14 @@ pub const Window = struct {
     pub fn contentPx(self: *Window) struct { w: u32, h: u32 } {
         const r = self.contentRect();
         return .{ .w = r.w, .h = r.h };
+    }
+
+    /// The rect a staged frame centers in: the content minus the app's gutter.
+    /// Same contract as Wayland's `frameArea` (see `reserveGutter`).
+    fn frameArea(self: *Window) Rect {
+        const c = self.contentRect();
+        const g = @min(self.gutter_right, c.w);
+        return .{ .x = c.x, .y = c.y, .w = c.w - g, .h = c.h };
     }
 
     fn paintStyle(self: *const Window) Style {
@@ -342,16 +361,19 @@ pub const Window = struct {
         self.win_w = @intCast(@max(content.w, 1));
         self.win_h = @intCast(@max(content.h, 1));
 
-        // Motore 2D-GL: compone `on_draw`+pannelli in un Canvas GPU-backed (registra vertici
-        // in `gl_rec`); niente raster CPU né premul→straight. Il present è lato JS (ubershader
-        // WebGL2 che legge `glBytes()`). Il chrome glass è disabilitato sul web (titlebar=false).
+        _ = self.panels.tick(0.016, self.host());
+        self.mailbox.swap();
+        const cr = self.contentRect();
+        const fa = self.frameArea();
+
+        // 2D-GL engine: composes `on_draw`+panels into a GPU-backed Canvas (records
+        // vertices in `gl_rec`); no CPU raster, no premul→straight. Presented JS-side
+        // (a WebGL2 ubershader reading `glBytes()`). The glass chrome is disabled on
+        // the web backend (titlebar=false).
         if (self.gl_mode) {
             self.gl_rec.reset();
-            _ = self.panels.tick(0.016, self.host());
-            chrome.swapFront(&self.lock, &self.staged, &self.front);
-            const cr = self.contentRect();
             var gc = paint.Canvas{ .pixels = &.{}, .width = self.win_w, .height = self.win_h, .gl = &self.gl_iface };
-            chrome.composeContent(&gc, cr, cr, &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+            chrome.composeContent(&gc, cr, fa, &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
             return;
         }
 
@@ -365,10 +387,7 @@ pub const Window = struct {
         if (self.chrome_cache.len < n) return;
         @memcpy(self.decor[0..n], self.chrome_cache[0..n]);
         var pc = paint.Canvas.init(self.decor[0..n], self.win_w, self.win_h);
-        _ = self.panels.tick(0.016, self.host());
-        chrome.swapFront(&self.lock, &self.staged, &self.front);
-        const cr = self.contentRect();
-        chrome.composeContent(&pc, cr, cr, &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(&pc, cr, fa, &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
 
         // …then convert premul→straight into zicro's browser canvas (shared LUT converter).
         paint.premulToStraightRgba(self.decor[0..n], canvas.pixels[0..n]);
@@ -390,8 +409,8 @@ pub const Window = struct {
         chrome.forwardMouse(self, event);
     }
 
-    // Gesto multi-touch dal substrato: come `innerMouse`, riporta il centro in coordinate
-    // app (sottrae l'origine del content); dx/dy sono delta e restano invariati.
+    // Multi-touch gesture from the substrate: like `innerMouse`, reports the center in
+    // app coordinates (subtracts the content origin); dx/dy are deltas and pass through.
     fn innerGesture(_: *zicro.window.Window, g: zicro.gesture.Gesture, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
         chrome.forwardGesture(self, g);

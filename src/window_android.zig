@@ -48,9 +48,7 @@ pub const Window = struct {
     panels: plugin.Registry,
     scrollbars: scroll.Scroll = .{ .follow_content = true },
 
-    lock: SpinLock = .{},
-    staged: Staged = .{},
-    front: Staged = .{},
+    mailbox: chrome.FrameMailbox = .{},
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const self = try gpa.create(Window);
@@ -80,8 +78,7 @@ pub const Window = struct {
         self.inner.deinit();
         self.panels.deinit();
         if (self.font) |*f| f.deinit();
-        self.staged.pixels.deinit(self.gpa);
-        self.front.pixels.deinit(self.gpa);
+        self.mailbox.deinit(self.gpa);
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -95,15 +92,31 @@ pub const Window = struct {
     pub fn run(self: *Window) !void {
         return self.inner.run();
     }
+    pub fn requestClose(self: *Window) void {
+        self.close();
+    }
     pub fn close(self: *Window) void {
         self.closed = true;
         self.inner.requestClose();
+    }
+    pub fn isVisible(self: *Window) bool {
+        return !self.closed;
+    }
+    pub fn setVisible(self: *Window, visible: bool) void {
+        if (!visible) self.close();
+    }
+    pub fn reserveGutter(_: *Window, _: u32) void {}
+    pub fn waitFrame(_: *Window, _: u32) bool {
+        return false;
     }
     pub fn hasBlur(_: *Window) bool {
         return false;
     }
     pub fn scaleFactor(_: *const Window) f32 {
         return 1;
+    }
+    pub fn physPx(self: *Window, logical_dp: u32) u32 {
+        return facade.physPxScale(self.scaleFactor(), logical_dp);
     }
     /// Responsive metrics — Android is always touch-primary. (Display density feeds in
     /// through `scaleFactor`; until it's wired it stays 1, so `w_dp` == physical px.)
@@ -128,7 +141,9 @@ pub const Window = struct {
         self.opts.style = style;
     }
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        _ = chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba);
+        if (self.mailbox.stage(self.gpa, width, height, rgba)) {
+            self.inner.requestRedraw();
+        }
     }
     pub fn textFont(self: *Window) !*text.Font {
         if (self.font == null) self.font = try text.Font.initDefault(self.gpa);
@@ -183,8 +198,8 @@ pub const Window = struct {
         self.panel_w = @intCast(@max(content.w, 1));
         self.panel_h = @intCast(@max(content.h, 1));
         _ = self.panels.tick(0.016, self.host());
-        chrome.swapFront(&self.lock, &self.staged, &self.front);
-        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        self.mailbox.swap();
+        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.mailbox.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {
@@ -202,7 +217,7 @@ pub const Window = struct {
         chrome.forwardMouse(self, event);
     }
 
-    // Gesto multi-touch dal substrato: riporta il centro in coordinate app (come innerMouse).
+    // Multi-touch gesture from the substrate: reports the center in app coordinates (like innerMouse).
     fn innerGesture(_: *zicro.window.Window, g: zicro.gesture.Gesture, user: ?*anyopaque) void {
         const self: *Window = @ptrCast(@alignCast(user.?));
         chrome.forwardGesture(self, g);

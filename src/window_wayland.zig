@@ -73,6 +73,12 @@ pub const PopupState = struct {
     y: i32 = 0,
     w: u32 = 0,
     h: u32 = 0,
+
+    fn destroy(self: PopupState) void {
+        self.popup.destroy();
+        wl.wl_proxy_destroy(@ptrCast(self.xdg_surface));
+        self.surface.destroy();
+    }
 };
 
 /// Zig 0.16 keeps blocking mutexes behind `std.Io`; the staging handoff is a short,
@@ -145,17 +151,20 @@ pub const Window = struct {
     text_input: ?*wl.ZwpTextInputV3 = null,
     data_device_manager: ?*wl.DataDeviceManager = null,
     text_input_enabled: bool = false,
+    /// IME preedit staged by `preedit_string` events; `on_preedit` fires from
+    /// this same buffer once `done` commits the text-input transaction — the
+    /// protocol never reads it in between, so one buffer suffices.
     preedit_buf: [256]u8 = undefined,
     preedit_len: usize = 0,
     preedit_cursor_begin: i32 = -1,
     preedit_cursor_end: i32 = -1,
-    pending_preedit_buf: [256]u8 = undefined,
-    pending_preedit_len: usize = 0,
-    pending_preedit_begin: i32 = -1,
-    pending_preedit_end: i32 = -1,
     pending_commit_buf: [256]u8 = undefined,
     pending_commit_len: usize = 0,
     active_popups: std.ArrayList(PopupState) = .empty,
+    /// Monotonic source for auto-assigned popup ids (`PopupSpec.id == 0`):
+    /// deriving an id from `active_popups.items.len` collided after a
+    /// middle popup was dismissed and a new one created.
+    next_popup_id: u32 = 1,
 
     surface: ?*wl.Surface = null,
     xdg_surface: ?*wl.XdgSurface = null,
@@ -334,9 +343,7 @@ pub const Window = struct {
 
     // Cross-thread frame mailbox: producers write `staged` under the lock, `redraw`
     // swaps it into `front` (window-thread-only) so the blit runs unlocked.
-    mutex: SpinLock = .{},
-    staged: Staged = .{},
-    front: Staged = .{},
+    mailbox: chrome.FrameMailbox = .{},
     wake_fd: posix.fd_t,
 
     // The zero-copy video path: GPU frames arrive as dmabufs and go to a
@@ -378,7 +385,8 @@ pub const Window = struct {
     // (Zig 0.16 keeps blocking mutex/condvar behind `std.Io`, see `SpinLock`:
     // for a blocking wait with timeout the raw futex is the right primitive here,
     // and this backend is Linux-only anyway.)
-    frame_seq: std.atomic.Value(u32) = .init(0),
+    /// Monotonic source for frame callback pacing.
+    frame_cb: ?*wl.Callback = null,
     /// Window thread only: true while a `wl_surface.frame` is in flight on the
     /// main surface (at most one pending callback at a time, requested
     /// together with the commit in `redraw`).
@@ -493,6 +501,7 @@ pub const Window = struct {
         // teardown and wake any `waitFrame` waiters BEFORE tearing down.
         // (The contract still holds: threads that call waitFrame must be joined
         // before deinit — this only narrows the race window.)
+        self.cancelFrameCallback();
         self.frame_teardown.store(true, .release);
         self.wakeFrameWaiters();
         if (self.appmenu_obj) |o| o.release();
@@ -505,8 +514,7 @@ pub const Window = struct {
         self.dropBuffers();
         if (self.font) |*f| f.deinit();
         if (self.decor.len > 0) self.gpa.free(self.decor);
-        self.staged.pixels.deinit(self.gpa);
-        self.front.pixels.deinit(self.gpa);
+        self.mailbox.deinit(self.gpa);
         for (self.video_buffers) |vb| {
             if (vb) |b| b.destroy();
         }
@@ -527,11 +535,7 @@ pub const Window = struct {
         if (self.fractional) |f| wl.wl_proxy_destroy(@ptrCast(f));
         if (self.viewport) |v| wl.wl_proxy_destroy(@ptrCast(v));
         if (self.blur) |b| wl.wl_proxy_destroy(@ptrCast(b));
-        for (self.active_popups.items) |p| {
-            p.popup.destroy();
-            wl.wl_proxy_destroy(@ptrCast(p.xdg_surface));
-            p.surface.destroy();
-        }
+        for (self.active_popups.items) |p| p.destroy();
         self.active_popups.deinit(self.gpa);
         if (self.text_input) |ti| ti.destroy();
         if (self.text_input_manager) |tim| tim.destroy();
@@ -554,12 +558,18 @@ pub const Window = struct {
         return self.blur != null;
     }
 
+    /// Poke `wake_fd` so the run loop's poll() returns immediately to pick up
+    /// whatever cross-thread state the caller just staged.
+    fn wake(self: *Window) void {
+        const one: u64 = 1;
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+    }
+
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; the
     /// newest frame wins (latest-value semantics, same spirit as zicro's media plane).
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        if (chrome.stageFrame(self.gpa, &self.mutex, &self.staged, width, height, rgba)) {
-            const one: u64 = 1;
-            _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        if (self.mailbox.stage(self.gpa, width, height, rgba)) {
+            self.wake();
         }
     }
 
@@ -585,8 +595,7 @@ pub const Window = struct {
     /// last full paint while the frame keeps moving.
     pub fn invalidate(self: *Window) void {
         self.overlay_dirty.store(true, .release);
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
     }
 
     /// Request a window resize from any thread. Stages the
@@ -598,8 +607,7 @@ pub const Window = struct {
         self.mutex.lock();
         self.pending_resize = .{ width, height };
         self.mutex.unlock();
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
     }
 
     /// Thread-safe `clipboardSet`: stages a copy of `bytes` and wakes the run
@@ -612,8 +620,7 @@ pub const Window = struct {
         if (self.pending_clip) |old| self.gpa.free(old);
         self.pending_clip = copy;
         self.mutex.unlock();
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
     }
 
     /// Unmap the video subsurface, so the parent's own staged frame
@@ -627,8 +634,7 @@ pub const Window = struct {
     /// Thread-safe (the unmap itself happens on the window thread).
     pub fn hideVideo(self: *Window) void {
         self.pending_hide_video.store(true, .release);
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
     }
 
     /// Single-plane dmabuf present (convenience overload for `presentDmabufPlanes`).
@@ -643,8 +649,6 @@ pub const Window = struct {
     pub fn presentDmabufPlanes(self: *Window, slot: u8, planes: []const DmabufPlane, width: u32, height: u32, fourcc: u32) bool {
         if (self.dmabuf == null or self.subcompositor == null or planes.len == 0 or planes.len > 4) return false;
         std.debug.assert(slot < self.video_buffers.len);
-        var stored: [4]DmabufPlane = undefined;
-        for (planes, 0..) |p, i| stored[i] = p;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -654,11 +658,11 @@ pub const Window = struct {
                 .height = height,
                 .fourcc = fourcc,
                 .plane_count = @intCast(planes.len),
-                .planes = stored,
+                .planes = undefined,
             };
+            @memcpy(self.staged_dma.?.planes[0..planes.len], planes);
         }
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
         return true;
     }
 
@@ -666,12 +670,12 @@ pub const Window = struct {
     /// lazily, then attach + commit the requested slot. Returns true when a
     /// staged frame was committed (so the caller can refresh a client overlay).
     fn processVideo(self: *Window) bool {
+        if (!self.configured) return false;
         self.mutex.lock();
         const req_opt = self.staged_dma;
         self.staged_dma = null;
         self.mutex.unlock();
         const req = req_opt orelse return false;
-        if (!self.configured) return false;
 
         if (self.video_surface == null) {
             const vs = self.compositor.?.createSurface();
@@ -837,10 +841,11 @@ pub const Window = struct {
     fn onFrameDone(data: ?*anyopaque, callback: *wl.Callback, _: u32) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(data.?));
         callback.destroy();
+        self.frame_cb = null;
         self.frame_cb_pending = false;
         _ = self.frame_seq.fetchAdd(1, .release);
         self.wakeFrameWaiters();
-        if (self.staged.fresh or self.overlay_dirty.load(.monotonic) or self.dirty_full or self.dirty_staged or self.dirty_rect != null) {
+        if (self.mailbox.isFresh() or self.overlay_dirty.load(.monotonic) or self.dirty_full or self.dirty_staged or self.dirty_rect != null) {
             self.needs_redraw = true;
         }
     }
@@ -950,23 +955,23 @@ pub const Window = struct {
                 if (fds[5].revents & (posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP) != 0) mnu.process();
             }
 
-            // Resize requested by another thread: run it HERE, on the window
-            // thread, before the redraw (Wayland surfaces are not thread-safe).
+            // Resize and clipboard are both requested cross-thread and staged under
+            // the same mutex; grab both under one lock instead of two.
             self.mutex.lock();
             const rr = self.pending_resize;
             self.pending_resize = null;
+            const pclip = self.pending_clip;
+            self.pending_clip = null;
             self.mutex.unlock();
+
+            // Run it HERE, on the window thread, before the redraw
+            // (Wayland surfaces are not thread-safe).
             if (rr) |wh| self.animateResize(wh[0], wh[1]);
 
             // Same rule for hide/show: the unmap/remap touches the surface,
             // so it must run here on the window thread (see `requestToggleVisible`).
             if (self.pending_toggle_visible.swap(false, .acquire)) self.setVisible(self.hidden.load(.acquire));
 
-            // Clipboard staged by another thread (see `requestClipboardSet`).
-            self.mutex.lock();
-            const pclip = self.pending_clip;
-            self.pending_clip = null;
-            self.mutex.unlock();
             if (pclip) |clip| {
                 self.clipboardSet(clip);
                 self.gpa.free(clip);
@@ -1022,7 +1027,7 @@ pub const Window = struct {
                 surface.commit();
             }
             self.configured = false;
-            self.frame_cb_pending = false;
+            self.cancelFrameCallback();
             self.hidden.store(true, .release);
             // A hidden surface gets no frame callbacks: release anyone parked
             // in `waitFrame` so render workers fall back to their own pacer.
@@ -1040,8 +1045,7 @@ pub const Window = struct {
     /// unmap/remap on the window thread (Wayland surfaces are not thread-safe).
     pub fn requestToggleVisible(self: *Window) void {
         self.pending_toggle_visible.store(true, .release);
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
     }
 
     /// sd-bus `Activate` trampoline: recover the window from the tray's ctx and forward to
@@ -1205,8 +1209,10 @@ pub const Window = struct {
 
         positioner.setAnchorRect(spec.x, spec.y, 1, 1);
         positioner.setSize(@intCast(@max(1, spec.w)), @intCast(@max(1, spec.h)));
-        if (spec.anchor != 0) positioner.setAnchor(spec.anchor);
-        if (spec.gravity != 0) positioner.setGravity(spec.gravity);
+        const anchor_val = toWaylandAnchor(spec.anchor);
+        const gravity_val = toWaylandGravity(spec.gravity);
+        if (anchor_val != 0) positioner.setAnchor(anchor_val);
+        if (gravity_val != 0) positioner.setGravity(gravity_val);
         positioner.setConstraintAdjustment(15);
 
         const xdg_surf = wm_base.getXdgSurface(surface);
@@ -1219,7 +1225,11 @@ pub const Window = struct {
 
         surface.commit();
 
-        const id = if (spec.id != 0) spec.id else @as(u32, @intCast(self.active_popups.items.len + 1));
+        const id = if (spec.id != 0) spec.id else blk: {
+            const auto_id = self.next_popup_id;
+            self.next_popup_id += 1;
+            break :blk auto_id;
+        };
         try self.active_popups.append(self.gpa, .{
             .id = id,
             .surface = surface,
@@ -1246,9 +1256,7 @@ pub const Window = struct {
             i -= 1;
             const p = self.active_popups.items[i];
             if (p.id == id or id == 0) {
-                p.popup.destroy();
-                wl.wl_proxy_destroy(@ptrCast(p.xdg_surface));
-                p.surface.destroy();
+                p.destroy();
                 _ = self.active_popups.orderedRemove(i);
                 if (id != 0) return;
             }
@@ -1269,8 +1277,10 @@ pub const Window = struct {
         if (self.text_input) |ti| {
             ti.enable();
             ti.setCursorRectangle(spec.x, spec.y, @intCast(spec.w), @intCast(spec.h));
-            if (spec.purpose != 0 or spec.hint != 0) {
-                ti.setContentType(spec.hint, spec.purpose);
+            const hint_val = toWaylandHint(spec.hint);
+            const purpose_val = toWaylandPurpose(spec.purpose);
+            if (hint_val != 0 or purpose_val != 0) {
+                ti.setContentType(hint_val, purpose_val);
             }
             ti.commit();
             self.text_input_enabled = true;
@@ -1285,6 +1295,65 @@ pub const Window = struct {
                 self.text_input_enabled = false;
             }
         }
+    }
+
+    fn toWaylandAnchor(anchor: plugin.PopupSpec.Anchor) u32 {
+        return switch (anchor) {
+            .none => 0,
+            .top => 1,
+            .bottom => 2,
+            .left => 3,
+            .right => 4,
+            .top_left => 5,
+            .bottom_left => 6,
+            .top_right => 7,
+            .bottom_right => 8,
+        };
+    }
+
+    fn toWaylandGravity(gravity: plugin.PopupSpec.Gravity) u32 {
+        return switch (gravity) {
+            .none => 0,
+            .top => 1,
+            .bottom => 2,
+            .left => 3,
+            .right => 4,
+            .top_left => 5,
+            .bottom_left => 6,
+            .top_right => 7,
+            .bottom_right => 8,
+        };
+    }
+
+    fn toWaylandHint(hint: plugin.TextInputSpec.Hint) u32 {
+        var val: u32 = 0;
+        if (hint.completion) val |= 1;
+        if (hint.spellcheck) val |= 2;
+        if (hint.auto_capitalization) val |= 4;
+        if (hint.lowercase) val |= 8;
+        if (hint.uppercase) val |= 16;
+        if (hint.titlecase) val |= 32;
+        if (hint.hidden_text) val |= 64;
+        if (hint.sensitive_data) val |= 128;
+        if (hint.latin) val |= 256;
+        if (hint.multiline) val |= 512;
+        return val;
+    }
+
+    fn toWaylandPurpose(purpose: plugin.TextInputSpec.Purpose) u32 {
+        return switch (purpose) {
+            .normal => 0,
+            .alpha => 1,
+            .digits => 2,
+            .number => 3,
+            .phone => 4,
+            .url => 5,
+            .email => 6,
+            .name => 7,
+            .password => 8,
+            .pin => 9,
+            .terminal => 10,
+        };
     }
 
     const popup_listener = wl.XdgPopup.Listener{
@@ -1310,9 +1379,7 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         for (self.active_popups.items, 0..) |p, i| {
             if (p.popup == popup) {
-                p.popup.destroy();
-                wl.wl_proxy_destroy(@ptrCast(p.xdg_surface));
-                p.surface.destroy();
+                p.destroy();
                 _ = self.active_popups.orderedRemove(i);
                 break;
             }
@@ -1358,14 +1425,14 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         if (txt) |t| {
             const span = std.mem.span(t);
-            const len = @min(span.len, self.pending_preedit_buf.len);
-            @memcpy(self.pending_preedit_buf[0..len], span[0..len]);
-            self.pending_preedit_len = len;
+            const len = @min(span.len, self.preedit_buf.len);
+            @memcpy(self.preedit_buf[0..len], span[0..len]);
+            self.preedit_len = len;
         } else {
-            self.pending_preedit_len = 0;
+            self.preedit_len = 0;
         }
-        self.pending_preedit_begin = cursor_begin;
-        self.pending_preedit_end = cursor_end;
+        self.preedit_cursor_begin = cursor_begin;
+        self.preedit_cursor_end = cursor_end;
     }
 
     fn onTextInputCommitString(data: ?*anyopaque, text_input: *wl.ZwpTextInputV3, txt: ?[*:0]const u8) callconv(.c) void {
@@ -1403,17 +1470,11 @@ pub const Window = struct {
             }
             self.pending_commit_len = 0;
         }
-        @memcpy(self.preedit_buf[0..self.pending_preedit_len], self.pending_preedit_buf[0..self.pending_preedit_len]);
-        self.preedit_len = self.pending_preedit_len;
-        self.preedit_cursor_begin = self.pending_preedit_begin;
-        self.preedit_cursor_end = self.pending_preedit_end;
-        self.pending_preedit_len = 0;
 
         if (self.opts.on_preedit) |cb| {
             cb(self, self.preedit_buf[0..self.preedit_len], self.preedit_cursor_begin, self.preedit_cursor_end, self.opts.user);
         }
-        self.dirty_full = true;
-        self.requestRedraw();
+        self.redrawAll();
     }
 
     const PanelCoords = struct { px: f32, py: f32, w: f32, h: f32 };
@@ -1506,8 +1567,7 @@ pub const Window = struct {
     /// even when idle. Safe to call from any thread (e.g. the RPC server).
     pub fn requestClose(self: *Window) void {
         self.closed = true;
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, 8);
+        self.wake();
     }
 
     /// Dynamically update the window's decoration style. Window thread only (it talks
@@ -1584,8 +1644,16 @@ pub const Window = struct {
         // it might never arrive. By clearing the flag, the first redraw after the
         // re-map requests a new one; if the old one arrives anyway, handling
         // two is harmless (each `done` destroys only its own wl_callback).
-        self.frame_cb_pending = false;
+        self.cancelFrameCallback();
         self.redrawAll();
+    }
+
+    fn cancelFrameCallback(self: *Window) void {
+        if (self.frame_cb) |fcb| {
+            fcb.destroy();
+            self.frame_cb = null;
+        }
+        self.frame_cb_pending = false;
     }
 
     /// The window's text engine, created lazily with the default font
@@ -1838,11 +1906,11 @@ pub const Window = struct {
     /// physical content size and the compositor's fractional scale.
     pub fn metrics(self: *Window) facade.Metrics {
         const c = self.contentPx();
-        return facade.computeMetrics(self.scaleFactor(), c.w, c.h, false);
+        return facade.computeMetrics(self.scaleFactor(), c.w, c.h, self.touch != null);
     }
 
     /// Logical → physical pixels, rounded.
-    fn physPx(self: *const Window, v: u32) u32 {
+    pub fn physPx(self: *const Window, v: u32) u32 {
         return @intCast((@as(u64, v) * self.scale120 + 60) / 120);
     }
 
@@ -1893,7 +1961,7 @@ pub const Window = struct {
         return @min(self.opts.titlebar_height, self.panel_h);
     }
 
-    fn contentRect(self: *Window) Rect {
+    pub fn contentRect(self: *Window) Rect {
         // Physical (buffer) pixels — the canvas/panel/pointer space. The title-bar
         // height stays unscaled on purpose: the controls panel draws its bar with its
         // own (unscaled) metrics, and the content must start exactly beneath it.
@@ -1944,12 +2012,12 @@ pub const Window = struct {
                     @memcpy(pixels[off .. off + r.w], self.decor[off .. off + r.w]);
                 }
                 _ = canvas.setClip(r.x, r.y, r.w, r.h);
-                chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+                chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
             }
             return;
         }
         @memcpy(pixels, self.decor);
-        chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     /// Wayland present path: size the shm buffers, acquire a free slot, compose
@@ -1978,11 +2046,11 @@ pub const Window = struct {
         // other trigger → full. Accumulated on BOTH slots: the back buffer
         // holds the pixels from two commits ago and on its turn will also have to recompose
         // what changed in the meantime.
-        chrome.swapFront(&self.mutex, &self.staged, &self.front);
+        self.mailbox.swap();
         var full = self.dirty_full;
         var partial: ?Rect = null;
-        if (self.front.width > 0) {
-            const r = chrome.frameRect(self.frameArea(), self.front.width, self.front.height);
+        if (self.mailbox.front.width > 0) {
+            const r = chrome.frameRect(self.frameArea(), self.mailbox.front.width, self.mailbox.front.height);
             if (self.dirty_staged) {
                 // First frame (no previous rect) → full.
                 if (self.last_front_rect) |prev| partial = plugin.unionOf(prev, r) else full = true;
@@ -2018,6 +2086,7 @@ pub const Window = struct {
         if (!self.frame_cb_pending) {
             const fcb = surface.frame();
             fcb.setListener(&frame_done_listener, self);
+            self.frame_cb = fcb;
             self.frame_cb_pending = true;
         }
         surface.commit();
@@ -2371,8 +2440,12 @@ pub const Window = struct {
         const self: *Window = @ptrCast(@alignCast(data.?));
         self.input_serial = serial;
         const pressed = state == wl.KEYBOARD_KEY_STATE_PRESSED;
-        if (pressed) self.armRepeat(key) else if (key == self.repeat_key) self.cancelRepeat();
+        if (!pressed and key == self.repeat_key) self.cancelRepeat();
         if (self.routeInput(.{ .key = .{ .key = key, .pressed = pressed } })) return;
+        // Repeat is armed only once a panel has had first refusal: a panel-owned
+        // key (menu navigation, popup dismissal) must not resurface at the app
+        // via synthetic repeat ticks after the panel already claimed the press.
+        if (pressed) self.armRepeat(key);
         if (key == wl.KEY_ESC and pressed) {
             // Layered dismissal: the topmost registered layer eats this ESC.
             if (self.n_dismissables > 0) {

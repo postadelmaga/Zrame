@@ -59,11 +59,7 @@ pub const Window = struct {
     panels: plugin.Registry,
     scrollbars: scroll.Scroll = .{ .follow_content = true },
 
-    // Cross-thread frame mailbox (same shape as the other backends): producers write
-    // `staged` under the lock; the window thread swaps it into `front` and composites.
-    lock: SpinLock = .{},
-    staged: Staged = .{},
-    front: Staged = .{},
+    mailbox: chrome.FrameMailbox = .{},
 
     pub fn init(gpa: Allocator, opts: Options) !*Window {
         const self = try gpa.create(Window);
@@ -99,12 +95,25 @@ pub const Window = struct {
         self.inner.deinit();
         self.panels.deinit();
         if (self.font) |*f| f.deinit();
-        self.staged.pixels.deinit(self.gpa);
-        self.front.pixels.deinit(self.gpa);
+        self.mailbox.deinit(self.gpa);
         self.threaded.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
+
+    pub fn requestClose(self: *Window) void {
+        self.close();
+    }
+
+    pub fn isVisible(self: *Window) bool {
+        return !self.closed;
+    }
+
+    pub fn setVisible(self: *Window, visible: bool) void {
+        if (!visible) self.close();
+    }
+
+    pub fn reserveGutter(_: *Window, _: u32) void {}
 
     /// Native glass: true when the zicro window mounted its NSVisualEffectView
     /// (real AppKit). Under Darling/Cocotron the class is missing → false, as before.
@@ -116,6 +125,11 @@ pub const Window = struct {
     pub fn scaleFactor(_: *const Window) f32 {
         return 1.0;
     }
+
+    pub fn physPx(self: *Window, logical_dp: u32) u32 {
+        return facade.physPxScale(self.scaleFactor(), logical_dp);
+    }
+
     /// Responsive metrics — desktop, pointer-driven (no touch).
     pub fn metrics(self: *Window) facade.Metrics {
         const c = self.contentPx();
@@ -125,7 +139,7 @@ pub const Window = struct {
     /// Stage a straight-alpha RGBA frame for presentation. Safe from any thread; newest
     /// frame wins. No wake needed: the zicro run loop repaints at 60 Hz.
     pub fn presentRgba(self: *Window, width: u32, height: u32, rgba: []const u8) void {
-        _ = chrome.stageFrame(self.gpa, &self.lock, &self.staged, width, height, rgba);
+        _ = self.mailbox.stage(self.gpa, width, height, rgba);
     }
 
     /// dmabuf zero-copy present is a Linux/Wayland path; callers fall back to `presentRgba`.
@@ -300,8 +314,8 @@ pub const Window = struct {
         self.panel_h = @intCast(@max(content.h, 1));
         // Panels animate on the frame clock (the zicro loop is a steady ~60 Hz).
         _ = self.panels.tick(0.016, self.host());
-        chrome.swapFront(&self.lock, &self.staged, &self.front);
-        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
+        self.mailbox.swap();
+        chrome.composeContent(canvas, self.contentRect(), self.contentRect(), &self.mailbox.front, self.presentStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
 
     fn innerKey(_: *zicro.window.Window, key: u32, state: u32, user: ?*anyopaque) void {

@@ -36,8 +36,8 @@ pub const runtime = @import("runtime.zig");
 pub const widget = zicro.widget;
 pub const keymap = zicro.keymap;
 pub const proportion = zicro.proportion;
-pub const phi = zicro.phi; // rapporto aureo del substrato (default di proporzione)
-pub const clipboard = zicro.clipboard; // appunti generici del substrato (blob opaco + tag)
+pub const phi = zicro.phi; // substrate's golden ratio (proportion default)
+pub const clipboard = zicro.clipboard; // substrate's generic clipboard (opaque blob + tag)
 pub const widgets = @import("widgets.zig");
 
 pub const Window = window.Window;

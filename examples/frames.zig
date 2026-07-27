@@ -117,6 +117,7 @@ pub fn main() !void {
     const sender, const receiver = try zicro.media.latest(zicro.media.Frame, gpa, io);
 
     var window_sink = zrame.WindowSink.init(win);
+    defer window_sink.deinit();
     var video_sink = zicro.video.VideoSink.init("video", receiver, window_sink.frameSink());
     try app.sink(zicro.Module.of(zicro.video.VideoSink, &video_sink));
     var painter: Painter = .{ .sender = sender };

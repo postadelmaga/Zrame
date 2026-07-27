@@ -310,9 +310,26 @@ pub const Menu = struct {
         if (std.mem.eql(u8, name, "clicked") and self.valid(id)) {
             if (self.nodes[@intCast(id)].item) |it| {
                 if (it.on_click) |cb| cb(self.effectiveCtx(it));
+                // A toggle's checkmark just flipped; the dbusmenu contract is push-based
+                // (`com.canonical.dbusmenu`), so a host that keeps the menu open (rather
+                // than re-querying on next AboutToShow) needs this signal to redraw it.
+                if (it.toggle) self.emitItemPropertiesUpdated(id);
             }
         }
         return bus.sd_bus_reply_method_return(m, "");
+    }
+
+    /// Emit `ItemsPropertiesUpdated` for one item, e.g. after a `Toggle` flips.
+    fn emitItemPropertiesUpdated(self: *Menu, id: i32) void {
+        var msg: ?*bus.Message = null;
+        if (bus.sd_bus_message_new_signal(self.bus, &msg, &self.path_buf, iface, "ItemsPropertiesUpdated") < 0) return;
+        defer _ = bus.sd_bus_message_unref(msg);
+        _ = bus.sd_bus_message_open_container(msg, bus.TYPE_ARRAY, "(ia{sv})");
+        self.appendGroupEntry(msg, id);
+        _ = bus.sd_bus_message_close_container(msg);
+        _ = bus.sd_bus_message_open_container(msg, bus.TYPE_ARRAY, "(ias)"); // removedProps: none
+        _ = bus.sd_bus_message_close_container(msg);
+        _ = bus.sd_bus_send(self.bus, msg, null);
     }
 
     fn onAboutToShow(m: ?*bus.Message, _: ?*anyopaque, _: ?*bus.BusError) callconv(.c) c_int {

@@ -93,6 +93,12 @@ pub fn computeMetrics(dpr_in: f32, w_px: u32, h_px: u32, touch: bool) Metrics {
     return .{ .w_dp = w_dp, .h_dp = h_dp, .dpr = dpr, .class = class, .touch = touch, .ui_scale = ui_scale };
 }
 
+/// Physical pixels calculated from logical DP and display density scale factor.
+pub fn physPxScale(scale: f32, logical_dp: u32) u32 {
+    const f = if (scale > 0) scale else 1.0;
+    return @intFromFloat(@round(@as(f32, @floatFromInt(logical_dp)) * f));
+}
+
 /// The concrete window struct for this target. Selected at comptime; the backends
 /// mutually import this file for the shared types below, so `*Window` in a callback
 /// signature is exactly the backend struct the caller receives.
@@ -108,6 +114,49 @@ pub const Window = switch (builtin.os.tag) {
     else
         @import("window_wayland.zig").Window,
 };
+
+comptime {
+    verifyWindowBackendContract(Window);
+}
+
+fn verifyWindowBackendContract(comptime W: type) void {
+    const required_fields = [_][]const u8{
+        "panel_w",
+        "panel_h",
+        "closed",
+    };
+    inline for (required_fields) |name| {
+        if (!@hasField(W, name)) {
+            @compileError("Window backend missing field '" ++ name ++ "'");
+        }
+    }
+
+    const required_decls = [_][]const u8{
+        "init",
+        "deinit",
+        "run",
+        "requestClose",
+        "close",
+        "isVisible",
+        "setVisible",
+        "metrics",
+        "physPx",
+        "contentPx",
+        "contentRect",
+        "presentRgba",
+        "waitFrame",
+        "toggleFullscreen",
+        "setStyle",
+        "reserveGutter",
+        "textFont",
+        "host",
+    };
+    inline for (required_decls) |name| {
+        if (!@hasDecl(W, name)) {
+            @compileError("Window backend missing declaration '" ++ name ++ "'");
+        }
+    }
+}
 
 /// Mouse events delivered to the app's `on_mouse` callback.
 ///
@@ -126,9 +175,11 @@ pub const MouseEvent = union(enum) {
     leave,
 };
 
-/// Gesto multi-touch riconosciuto dal substrato (pinch, …). Un dito arriva come evento
-/// mouse su `on_mouse`; due dita qui. `scale` = rapporto di zoom incrementale, `(cx,cy)` il
-/// centro, `(dx,dy)` la traslazione — l'app zooma/pana a modo suo. Vedi `zicro.gesture`.
+/// Multi-touch gesture recognized by the substrate (pinch, …). One finger arrives as a
+/// mouse event on `on_mouse`; two fingers land here. `scale` = incremental zoom ratio,
+/// `(cx,cy)` the center, `(dx,dy)` the translation — the app zooms/pans however it likes.
+/// See `zicro.gesture`. Only fires on the web and Android backends today — Wayland/Win32/
+/// Cocoa track at most a single primary finger and never invoke this callback.
 pub const GestureEvent = zicro.gesture.Gesture;
 
 /// Declarative tray-icon config (see `tray.zig`). `on_activate` fires on left-click.
@@ -192,7 +243,8 @@ pub const Options = struct {
     on_text: ?*const fn (window: *Window, bytes: [4]u8, len: u8, user: ?*anyopaque) void = null,
     /// Optional pre-edit composition handler for Input Method Editors (IME, `zwp_text_input_v3`).
     /// `text` is the UTF-8 encoded in-progress composition string, `cursor_begin` and `cursor_end`
-    /// indicate the selection/cursor bounds within preedit text.
+    /// indicate the selection/cursor bounds within preedit text. Wayland-only for now; a no-op
+    /// on the other backends.
     on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
     /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
@@ -203,6 +255,7 @@ pub const Options = struct {
     on_mouse: ?*const fn (window: *Window, event: MouseEvent, user: ?*anyopaque) bool = null,
     /// Optional multi-touch gesture handler (pinch, …) recognised by the substrate. Single
     /// touch still arrives through `on_mouse`; two fingers here. See [`GestureEvent`].
+    /// Web and Android only for now — Wayland/Win32/Cocoa never invoke this.
     on_gesture: ?*const fn (window: *Window, gesture: GestureEvent, user: ?*anyopaque) void = null,
     /// Optional system-tray icon (StatusNotifierItem over DBus). Linux-only; a no-op
     /// elsewhere.
