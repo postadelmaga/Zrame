@@ -687,7 +687,7 @@ pub const Window = struct {
     /// The content rect within the layered buffer: the panel sits inset by the shadow-gutter
     /// margin on every side, minus the (optional) title bar band at its top. Same geometry as
     /// the Wayland backend, so the app content lands in the identical spot.
-    fn contentRect(self: *Window) Rect {
+    pub fn contentRect(self: *Window) Rect {
         const m = self.curMargin();
         const tb = self.titlebarHeight();
         return .{ .x = m, .y = m + tb, .w = self.panel_w, .h = self.panel_h - tb };
@@ -1073,7 +1073,7 @@ pub const Window = struct {
                 // Mouse in APP coordinates (see `MouseEvent`): canvas minus the origin of the
                 // staged frame/content rect — panels and the resize band stay in canvas space.
                 if (self.opts.on_mouse) |cb| {
-                    const o = chrome.appOrigin(self.contentRect(), &self.front);
+                    const o = chrome.appOrigin(self.contentRect(), &self.mailbox.front);
                     _ = cb(self, .{ .motion = .{ .x = p.x - o.x, .y = p.y - o.y } }, self.opts.user);
                 }
                 return 0;
