@@ -692,6 +692,11 @@ pub const Window = struct {
             empty.destroy();
             const ss = self.subcompositor.?.getSubsurface(vs, self.surface.?);
             ss.setDesync();
+            // A subsurface is added top-most in its parent's stack by default:
+            // without this, any content the app draws on the PARENT surface
+            // (labels, chrome, future overlays — see zuer's Panel work) would
+            // render underneath this one and never be seen.
+            ss.placeBelow(self.surface.?);
             self.video_surface = vs;
             self.video_subsurface = ss;
             // Fractional HiDPI: the frame is rendered in physical pixels; the
