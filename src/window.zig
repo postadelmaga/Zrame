@@ -46,18 +46,6 @@ pub const DmabufPlane = struct {
     modifier: u64 = 0,
 };
 
-/// Outcome delivered to `Options.on_video_buffer_event` for a
-/// `presentDmabufPlanesDynamic` frame: the ONLY safe signal that the caller
-/// may recycle/free whatever resource sits behind the frame's `token` (e.g.
-/// unref a decoder's hardware surface). `released` fires once the compositor
-/// is done reading the buffer (or, if the frame was superseded before ever
-/// being shown, immediately — either way "safe to free now"). `failed` fires
-/// when the compositor rejected the format/modifier combo: a normal,
-/// recoverable event (unlike `presentDmabufPlanes`' `createImmed`, which
-/// would kill the whole connection on the same rejection) — the caller
-/// should fall back to a non-zero-copy path for this frame/stream.
-pub const VideoBufferEvent = enum { released, failed };
-
 /// Device form factor, classified from the logical (dp) content width. Apps reflow
 /// their layout on this — collapse side panels, shrink the toolbar to essentials —
 /// instead of hardcoding pixel thresholds.
@@ -205,7 +193,7 @@ pub const TrayConfig = struct {
 };
 
 /// How a presented GPU frame (`presentDmabuf`) is placed in the content rect.
-pub const VideoFit = enum(u8) {
+pub const VideoFit = enum {
     /// The frame FILLS the content rect (wp_viewport scales it on the scanout
     /// path, for free). Its pixel size is then a quality knob — the resolution
     /// tier, dynamic-res, FSR — and not a statement about how big the window is.
@@ -216,14 +204,6 @@ pub const VideoFit = enum(u8) {
     /// render is a PANEL inside a larger card — the rest of the content rect
     /// belongs to `on_draw` (text, chrome) and must not be painted over.
     native,
-    /// Aspect-preserving letterbox/pillarbox: the frame is scaled to the
-    /// largest size that fits ENTIRELY within the content rect, centered —
-    /// same math as a movie player's "fit to window". Unlike `fill`, this
-    /// never crops or distorts the picture; unlike `native`, it still uses
-    /// `wp_viewport` scaling instead of showing the frame at its raw pixel
-    /// size. What real video playback wants (`fill` is for a render whose
-    /// pixel size is a pure quality knob, e.g. the mesh viewer).
-    contain,
 };
 
 pub const Options = struct {
@@ -266,12 +246,6 @@ pub const Options = struct {
     /// indicate the selection/cursor bounds within preedit text. Wayland-only for now; a no-op
     /// on the other backends.
     on_preedit: ?*const fn (window: *Window, text: []const u8, cursor_begin: i32, cursor_end: i32, user: ?*anyopaque) void = null,
-    /// Fired on the window thread for every `presentDmabufPlanesDynamic`
-    /// frame once its outcome is known (see [`VideoBufferEvent`]) — `token`
-    /// is whatever the caller passed to the matching present call, echoed
-    /// back unchanged. Wayland-only for now (a no-op elsewhere, since only
-    /// that backend has the per-frame dynamic dmabuf path).
-    on_video_buffer_event: ?*const fn (window: *Window, token: u64, event: VideoBufferEvent, user: ?*anyopaque) void = null,
     /// Optional scroll handler (axis: 0 vertical / 1 horizontal, value in 1/256 units).
     on_scroll: ?*const fn (window: *Window, axis: u32, value: i32, user: ?*anyopaque) void = null,
     /// Optional mouse event handler (motion, button clicks, leave). Motion coordinates

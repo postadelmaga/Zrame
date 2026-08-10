@@ -52,8 +52,7 @@ const Staged = chrome.Staged;
 
 pub const DmabufPlane = facade.DmabufPlane;
 
-/// One pending dmabuf present (see `Window.presentDmabuf` / `Window.presentDmabufPlanes`
-/// / `Window.presentDmabufPlanesDynamic`).
+/// One pending dmabuf present (see `Window.presentDmabuf` / `Window.presentDmabufPlanes`).
 const StagedDma = struct {
     slot: u8,
     width: u32,
@@ -61,51 +60,6 @@ const StagedDma = struct {
     fourcc: u32,
     plane_count: u8 = 1,
     planes: [4]DmabufPlane = undefined,
-    /// True for `presentDmabufPlanesDynamic`: every present is a physically
-    /// distinct buffer (VAAPI decode output), never the same persistent GPU
-    /// memory rewritten in place (the mesh's `presentDmabufPlanes` case) — see
-    /// `processVideo`, which takes a completely different path for this.
-    dynamic: bool = false,
-    /// Only meaningful when `dynamic`: echoed back via
-    /// `Options.on_video_buffer_event` so the caller can correlate the event
-    /// with the resource (e.g. an AVFrame) behind this specific present call.
-    token: u64 = 0,
-};
-
-/// Size of the fixed pools backing the dynamic dmabuf buffer lifecycle (see
-/// `Window.dynamic_creates`/`dynamic_releases`) — generous enough for a
-/// producer pipelining several frames ahead (Zuer's own pool is 3) without
-/// ever needing a per-frame heap allocation.
-const dynamic_pool_cap = 8;
-
-/// Size of `Window.pending_drops` (see `presentDmabufPlanesDynamic`'s mailbox
-/// comment) — bounds how many superseded-before-shown tokens can accumulate
-/// between two window-thread wake-ups before the OLDEST ones would need to be
-/// dropped outright (never observed in practice at GPU_CAP=3-ish producer
-/// pool sizes; generous enough for several times that).
-const pending_drops_cap = 16;
-
-/// One in-flight `zwp_linux_buffer_params_v1.create` awaiting its
-/// `created`/`failed` event — a listener `data` pointer straight into
-/// `Window.dynamic_creates`, claimed/freed by index (see
-/// `Window.claimDynamicCreateSlot`). Carries `window` itself (rather than
-/// recovering it from the slot pointer via `@fieldParentPtr`, which needs a
-/// pointer to the ARRAY field, not one of its elements) — one extra pointer
-/// per slot, trivial next to what it buys in simplicity.
-const DynamicCreatePending = struct {
-    in_use: bool = false,
-    window: *Window = undefined,
-    token: u64 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-};
-
-/// One dynamic `wl_buffer` alive between its `created` and `release` events —
-/// same slot-by-index scheme as `DynamicCreatePending`.
-const DynamicReleasePending = struct {
-    in_use: bool = false,
-    window: *Window = undefined,
-    token: u64 = 0,
 };
 
 /// Tracked state of an active secondary popup surface (`xdg_popup`).
@@ -421,44 +375,6 @@ pub const Window = struct {
     /// different size recreates the buffer, so producers may change resolution
     /// (window resize) without exhausting slots.
     video_buf_sizes: [8][2]u32 = @splat(.{ 0, 0 }),
-    /// Fit mode for the video subsurface (see `VideoFit`), separate from
-    /// `opts.video_fit` (the init-time default) so `setVideoFit` can switch it
-    /// at runtime from any thread — an app alternating between the mesh
-    /// (`.fill`) and real video playback (`.contain`) on the same `Window`
-    /// needs this, since `Options` is otherwise fixed at `init`.
-    video_fit: std.atomic.Value(facade.VideoFit) = .init(.fill),
-    /// Thread-safe snapshot backing the public `videoRect()` getter — kept in
-    /// sync (window-thread-only writes, in `attachAndCommitVideo`) with the
-    /// internal `video_rect` above. Plain per-field atomics rather than a
-    /// lock: a caller reading mid-update might see one frame's old x paired
-    /// with a new y during a resize — harmless (whatever it positions
-    /// self-corrects the very next frame) and keeps the video hot path free
-    /// of cross-thread locking. An app drawing its own overlay (controls,
-    /// subtitles) on the parent surface over the video needs this to align
-    /// with wherever the fit (`VideoFit`) placed it on the window thread.
-    video_rect_x: std.atomic.Value(u32) = .init(0),
-    video_rect_y: std.atomic.Value(u32) = .init(0),
-    video_rect_w: std.atomic.Value(u32) = .init(0),
-    video_rect_h: std.atomic.Value(u32) = .init(0),
-    video_rect_valid: std.atomic.Value(bool) = .init(false),
-    /// Fixed pools backing the dynamic (`presentDmabufPlanesDynamic`) buffer
-    /// lifecycle — no allocator traffic on the video hot path, where
-    /// create/created/failed/release can all happen many times a second.
-    /// Zrame is a generic windowing layer other apps use for non-video
-    /// content too, so this stays zero-cost (a few hundred bytes on `Window`)
-    /// for anyone who never calls the dynamic present path. Slots are plain
-    /// array elements INSIDE `Window` (heap-allocated once, stable for the
-    /// window's lifetime) — a listener's `data` can point straight at one,
-    /// no separate `gpa.create` per frame. See `claimDynamicCreateSlot` /
-    /// `claimDynamicReleaseSlot`.
-    dynamic_creates: [dynamic_pool_cap]DynamicCreatePending = @splat(.{}),
-    dynamic_releases: [dynamic_pool_cap]DynamicReleasePending = @splat(.{}),
-    /// Tokens superseded before ever being shown (see the mailbox comment on
-    /// `presentDmabufPlanesDynamic`) — queued under `mutex`, drained and
-    /// notified (`on_video_buffer_event`) on the window thread by
-    /// `processVideo`, NEVER synchronously from the caller's thread.
-    pending_drops: [pending_drops_cap]u64 = undefined,
-    pending_drops_len: u8 = 0,
     /// LIFO of dismissable layers: ESC pops the topmost before `close_on_esc`
     /// gets a say (menus still handle their own ESC first, via routeInput).
     /// Window-thread only; apps push from callbacks or before `run`.
@@ -519,7 +435,6 @@ pub const Window = struct {
             .timer_fd = timer_fd,
             .repeat_fd = repeat_fd,
             .panels = plugin.Registry.init(gpa),
-            .video_fit = .init(opts.video_fit),
         };
         self.panel_w = @max(self.panel_w, self.minPanel());
         self.panel_h = @max(self.panel_h, self.minPanel());
@@ -607,29 +522,6 @@ pub const Window = struct {
         if (self.font) |*f| f.deinit();
         if (self.decor.len > 0) self.gpa.free(self.decor);
         self.mailbox.deinit(self.gpa);
-        // Dynamic dmabuf video path: notify the caller for anything still
-        // in flight, so an AVFrame/hardware surface behind an unconsumed
-        // present, an unresolved create, or an unreleased buffer is never
-        // leaked just because the window closed before Wayland told us
-        // "done" — teardown IS "done" from the caller's point of view.
-        if (self.staged_dma) |sd| {
-            if (sd.dynamic) {
-                if (self.opts.on_video_buffer_event) |cb| cb(self, sd.token, .released, self.opts.user);
-            }
-            self.staged_dma = null;
-        }
-        for (&self.dynamic_creates) |*s| {
-            if (s.in_use) {
-                s.in_use = false;
-                if (self.opts.on_video_buffer_event) |cb| cb(self, s.token, .failed, self.opts.user);
-            }
-        }
-        for (&self.dynamic_releases) |*s| {
-            if (s.in_use) {
-                s.in_use = false;
-                if (self.opts.on_video_buffer_event) |cb| cb(self, s.token, .released, self.opts.user);
-            }
-        }
         for (self.video_buffers) |vb| {
             if (vb) |b| b.destroy();
         }
@@ -759,16 +651,8 @@ pub const Window = struct {
 
     /// Present a GPU frame (1..4 planes) with zero CPU pixel work: planes specify the dmabuf
     /// exports (`fourcc`/`stride`/`modifier`/`offset` as reported by exporter/Vulkan). `slot`
-    /// (0..7) identifies a PERSISTENT image, rewritten in place every frame (e.g. a render
-    /// target the app keeps drawing into) — its wl_buffer is created once and reused as-is on
-    /// every subsequent present at that slot, regardless of the fds passed in (they are assumed
-    /// to still point at the SAME underlying memory; only the size is checked for a fresh
-    /// buffer). A source where every present is a physically DIFFERENT buffer — a hardware
-    /// video decoder's output, one distinct surface per frame — must use
-    /// `presentDmabufPlanesDynamic` instead: reusing this call for that would silently keep
-    /// showing the FIRST frame's content forever after the first present at a given slot.
-    /// Returns false when compositor lacks linux-dmabuf/subcompositor support — fall back to
-    /// `presentRgba`.
+    /// (0..7) identifies a persistent image; its wl_buffer is created once and reused. Returns
+    /// false when compositor lacks linux-dmabuf/subcompositor support — fall back to `presentRgba`.
     pub fn presentDmabufPlanes(self: *Window, slot: u8, planes: []const DmabufPlane, width: u32, height: u32, fourcc: u32) bool {
         if (self.dmabuf == null or self.subcompositor == null or planes.len == 0 or planes.len > 4) return false;
         std.debug.assert(slot < self.video_buffers.len);
@@ -789,278 +673,71 @@ pub const Window = struct {
         return true;
     }
 
-    /// Present a GPU frame that is a PHYSICALLY DISTINCT buffer every call — a hardware video
-    /// decoder's output (VAAPI/VDPAU/etc. exported as DRM-PRIME), never the same persistent
-    /// render target `presentDmabufPlanes` expects. Unlike that call, this ALWAYS creates a
-    /// fresh `wl_buffer` (never reuses one) via the async `zwp_linux_buffer_params_v1.create`
-    /// request instead of `create_immed`: an unsupported format/modifier combo then arrives as
-    /// a normal `failed` event — reported through `Options.on_video_buffer_event` — instead of
-    /// a FATAL Wayland protocol error that would kill the whole client connection.
-    ///
-    /// `token` is opaque to this window: whatever the caller passed here is echoed back via
-    /// `on_video_buffer_event` (`.released` once the compositor is truly done reading the
-    /// buffer — or immediately, if this frame gets superseded by a newer one before ever being
-    /// shown; `.failed` if the compositor rejected it) — the ONLY safe signal to recycle/free
-    /// the resource behind it (e.g. unref the decoder's hardware surface). `slot` is carried
-    /// through purely for the caller's own bookkeeping (this call ignores it beyond that).
-    ///
-    /// Returns false immediately when compositor lacks linux-dmabuf/subcompositor support (no
-    /// event will follow in that case — nothing was staged). A `true` return only means the
-    /// frame was accepted for staging, NOT that it was shown — the real outcome always arrives
-    /// later via `on_video_buffer_event`.
-    pub fn presentDmabufPlanesDynamic(self: *Window, slot: u8, token: u64, planes: []const DmabufPlane, width: u32, height: u32, fourcc: u32) bool {
-        if (self.dmabuf == null or self.subcompositor == null or planes.len == 0 or planes.len > 4) return false;
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            // The mailbox holds at most one pending request: a producer that
-            // outruns the window thread would otherwise silently drop the
-            // previous request WITHOUT ever notifying its caller — fine for
-            // the persistent-target case (nothing owns per-frame resources
-            // there), a leak here (a superseded frame's AVFrame would never
-            // be freed). It was never shown, so "safe to free" is immediately
-            // true — but the notification MUST still happen on the window
-            // thread (see `pending_drops`), never synchronously here: this
-            // runs on the CALLER's thread, which may already hold an app lock
-            // the callback also needs (seen in practice: the caller holding
-            // its own frame-state mutex across the present call self-deadlocks
-            // if the callback tries to lock it again reentrantly).
-            if (self.staged_dma) |old| {
-                if (old.dynamic and self.pending_drops_len < pending_drops_cap) {
-                    self.pending_drops[self.pending_drops_len] = old.token;
-                    self.pending_drops_len += 1;
-                }
-            }
-            self.staged_dma = .{
-                .slot = slot,
-                .width = width,
-                .height = height,
-                .fourcc = fourcc,
-                .plane_count = @intCast(planes.len),
-                .planes = undefined,
-                .dynamic = true,
-                .token = token,
-            };
-            @memcpy(self.staged_dma.?.planes[0..planes.len], planes);
+    /// Window-thread half of `presentDmabuf`: build the subsurface/buffers
+    /// lazily, then attach + commit the requested slot. Returns true when a
+    /// staged frame was committed (so the caller can refresh a client overlay).
+    fn processVideo(self: *Window) bool {
+        if (!self.configured) return false;
+        self.mutex.lock();
+        const req_opt = self.staged_dma;
+        self.staged_dma = null;
+        self.mutex.unlock();
+        const req = req_opt orelse return false;
+
+        if (self.video_surface == null) {
+            const vs = self.compositor.?.createSurface();
+            // Input passes through to the glass parent (drag/keys still work).
+            const empty = self.compositor.?.createRegion();
+            vs.setInputRegion(empty);
+            empty.destroy();
+            const ss = self.subcompositor.?.getSubsurface(vs, self.surface.?);
+            ss.setDesync();
+            // A subsurface is added top-most in its parent's stack by default:
+            // without this, any content the app draws on the PARENT surface
+            // (labels, chrome, future overlays — see zuer's Panel work) would
+            // render underneath this one and never be seen.
+            ss.placeBelow(self.surface.?);
+            self.video_surface = vs;
+            self.video_subsurface = ss;
+            // Fractional HiDPI: the frame is rendered in physical pixels; the
+            // viewport presents it at logical size (identity on scale-1).
+            if (self.viewporter) |vpr| self.video_viewport = vpr.getViewport(vs);
+            // Mapping and position are parent state: one chrome commit seals them.
+            self.redrawAll();
         }
-        self.wake();
-        return true;
-    }
-
-    /// Lazily creates the video subsurface (shared by the persistent-target and
-    /// dynamic present paths below) — same subsurface either way, only what
-    /// feeds its buffers differs.
-    fn ensureVideoSurface(self: *Window) void {
-        if (self.video_surface != null) return;
-        const vs = self.compositor.?.createSurface();
-        // Input passes through to the glass parent (drag/keys still work).
-        const empty = self.compositor.?.createRegion();
-        vs.setInputRegion(empty);
-        empty.destroy();
-        const ss = self.subcompositor.?.getSubsurface(vs, self.surface.?);
-        ss.setDesync();
-        // A subsurface is added top-most in its parent's stack by default:
-        // without this, any content the app draws on the PARENT surface
-        // (labels, chrome, future overlays — see zuer's Panel work) would
-        // render underneath this one and never be seen.
-        ss.placeBelow(self.surface.?);
-        self.video_surface = vs;
-        self.video_subsurface = ss;
-        // Fractional HiDPI: the frame is rendered in physical pixels; the
-        // viewport presents it at logical size (identity on scale-1).
-        if (self.viewporter) |vpr| self.video_viewport = vpr.getViewport(vs);
-        // Mapping and position are parent state: one chrome commit seals them.
-        self.redrawAll();
-    }
-
-    /// The rect (physical, canvas space) a `width`×`height` frame should be
-    /// positioned/scaled into, per `self.video_fit`. Computed fresh every
-    /// time (not cached): for the dynamic path this runs at ATTACH time
-    /// (when `created` fires), potentially a whole round-trip after the
-    /// present call, and the window may have been resized meanwhile.
-    ///
-    /// The content rect is physical; everything handed to the compositor
-    /// (subsurface position, viewport destination) is logical. `.fill`: the
-    /// frame FILLS the content area — its pixel size is then a quality knob
-    /// (resolution tier, dynamic-res, FSR), not a statement about window
-    /// size; `wp_viewport` scales it on the compositor's scanout path, for
-    /// free. `.native`: no scaling at all (needed when there's no
-    /// viewporter, or for a PANEL inside a larger card whose `on_draw` owns
-    /// the rest of the content rect — filling would paint over it).
-    /// `.contain`: aspect-preserving letterbox/pillarbox — what real video
-    /// playback wants, same math as `compose.zig`'s CPU aspect-fit.
-    fn videoDestRect(self: *Window, width: u32, height: u32) Rect {
+        // The content rect is physical (canvas space); everything handed to the
+        // compositor — subsurface position, viewport destination — is logical.
+        //
+        // The frame FILLS the content area. Its pixel size is a quality knob (the
+        // resolution tier, dynamic-res, FSR) and has nothing to do with how big
+        // the window is: wp_viewport scales the buffer up to the content rect on
+        // the compositor's scanout path, for free. Presenting the buffer at its
+        // native size instead — which is what we used to do — left a fat border
+        // of empty glass around anything rendered below the window's size.
+        //
+        // Unless the window says otherwise: `video_fit = .native` is for a render
+        // that is a PANEL inside a larger card (the rest of the content rect is
+        // `on_draw`'s text), where filling would paint over it. Without a
+        // viewporter we cannot scale at all, so that is the only thing we can do.
         const content = self.frameArea();
         var vw = content.w;
         var vh = content.h;
         var dx = content.x;
         var dy = content.y;
-        const fit = self.video_fit.load(.monotonic);
-        if (self.video_viewport == null or fit == .native) {
-            vw = @min(width, content.w);
-            vh = @min(height, content.h);
-            dx = content.x + (content.w - vw) / 2;
-            dy = content.y + (content.h - vh) / 2;
-        } else if (fit == .contain and width > 0 and height > 0) {
-            const src_aspect: f64 = @as(f64, @floatFromInt(width)) / @as(f64, @floatFromInt(height));
-            const dst_aspect: f64 = @as(f64, @floatFromInt(content.w)) / @as(f64, @floatFromInt(content.h));
-            if (src_aspect > dst_aspect) {
-                vw = content.w;
-                vh = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(content.w)) / src_aspect))));
-            } else {
-                vh = content.h;
-                vw = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(content.h)) * src_aspect))));
-            }
+        if (self.video_viewport == null or self.opts.video_fit == .native) {
+            vw = @min(req.width, content.w);
+            vh = @min(req.height, content.h);
             dx = content.x + (content.w - vw) / 2;
             dy = content.y + (content.h - vh) / 2;
         }
-        return .{ .x = dx, .y = dy, .w = vw, .h = vh };
-    }
-
-    /// Tail shared by both present paths: position the subsurface per `rect`,
-    /// attach `buffer`, damage it whole, and commit.
-    fn attachAndCommitVideo(self: *Window, buffer: *wl.Buffer, width: u32, height: u32, rect: Rect) void {
-        self.video_rect = rect;
-        self.video_rect_x.store(rect.x, .monotonic);
-        self.video_rect_y.store(rect.y, .monotonic);
-        self.video_rect_w.store(rect.w, .monotonic);
-        self.video_rect_h.store(rect.h, .monotonic);
-        self.video_rect_valid.store(true, .monotonic);
-        self.video_subsurface.?.setPosition(@intCast(self.logiPx(rect.x)), @intCast(self.logiPx(rect.y)));
+        self.video_rect = .{ .x = dx, .y = dy, .w = vw, .h = vh };
+        self.video_subsurface.?.setPosition(@intCast(self.logiPx(dx)), @intCast(self.logiPx(dy)));
         if (self.video_viewport) |vp| {
-            vp.setDestination(@intCast(@max(self.logiPx(rect.w), 1)), @intCast(@max(self.logiPx(rect.h), 1)));
-        }
-        const vs = self.video_surface.?;
-        vs.attach(buffer, 0, 0);
-        vs.damageBuffer(0, 0, @intCast(width), @intCast(height));
-        // Refresh pacing: one frame callback per commit; producers that honor
-        // `videoBusy` settle at the compositor's cadence.
-        self.video_pending.store(true, .release);
-        const cb = vs.frame();
-        cb.setListener(&video_frame_listener, self);
-        vs.commit();
-    }
-
-    /// Claims a free slot in `dynamic_creates` (linear scan — `dynamic_pool_cap`
-    /// is small and this runs at most once per present, never in a hot inner
-    /// loop). `null` when all slots are in flight (an extreme producer/
-    /// compositor pace mismatch — the caller reports `.failed` and the
-    /// producer naturally retries on its next frame).
-    fn claimDynamicCreateSlot(self: *Window) ?*DynamicCreatePending {
-        for (&self.dynamic_creates) |*s| {
-            if (!s.in_use) return s;
-        }
-        return null;
-    }
-
-    /// Same as `claimDynamicCreateSlot`, for `dynamic_releases`.
-    fn claimDynamicReleaseSlot(self: *Window) ?*DynamicReleasePending {
-        for (&self.dynamic_releases) |*s| {
-            if (!s.in_use) return s;
-        }
-        return null;
-    }
-
-    const dynamic_create_listener = wl.BufferParams.Listener{ .created = onDynamicBufferCreated, .failed = onDynamicBufferFailed };
-    const dynamic_release_listener = wl.Buffer.Listener{ .release = onDynamicBufferRelease };
-
-    /// `data` points straight into `Window.dynamic_creates` (see
-    /// `claimDynamicCreateSlot`) — no heap allocation on this path.
-    fn onDynamicBufferCreated(data: ?*anyopaque, params: *wl.BufferParams, buffer: *wl.Buffer) callconv(.c) void {
-        const slot: *DynamicCreatePending = @ptrCast(@alignCast(data.?));
-        const self = slot.window;
-        const width = slot.width;
-        const height = slot.height;
-        const token = slot.token;
-        slot.in_use = false;
-        params.destroy();
-
-        const rslot = self.claimDynamicReleaseSlot() orelse {
-            // No free release slot: holding the buffer without ever being
-            // able to safely tell the caller "free your AVFrame now" would
-            // leak a decoder surface. Destroy it now and report failure
-            // instead — the caller falls back to its non-zero-copy path.
-            buffer.destroy();
-            if (self.opts.on_video_buffer_event) |cb| cb(self, token, .failed, self.opts.user);
-            return;
-        };
-        rslot.* = .{ .in_use = true, .window = self, .token = token };
-        buffer.setListener(&dynamic_release_listener, rslot);
-
-        self.ensureVideoSurface();
-        self.attachAndCommitVideo(buffer, width, height, self.videoDestRect(width, height));
-    }
-
-    fn onDynamicBufferFailed(data: ?*anyopaque, params: *wl.BufferParams) callconv(.c) void {
-        const slot: *DynamicCreatePending = @ptrCast(@alignCast(data.?));
-        const self = slot.window;
-        const token = slot.token;
-        slot.in_use = false;
-        params.destroy();
-        if (self.opts.on_video_buffer_event) |cb| cb(self, token, .failed, self.opts.user);
-    }
-
-    fn onDynamicBufferRelease(data: ?*anyopaque, buffer: *wl.Buffer) callconv(.c) void {
-        const slot: *DynamicReleasePending = @ptrCast(@alignCast(data.?));
-        const self = slot.window;
-        const token = slot.token;
-        slot.in_use = false;
-        buffer.destroy();
-        if (self.opts.on_video_buffer_event) |cb| cb(self, token, .released, self.opts.user);
-    }
-
-    /// Window-thread half of `presentDmabuf`/`presentDmabufPlanesDynamic`:
-    /// dispatches to the persistent-target path (attach+commit synchronously,
-    /// same as before) or the dynamic one (fires off an async buffer
-    /// creation; attach+commit happens later, in `onDynamicBufferCreated`).
-    /// Returns true when a staged frame was committed IMMEDIATELY (so the
-    /// caller can refresh a client overlay) — a dynamic request always
-    /// returns false here even on success, since nothing is shown yet.
-    fn processVideo(self: *Window) bool {
-        if (!self.configured) return false;
-        var drops: [pending_drops_cap]u64 = undefined;
-        var ndrops: u8 = 0;
-        self.mutex.lock();
-        const req_opt = self.staged_dma;
-        self.staged_dma = null;
-        ndrops = self.pending_drops_len;
-        @memcpy(drops[0..ndrops], self.pending_drops[0..ndrops]);
-        self.pending_drops_len = 0;
-        self.mutex.unlock();
-        // Drenati QUI, sul thread finestra (mai dal thread chiamante di
-        // `presentDmabufPlanesDynamic` — vedi il commento lì): anche se non
-        // c'è una richiesta nuova da processare in questo giro, un token
-        // scartato prima di essere mostrato non deve aspettare la prossima
-        // richiesta viva per essere notificato.
-        for (drops[0..ndrops]) |t| {
-            if (self.opts.on_video_buffer_event) |cb| cb(self, t, .released, self.opts.user);
-        }
-        const req = req_opt orelse return false;
-
-        self.ensureVideoSurface();
-
-        if (req.dynamic) {
-            const params = self.dmabuf.?.createParams();
-            var pi: u32 = 0;
-            while (pi < req.plane_count) : (pi += 1) {
-                const pl = req.planes[pi];
-                params.add(pl.fd, pi, pl.offset, pl.stride, pl.modifier);
-            }
-            const cslot = self.claimDynamicCreateSlot() orelse {
-                params.destroy();
-                if (self.opts.on_video_buffer_event) |cb| cb(self, req.token, .failed, self.opts.user);
-                return false;
-            };
-            cslot.* = .{ .in_use = true, .window = self, .token = req.token, .width = req.width, .height = req.height };
-            params.setListener(&dynamic_create_listener, cslot);
-            params.create(@intCast(req.width), @intCast(req.height), req.fourcc, 0);
-            return false;
+            vp.setDestination(@intCast(@max(self.logiPx(vw), 1)), @intCast(@max(self.logiPx(vh), 1)));
         }
 
-        // Persistent-target path (the mesh): the wl_buffer is created once
-        // per slot (or when its size changes) and reused in place for every
-        // subsequent present — the underlying GPU memory is rewritten by the
-        // producer, not replaced.
+        // A slot re-presented at a new size (producer resized) gets a fresh
+        // wl_buffer; the compositor keeps the old one alive until released.
         if (self.video_buffers[req.slot]) |b| {
             const sz = self.video_buf_sizes[req.slot];
             if (sz[0] != req.width or sz[1] != req.height) {
@@ -1084,7 +761,15 @@ pub const Window = struct {
             );
             params.destroy();
         }
-        self.attachAndCommitVideo(self.video_buffers[req.slot].?, req.width, req.height, self.videoDestRect(req.width, req.height));
+        const vs = self.video_surface.?;
+        vs.attach(self.video_buffers[req.slot], 0, 0);
+        vs.damageBuffer(0, 0, @intCast(req.width), @intCast(req.height));
+        // Refresh pacing: one frame callback per commit; producers that honor
+        // `videoBusy` settle at the compositor's cadence.
+        self.video_pending.store(true, .release);
+        const cb = vs.frame();
+        cb.setListener(&video_frame_listener, self);
+        vs.commit();
         return true;
     }
 
@@ -1902,34 +1587,6 @@ pub const Window = struct {
         try self.repaintDecor(self.panel_w + 2 * m, self.panel_h + 2 * m);
         self.applySurfaceMetrics();
         self.redrawAll();
-    }
-
-    /// Switches how the video subsurface is fit into the content rect (see
-    /// `VideoFit`). Thread-safe — only stores an atomic read by `processVideo`
-    /// on the next present, no Wayland object touched here — so an app can
-    /// call it from any thread when switching between content types on the
-    /// same `Window` (e.g. the mesh viewer wants `.fill`, real video playback
-    /// wants `.contain`).
-    pub fn setVideoFit(self: *Window, fit: facade.VideoFit) void {
-        self.video_fit.store(fit, .monotonic);
-    }
-
-    /// Thread-safe snapshot of where the video subsurface is CURRENTLY
-    /// positioned/sized (physical canvas space — same space as `presentRgba`'s
-    /// buffer), or `null` before the first frame has been shown. An app
-    /// drawing its own overlay (controls, subtitles) on the parent surface
-    /// over the video needs this to stay aligned with the fit (`VideoFit`)
-    /// computed independently on the window thread, which can change from one
-    /// present to the next (resize, fit-mode switch) — duplicating that math
-    /// on the caller's side would drift out of sync.
-    pub fn videoRect(self: *const Window) ?Rect {
-        if (!self.video_rect_valid.load(.monotonic)) return null;
-        return .{
-            .x = self.video_rect_x.load(.monotonic),
-            .y = self.video_rect_y.load(.monotonic),
-            .w = self.video_rect_w.load(.monotonic),
-            .h = self.video_rect_h.load(.monotonic),
-        };
     }
 
     /// Toggles fullscreen mode. It only requests/releases

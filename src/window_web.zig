@@ -203,13 +203,6 @@ pub const Window = struct {
     pub fn presentDmabufPlanes(_: *Window, _: u8, _: []const facade.DmabufPlane, _: u32, _: u32, _: u32) bool {
         return false;
     }
-    pub fn presentDmabufPlanesDynamic(_: *Window, _: u8, _: u64, _: []const facade.DmabufPlane, _: u32, _: u32, _: u32) bool {
-        return false;
-    }
-    pub fn videoRect(_: *const Window) ?facade.Rect {
-        return null;
-    }
-    pub fn setVideoFit(_: *Window, _: facade.VideoFit) void {}
     pub fn toggleFullscreen(self: *Window) void {
         self.fullscreen = !self.fullscreen;
     }
