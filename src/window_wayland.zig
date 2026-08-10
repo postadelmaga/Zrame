@@ -78,12 +78,6 @@ const StagedDma = struct {
 /// ever needing a per-frame heap allocation.
 const dynamic_pool_cap = 8;
 
-/// One YCbCr coefficients/range combination the compositor advertised (see
-/// `Window.color_repr_combos`/`pickColorRepr`) — named so the field type and
-/// `pickColorRepr`'s return type are the SAME type (two `struct {...}`
-/// literals with identical fields are still distinct nominal types in Zig).
-const ColorReprCombo = struct { coefficients: wl.ColorRepresentationCoefficients, range: wl.ColorRepresentationRange };
-
 /// Size of `Window.pending_drops` (see `presentDmabufPlanesDynamic`'s mailbox
 /// comment) — bounds how many superseded-before-shown tokens can accumulate
 /// between two window-thread wake-ups before the OLDEST ones would need to be
@@ -199,30 +193,6 @@ pub const Window = struct {
     cursor_shapes: ?*wl.CursorShapeManager = null,
     viewporter: ?*wl.Viewporter = null,
     fractional_manager: ?*wl.FractionalScaleManager = null,
-    /// `wp_color_representation_v1` (staging) — lets the video subsurface
-    /// declare its actual YCbCr coefficients/range (e.g. bt601 limited)
-    /// instead of the compositor guessing "identity, full range" for a
-    /// dmabuf it has no other metadata for (a real, visible bug hit by
-    /// Zuer's zero-copy VAAPI path: undeclared range made the video look
-    /// darker/washed out). `color_repr_combos`/`color_repr_combo_count`
-    /// capture what the compositor actually advertises (varies — this
-    /// session's KWin offers only bt601+limited, no bt709 at all) via
-    /// `color_repr_manager`'s Listener, read once `ensureVideoSurface`
-    /// creates the per-surface object.
-    color_repr_manager: ?*wl.ColorRepresentationManager = null,
-    color_repr_surface: ?*wl.ColorRepresentationSurface = null,
-    color_repr_combos: [16]ColorReprCombo = undefined,
-    color_repr_combo_count: u8 = 0,
-    /// `wp_color_manager_v1` (staging) — see the doc comment on the type
-    /// aliases near its bindings in zicro.wl: needed ALONGSIDE
-    /// color-representation for correct results on a compositor with an
-    /// advanced color pipeline (confirmed in practice, not just in theory).
-    /// `color_mgmt_surface` is created once per video surface lifetime (not
-    /// per frame, unlike the dmabuf buffers) and torn down/reset exactly
-    /// like `color_repr_surface` when this reused surface switches to the
-    /// mesh's persistent RGB content.
-    color_mgmt_manager: ?*wl.ColorManager = null,
-    color_mgmt_surface: ?*wl.ColorManagementSurface = null,
     text_input_manager: ?*wl.ZwpTextInputManagerV3 = null,
     text_input: ?*wl.ZwpTextInputV3 = null,
     data_device_manager: ?*wl.DataDeviceManager = null,
@@ -663,10 +633,6 @@ pub const Window = struct {
         for (self.video_buffers) |vb| {
             if (vb) |b| b.destroy();
         }
-        if (self.color_repr_surface) |crs| crs.destroy();
-        if (self.color_repr_manager) |mgr| wl.wl_proxy_destroy(@ptrCast(mgr));
-        if (self.color_mgmt_surface) |cms| cms.destroy();
-        if (self.color_mgmt_manager) |mgr| wl.wl_proxy_destroy(@ptrCast(mgr));
         if (self.video_viewport) |v| wl.wl_proxy_destroy(@ptrCast(v));
         if (self.video_subsurface) |ss| ss.destroy();
         if (self.video_surface) |vs| vs.destroy();
@@ -1022,47 +988,6 @@ pub const Window = struct {
         buffer.setListener(&dynamic_release_listener, rslot);
 
         self.ensureVideoSurface();
-        // Lazy, once: declare the YCbCr coefficients/range/chroma-siting for
-        // this content (see the field doc on `color_repr_manager`). Matched
-        // field-for-field against `mpv --vo=dmabuf-wayland`'s own
-        // WAYLAND_DEBUG trace on this same compositor/hardware (which
-        // renders correctly): coefficients/range/chroma_location alone were
-        // NOT sufficient (verified via screenshot comparison — still
-        // visibly too dark) until paired with the image-description setup
-        // below (`color_mgmt_manager`). Only done for THIS (dynamic/video)
-        // path — the mesh's persistent RGB target must never get YCbCr
-        // metadata (see the reset below, in the static branch of
-        // `processVideo`, for the case a video session ran on this same
-        // reused surface before a mesh one).
-        if (self.color_repr_surface == null) {
-            if (self.color_repr_manager) |mgr| {
-                if (self.pickColorRepr()) |combo| {
-                    const crs = mgr.getSurface(self.video_surface.?);
-                    crs.setCoefficientsAndRange(combo.coefficients, combo.range);
-                    crs.setChromaLocation(.type_0); // cosited horiz./midpoint vert. — the H.26x/MPEG 4:2:0 convention
-                    self.color_repr_surface = crs;
-                }
-            }
-        }
-        // Lazy, once: declare primaries/transfer-function via
-        // wp_color_manager_v1 (see the doc comment on its bindings in
-        // zicro.wl) — srgb primaries + bt1886 transfer function, mpv's own
-        // default guess for undeclared SDR content and what actually fixed
-        // the darkness in side-by-side testing. Async: the image
-        // description isn't usable until its `ready`/`ready2` event fires
-        // (see `onImageDescriptionReady2`), so `set_image_description`
-        // happens there, not here.
-        if (self.color_mgmt_surface == null) {
-            if (self.color_mgmt_manager) |mgr| {
-                const cms = mgr.getSurface(self.video_surface.?);
-                self.color_mgmt_surface = cms;
-                const creator = mgr.createParametricCreator();
-                creator.setPrimariesNamed(.srgb);
-                creator.setTfNamed(.bt1886);
-                const desc = creator.create();
-                desc.setListener(&image_description_listener, self);
-            }
-        }
         self.attachAndCommitVideo(buffer, width, height, self.videoDestRect(width, height));
     }
 
@@ -1158,19 +1083,6 @@ pub const Window = struct {
                 0,
             );
             params.destroy();
-        }
-        // Defensive reset: this is the persistent RGB path (mesh) — if a
-        // dynamic (YCbCr video) session ran on this same reused video
-        // surface before, its color representation metadata must not leak
-        // onto RGB content. Destroying unsets it (double-buffered, applied
-        // by the commit below — see the protocol XML).
-        if (self.color_repr_surface) |crs| {
-            crs.destroy();
-            self.color_repr_surface = null;
-        }
-        if (self.color_mgmt_surface) |cms| {
-            cms.destroy();
-            self.color_mgmt_surface = null;
         }
         self.attachAndCommitVideo(self.video_buffers[req.slot].?, req.width, req.height, self.videoDestRect(req.width, req.height));
         return true;
@@ -2693,92 +2605,10 @@ pub const Window = struct {
             self.fractional_manager = @ptrCast(registry.bind(name, &wl.wp_fractional_scale_manager_v1_interface, 1).?);
         } else if (std.mem.eql(u8, iface, appmenu_global)) {
             self.appmenu_manager = @ptrCast(registry.bind(name, appmenu_interface, 1).?);
-        } else if (std.mem.eql(u8, iface, "wp_color_representation_manager_v1")) {
-            const mgr: *wl.ColorRepresentationManager = @ptrCast(registry.bind(name, &wl.wp_color_representation_manager_v1_interface, 1).?);
-            mgr.setListener(&color_repr_listener, self);
-            self.color_repr_manager = mgr;
-        } else if (std.mem.eql(u8, iface, "wp_color_manager_v1")) {
-            self.color_mgmt_manager = @ptrCast(registry.bind(name, &wl.wp_color_manager_v1_interface, @min(ver, 2)).?);
         }
     }
 
     fn onGlobalRemove(_: ?*anyopaque, _: *wl.Registry, _: u32) callconv(.c) void {}
-
-    const color_repr_listener = wl.ColorRepresentationManager.Listener{
-        .supported_alpha_mode = onColorReprAlphaMode,
-        .supported_coefficients_and_ranges = onColorReprCoefficients,
-        .done = onColorReprDone,
-    };
-
-    fn onColorReprAlphaMode(_: ?*anyopaque, _: *wl.ColorRepresentationManager, _: u32) callconv(.c) void {}
-
-    fn onColorReprCoefficients(data: ?*anyopaque, _: *wl.ColorRepresentationManager, coefficients: u32, range: u32) callconv(.c) void {
-        const self: *Window = @ptrCast(@alignCast(data.?));
-        if (self.color_repr_combo_count >= self.color_repr_combos.len) return;
-        // Only entries for pixel formats compatible with our YCbCr dmabuf
-        // matter (identity/full is for RGB, never picked by videoColorRepr).
-        self.color_repr_combos[self.color_repr_combo_count] = .{
-            .coefficients = @enumFromInt(coefficients),
-            .range = @enumFromInt(range),
-        };
-        self.color_repr_combo_count += 1;
-    }
-
-    fn onColorReprDone(_: ?*anyopaque, _: *wl.ColorRepresentationManager) callconv(.c) void {}
-
-    const image_description_listener = wl.ImageDescription.Listener{
-        .failed = onImageDescriptionFailed,
-        .ready = onImageDescriptionReady,
-        .ready2 = onImageDescriptionReady2,
-    };
-
-    /// Not usable yet on `failed`: destroy it (per protocol, a failed
-    /// image description carries no valid state) and leave
-    /// `color_mgmt_surface` without a description set — the surface keeps
-    /// compositor-default color handling (today's pre-fix behavior), not a
-    /// crash or a stuck state.
-    fn onImageDescriptionFailed(_: ?*anyopaque, desc: *wl.ImageDescription, _: u32, _: [*:0]const u8) callconv(.c) void {
-        desc.destroy();
-    }
-
-    fn onImageDescriptionReady(data: ?*anyopaque, desc: *wl.ImageDescription, _: u32) callconv(.c) void {
-        applyImageDescription(data, desc);
-    }
-
-    fn onImageDescriptionReady2(data: ?*anyopaque, desc: *wl.ImageDescription, _: u32, _: u32) callconv(.c) void {
-        applyImageDescription(data, desc);
-    }
-
-    /// `ready`/`ready2` both land here (only one ever fires for a given
-    /// ColorManager binding — see the Listener doc in zicro.wl). Setting the
-    /// description on the surface has copy semantics (protocol guarantee),
-    /// so the description object itself is destroyed right after — no need
-    /// to keep it alive.
-    fn applyImageDescription(data: ?*anyopaque, desc: *wl.ImageDescription) void {
-        const self: *Window = @ptrCast(@alignCast(data.?));
-        if (self.color_mgmt_surface) |cms| {
-            cms.setImageDescription(desc, .perceptual);
-        }
-        desc.destroy();
-    }
-
-    /// Picks the best YCbCr coefficients/range the compositor actually
-    /// advertised (see `color_repr_combos`): bt709 preferred (the common
-    /// convention for undeclared HD content — most of what a video player
-    /// shows), bt601 next (the only option some compositors offer, this
-    /// session's KWin included), else `null` — no protocol object is created
-    /// and the surface keeps compositor-default (implementation-defined)
-    /// color representation, exactly today's behavior.
-    fn pickColorRepr(self: *const Window) ?ColorReprCombo {
-        var bt601: ?usize = null;
-        for (self.color_repr_combos[0..self.color_repr_combo_count], 0..) |c, i| {
-            if (c.range != .limited) continue;
-            if (c.coefficients == .bt709) return c;
-            if (c.coefficients == .bt601) bt601 = i;
-        }
-        if (bt601) |i| return self.color_repr_combos[i];
-        return null;
-    }
 
     const wm_base_listener = wl.XdgWmBase.Listener{ .ping = onPing };
 
