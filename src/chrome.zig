@@ -236,12 +236,29 @@ pub fn composeContent(
             var row_style = style;
             row_style.content_radius = 0;
             row_style.content_fade_width = 0;
+            row_style.corner_fade_width = 0;
             var sy: u32 = 0;
             while (sy < fh) : (sy += 1) {
                 const src_row = front.pixels.items[@as(usize, sy) * front.width * 4 ..][0 .. @as(usize, fw) * 4];
                 canvas.blitRgba(dx, dy + sy, src_row, fw, 1, row_style);
             }
         }
+    }
+
+    // Definition ring OVER the content: 1px along the panel edge, light on top and
+    // darker at the bottom, so a bright frameless window still reads on a bright
+    // desktop. Skipped when the style has none (or the content rect is empty).
+    if (style.edge_ring_alpha > 0.0 and content.w > 0 and content.h > 0) {
+        canvas.strokeRoundedRectGradient(
+            @floatFromInt(content.x),
+            @floatFromInt(content.y),
+            @floatFromInt(content.w),
+            @floatFromInt(content.h),
+            style.content_radius,
+            1.0,
+            paint.Color.rgba(255, 255, 255, style.edge_ring_alpha),
+            paint.Color.rgba(0, 0, 0, style.edge_ring_alpha * 2.0),
+        );
     }
 
     // Panels (title bar, scrollbars, context menu, plugins) composite last, on top of both

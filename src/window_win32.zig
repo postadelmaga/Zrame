@@ -680,6 +680,8 @@ pub const Window = struct {
         s.corner_radius = 0;
         s.content_radius = 0;
         s.content_fade_width = 0;
+        s.corner_fade_width = 0;
+        s.edge_ring_alpha = 0;
         s.border_anim_width = 0;
         return s;
     }

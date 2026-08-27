@@ -1960,6 +1960,7 @@ pub const Window = struct {
         s.glass_fade_width = self.physPxF(s.glass_fade_width);
         s.content_radius = self.physPxF(s.content_radius);
         s.content_fade_width = self.physPxF(s.content_fade_width);
+        s.corner_fade_width = self.physPxF(s.corner_fade_width);
         s.border_anim_width = self.physPxF(s.border_anim_width);
         return s;
     }

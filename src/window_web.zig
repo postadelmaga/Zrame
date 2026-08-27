@@ -302,6 +302,7 @@ pub const Window = struct {
         s.glass_fade_width *= f;
         s.content_radius *= f;
         s.content_fade_width *= f;
+        s.corner_fade_width *= f;
         s.border_anim_width *= f;
         return s;
     }
@@ -418,4 +419,3 @@ pub const Window = struct {
         chrome.forwardGesture(self, g);
     }
 };
-
