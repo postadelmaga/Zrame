@@ -1579,7 +1579,13 @@ pub const Window = struct {
     pub fn setStyle(self: *Window, style: Style) !void {
         self.opts.style = style;
         const m = style.margin;
-        try self.repaintDecor(self.panel_w + 2 * m, self.panel_h + 2 * m);
+        // Decor in pixel FISICI, come i buffer shm (`redraw` confronta `physPx`
+        // del pannello con `buf_w/h`): a dimensione logica, con scala frazionaria
+        // del display, `decor.len` divergeva da `pixels.len` e il `@memcpy` del
+        // redraw successivo andava in panic ("non-equal lengths"). Se la nuova
+        // geometria non coincide con i buffer correnti, `redraw` li ridimensiona
+        // e ridipinge di nuovo il decor: qui basta restare coerenti.
+        try self.repaintDecor(self.physPx(self.panel_w + 2 * m), self.physPx(self.panel_h + 2 * m));
         self.applySurfaceMetrics();
         self.redrawAll();
     }
@@ -2020,6 +2026,9 @@ pub const Window = struct {
             }
             return;
         }
+        // Difesa: il decor deve avere esattamente la geometria dei buffer
+        // (qualunque percorso l'abbia ridipinto a una taglia diversa).
+        if (self.decor.len != pixels.len) self.repaintDecor(bw, bh) catch return;
         @memcpy(pixels, self.decor);
         chrome.composeContent(&canvas, self.contentRect(), self.frameArea(), &self.mailbox.front, self.paintStyle(), &self.panels, self.host(), self.opts.on_draw, self.opts.user);
     }
