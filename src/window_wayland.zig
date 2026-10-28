@@ -1838,7 +1838,7 @@ pub const Window = struct {
             .plain
         else
             .none;
-        if (@intFromEnum(rank) > @intFromEnum(self.pending_mime)) self.pending_mime = rank;
+        if (@backingInt(rank) > @backingInt(self.pending_mime)) self.pending_mime = rank;
     }
 
     fn onOfferSourceActions(_: ?*anyopaque, _: *wl.DataOffer, _: u32) callconv(.c) void {}

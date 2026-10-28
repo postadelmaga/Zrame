@@ -217,6 +217,9 @@ pub const Panel = struct {
 
     /// Build a `Panel` from `*T`, deriving the vtable from `T`'s methods. `T.draw` and
     /// `T.onInput` are required; `T.tick` and `T.deinit` are optional.
+    /// The hooks must be `pub`: since Zig 0.17 `@hasDecl` reports only public
+    /// declarations, so a non-pub `tick`/`deinit`/`dirtyBounds` is silently not
+    /// picked up here — it compiles, and the panel just never ticks or frees.
     pub fn of(comptime T: type, instance: *T) Panel {
         const gen = struct {
             fn drawFn(ptr: *anyopaque, canvas: *paint.Canvas, host: Host) void {
@@ -386,27 +389,27 @@ const TestPanel = struct {
     frames_left: u32 = 0,
     deinited: *bool,
 
-    fn draw(self: *TestPanel, canvas: *paint.Canvas, host: Host) void {
+    pub fn draw(self: *TestPanel, canvas: *paint.Canvas, host: Host) void {
         _ = canvas;
         _ = host;
         self.draws += 1;
     }
     // Note: no `dirtyBounds` — so a bare TestPanel reports `.unknown` (forces a
     // full redraw). The damage-declaring variant is `DirtyPanel` below.
-    fn onInput(self: *TestPanel, event: Event, host: Host) bool {
+    pub fn onInput(self: *TestPanel, event: Event, host: Host) bool {
         _ = event;
         _ = host;
         self.inputs += 1;
         return self.consume;
     }
-    fn tick(self: *TestPanel, dt: f32, host: Host) bool {
+    pub fn tick(self: *TestPanel, dt: f32, host: Host) bool {
         _ = dt;
         _ = host;
         self.ticks += 1;
         if (self.frames_left > 0) self.frames_left -= 1;
         return self.frames_left > 0;
     }
-    fn deinit(self: *TestPanel, gpa: Allocator) void {
+    pub fn deinit(self: *TestPanel, gpa: Allocator) void {
         _ = gpa;
         self.deinited.* = true;
     }
@@ -486,11 +489,11 @@ test "owned panels are deinited, borrowed ones are not" {
 /// A panel that declares a damage rect (or none), used to exercise `dirtyBounds`.
 const DirtyPanel = struct {
     bounds: ?Rect,
-    fn draw(_: *DirtyPanel, _: *paint.Canvas, _: Host) void {}
-    fn onInput(_: *DirtyPanel, _: Event, _: Host) bool {
+    pub fn draw(_: *DirtyPanel, _: *paint.Canvas, _: Host) void {}
+    pub fn onInput(_: *DirtyPanel, _: Event, _: Host) bool {
         return false;
     }
-    fn dirtyBounds(self: *DirtyPanel, _: Host) ?Rect {
+    pub fn dirtyBounds(self: *DirtyPanel, _: Host) ?Rect {
         return self.bounds;
     }
 };

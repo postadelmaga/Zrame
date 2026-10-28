@@ -188,7 +188,7 @@ pub const Controls = struct {
     fn drawDisc(self: *Controls, canvas: *paint.Canvas, btn: Button, b: Bar, info: plugin.Info) void {
         const d = discDiameter(b);
         const c = discCenter(btn, b);
-        const hf = ui.cubicOut(self.hover[@intFromEnum(btn)]);
+        const hf = ui.cubicOut(self.hover[@backingInt(btn)]);
         var col = switch (btn) {
             .close => mac_close,
             .minimize => mac_min,
@@ -228,7 +228,7 @@ pub const Controls = struct {
     }
 
     fn drawCell(self: *Controls, canvas: *paint.Canvas, btn: Button, r: Bar, info: plugin.Info) void {
-        const hf = ui.cubicOut(self.hover[@intFromEnum(btn)]);
+        const hf = ui.cubicOut(self.hover[@backingInt(btn)]);
         if (hf > 0.001) {
             const hl = if (btn == .close)
                 Color.rgba(232, 76, 76, 0.90 * hf)
@@ -312,7 +312,7 @@ pub const Controls = struct {
         _ = host;
         var active = false;
         inline for (0..button_count) |i| {
-            const target = if (self.hovered) |h| @intFromEnum(h) == i else false;
+            const target = if (self.hovered) |h| @backingInt(h) == i else false;
             const nf = ui.approach(self.hover[i], target, dt);
             if (nf != self.hover[i]) active = true;
             self.hover[i] = nf;

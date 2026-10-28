@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Everything zrame draws is per-pixel software rendering; Debug builds can't hold
     // 60 Hz on the demos, so optimized is the default (-Doptimize=Debug to override).
-    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
 
     const zicro = b.dependency("zicro", .{ .target = target, .optimize = optimize });
 
@@ -79,34 +79,34 @@ pub fn build(b: *std.Build) void {
     // A loadable plugin built as a shared library, plus a host that dlopens it:
     // `zig build run-plugin`. The host hardcodes a `.so` path, so build it on Linux only.
     if (target.result.os.tag == .linux) {
-    const clock = b.addLibrary(.{
-        .name = "zrame_clock",
-        .linkage = .dynamic,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/plugin_clock.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "zrame", .module = zrame }},
-        }),
-    });
-    b.installArtifact(clock);
+        const clock = b.addLibrary(.{
+            .name = "zrame_clock",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/plugin_clock.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zrame", .module = zrame }},
+            }),
+        });
+        b.installArtifact(clock);
 
-    const host_exe = b.addExecutable(.{
-        .name = "plugin_host",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/plugin_host.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "zrame", .module = zrame }},
-        }),
-    });
-    b.installArtifact(host_exe);
-    const host_run = b.addRunArtifact(host_exe);
-    // The host dlopens zig-out/lib/libzrame_clock.so, so make sure it's installed first.
-    host_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| host_run.addArgs(args);
-    const host_step = b.step("run-plugin", "Run the dlopen plugin host example");
-    host_step.dependOn(&host_run.step);
+        const host_exe = b.addExecutable(.{
+            .name = "plugin_host",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/plugin_host.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zrame", .module = zrame }},
+            }),
+        });
+        b.installArtifact(host_exe);
+        const host_run = b.addRunArtifact(host_exe);
+        // The host dlopens zig-out/lib/libzrame_clock.so, so make sure it's installed first.
+        host_run.step.dependOn(b.getInstallStep());
+        host_run.addPassthruArgs();
+        const host_step = b.step("run-plugin", "Run the dlopen plugin host example");
+        host_step.dependOn(&host_run.step);
     }
 
     // `zig build web` — the WebAssembly glass window in a browser tab. wasm32-freestanding,

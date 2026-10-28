@@ -69,7 +69,7 @@ pub const Tray = struct {
         copyz(&self.icon_buf, cfg.icon_name);
         copyz(&self.tip_buf, cfg.tooltip);
         // Well-known name per the SNI convention: org.kde.StatusNotifierItem-PID-ID.
-        _ = std.fmt.bufPrintZ(&self.name_buf, "org.kde.StatusNotifierItem-{d}-1", .{linux.getpid()}) catch return error.TrayName;
+        _ = std.mem.printSentinel(&self.name_buf, "org.kde.StatusNotifierItem-{d}-1", .{linux.getpid()}, 0) catch return error.TrayName;
 
         if (bus.sd_bus_open_user(&self.bus) < 0) return error.TrayBusOpen;
         errdefer _ = bus.sd_bus_unref(self.bus);

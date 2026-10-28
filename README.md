@@ -118,7 +118,7 @@ zig build run-tray     # a bare system-tray icon; left-click prints "activated"
 ```
 
 Requirements: Linux + Wayland, `libwayland-client`, `wayland-scanner`,
-`wayland-protocols` ≥ 1.41 (for `ext-background-effect-v1`), Zig 0.16.
+`wayland-protocols` ≥ 1.41 (for `ext-background-effect-v1`), Zig 0.17.
 
 > **No blur?** The window still works — translucent, rounded, shadowed — but the frost
 > needs the compositor's blur effect. On KDE Plasma it must be enabled: System Settings →
